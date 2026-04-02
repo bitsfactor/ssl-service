@@ -74,7 +74,7 @@ def render_caddyfile(
   ]
   lines: list[str] = [
     "{",
-    f"  admin {admin_address}",
+    f"\tadmin {admin_address}",
     "}",
     "",
   ]
@@ -84,7 +84,7 @@ def render_caddyfile(
     lines.extend(
       [
         f"{domains} {{",
-        "  redir https://{host}{uri} 308",
+        "\tredir https://{host}{uri} 308",
         "}",
         "",
       ]
@@ -97,18 +97,18 @@ def render_caddyfile(
     domain_dir = output_path.parent.parent / "certs" / route.domain
     block = [
       f"https://{route.domain} {{",
-      f"  tls {domain_dir / 'fullchain.pem'} {domain_dir / 'privkey.pem'}",
+      f"\ttls {domain_dir / 'fullchain.pem'} {domain_dir / 'privkey.pem'}",
     ]
     if route.upstream_target is None:
       block.extend(
         [
-          "  respond \"certificate-only route\" 200",
+          '\trespond "certificate-only route" 200',
         ]
       )
     else:
       block.extend(
         [
-          f"  reverse_proxy {validate_upstream_target(route.upstream_target)}",
+          f"\treverse_proxy {validate_upstream_target(route.upstream_target)}",
         ]
       )
     block.extend(
