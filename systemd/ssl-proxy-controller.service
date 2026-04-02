@@ -1,0 +1,19 @@
+[Unit]
+Description=SSL Proxy Controller
+After=network-online.target caddy.service
+Wants=network-online.target
+Requires=caddy.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/ssl-proxy/.venv/bin/python -m ssl_proxy_controller --config /etc/ssl-proxy/config.yaml
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

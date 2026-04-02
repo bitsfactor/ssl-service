@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssl-proxy-controller"
+version = "0.1.0"
+description = "Caddy front proxy controller backed by PostgreSQL"
+requires-python = ">=3.11"
+dependencies = [
+  "cryptography>=42.0.0,<43.0.0",
+  "psycopg[binary]>=3.1.18,<4.0.0",
+  "PyYAML>=6.0.1,<7.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.2.0,<9.0.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
