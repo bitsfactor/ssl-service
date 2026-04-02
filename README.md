@@ -1,92 +1,92 @@
 # ssl-server
 
-一个基于 Caddy 的前置代理服务：
+A Caddy-based front proxy service that:
 
-- 监听 `80/443`
-- 按域名转发到后端
-- 自动管理 HTTPS 证书
+- listens on `80/443`
+- routes traffic by domain
+- manages HTTPS certificates automatically
 
-## 安装
+## Install
 
-执行：
+Run:
 
 ```bash
 sudo bash setup.sh install
 ```
 
-安装时会要求输入：
+The installer will ask for:
 
-- 模式：`readonly` 或 `readwrite`
+- mode: `readonly` or `readwrite`
 - PostgreSQL DSN
-- ACME 邮箱
+- ACME email
 
-模式说明：
+Mode summary:
 
-- `readonly`：只读取数据库中的域名和证书，不申请证书
-- `readwrite`：负责申请和续签证书，并写回数据库
+- `readonly`: reads routes and certificates from PostgreSQL, does not issue certificates
+- `readwrite`: issues and renews certificates, then writes them back to PostgreSQL
 
-安装完成后可用命令：
+After install, these commands are available:
 
 - `ssl-proxy`
 - `domain-manage`
 
-## 添加第一个域名
+## Add Your First Domain
 
-先做 DNS：
+First, update DNS:
 
-- 先把域名解析到 `readwrite` 节点
-- 当前使用 `HTTP-01` 验证，所以公网必须能访问这台机器的 `80` 端口
+- point the domain to the `readwrite` node
+- this project uses `HTTP-01`, so the node must be reachable on port `80`
 
-例如把 `api.example.com` 转发到本机 `6111`：
+Example: route `api.example.com` to local port `6111`
 
 ```bash
 sudo domain-manage add api.example.com 6111 --sync-now
 sudo domain-manage issue-now api.example.com
 ```
 
-如果是转发到其他服务器：
+Route to another server:
 
 ```bash
 sudo domain-manage add api.example.com 10.0.0.25:8080 --sync-now
 sudo domain-manage issue-now api.example.com
 ```
 
-如果只是先申请证书，不接后端：
+Certificate only, no backend yet:
 
 ```bash
 sudo domain-manage add api.example.com --sync-now
 sudo domain-manage issue-now api.example.com
 ```
 
-申请前可先检查：
+Optional pre-check:
 
 ```bash
 domain-manage check api.example.com
 ```
 
-## 查看结果
+## Check The Result
 
-查看域名状态：
+Check domain status:
 
 ```bash
 domain-manage status api.example.com
 ```
 
-查看服务状态：
+Check service status:
 
 ```bash
 sudo ssl-proxy status
 ```
 
-直接访问：
+Test HTTPS:
 
 ```bash
 curl -I https://api.example.com
 ```
 
-## 常用命令
+## Common Commands
 
-服务管理：
+Service management:
 
 ```bash
 sudo ssl-proxy start
@@ -98,7 +98,7 @@ sudo ssl-proxy update
 sudo ssl-proxy uninstall
 ```
 
-域名管理：
+Domain management:
 
 ```bash
 domain-manage list
@@ -113,8 +113,8 @@ sudo domain-manage issue-now <domain>
 sudo domain-manage sync-now
 ```
 
-## 说明
+## Notes
 
-- 不支持通配符证书，例如 `*.example.com`
-- 支持的回源格式：`6111`、`127.0.0.1:6111`、`10.0.0.25:6111`、`backend.internal:6111`、`[2001:db8::10]:6111`
-- 配置文件：`/etc/ssl-proxy/config.yaml`
+- wildcard certificates such as `*.example.com` are not supported
+- supported upstream formats: `6111`, `127.0.0.1:6111`, `10.0.0.25:6111`, `backend.internal:6111`, `[2001:db8::10]:6111`
+- config file: `/etc/ssl-proxy/config.yaml`
