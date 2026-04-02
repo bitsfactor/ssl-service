@@ -73,6 +73,78 @@ def env_with_dsn(tmp_path: Path, dsn: str) -> dict[str, str]:
   return env
 
 
+def install_fake_psycopg(tmp_path: Path) -> Path:
+  package_dir = tmp_path / "psycopg"
+  package_dir.mkdir()
+  (package_dir / "__init__.py").write_text(
+    """
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+
+class Error(Exception):
+  pass
+
+
+class FakeCursor:
+  def __init__(self) -> None:
+    self._row = None
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, exc_type, exc, tb):
+    return None
+
+  def execute(self, query, params=None):
+    if "UPDATE routes" in query and "SET upstream_target = %s" in query:
+      self._row = {
+        "domain": params[1],
+        "upstream_target": params[0],
+        "enabled": True,
+        "updated_at": datetime(2026, 4, 2, tzinfo=UTC),
+        "certificate_status": None,
+        "certificate_not_after": None,
+        "retry_after": None,
+        "last_error": None,
+      }
+    else:
+      self._row = None
+
+  def fetchone(self):
+    return self._row
+
+  def fetchall(self):
+    return []
+
+
+class FakeConnection:
+  def __enter__(self):
+    return self
+
+  def __exit__(self, exc_type, exc, tb):
+    return None
+
+  def cursor(self):
+    return FakeCursor()
+
+  def commit(self):
+    return None
+
+
+def connect(*args, **kwargs):
+  return FakeConnection()
+"""
+  )
+  (package_dir / "rows.py").write_text(
+    """
+dict_row = object()
+"""
+  )
+  return tmp_path
+
+
 def test_status_rejects_wildcard_domain(tmp_path: Path) -> None:
   result = run_script(["status", "*.example.com"], env=base_env(tmp_path))
 
@@ -154,3 +226,16 @@ def test_status_reports_db_failure_without_traceback(tmp_path: Path) -> None:
   assert "database_lookup_ok: no" in result.stdout
   assert "database_error: database connection failed:" in result.stdout
   assert "Traceback" not in result.stderr
+
+
+def test_set_target_accepts_remote_ip_upstream(tmp_path: Path) -> None:
+  fake_site = install_fake_psycopg(tmp_path)
+  env = base_env(tmp_path)
+  env["PYTHONPATH"] = f"{fake_site}:{env.get('PYTHONPATH', '')}".rstrip(":")
+
+  result = run_script(["set-target", "api.example.com", "154.17.0.51:50101"], env=env)
+
+  assert result.returncode == 0
+  assert result.stderr == ""
+  assert "domain=api.example.com" in result.stdout
+  assert "upstream_target=154.17.0.51:50101" in result.stdout

@@ -79,11 +79,13 @@ def render_caddyfile(
     lines.extend(
       [
         f"{domains} {{",
-        "  handle /.well-known/acme-challenge/* {",
-        f"    root * {acme_webroot}",
-        "    file_server",
+        "  route {",
+        "    handle /.well-known/acme-challenge/* {",
+        f"      root * {acme_webroot}",
+        "      file_server",
+        "    }",
+        "    redir https://{host}{uri} 308",
         "  }",
-        "  redir https://{host}{uri} 308",
         "}",
         "",
       ]

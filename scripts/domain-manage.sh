@@ -700,7 +700,9 @@ run_db_tool() {
   "${python_bin}" - "$@" <<'PY'
 from __future__ import annotations
 
+import ipaddress
 import os
+import re
 import sys
 from pathlib import Path
 
