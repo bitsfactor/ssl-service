@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEPLOY_DIR="/opt/ssl-proxy"
+PROGRAM_NAME="$(basename "${BASH_SOURCE[0]}")"
 CONFIG_CANDIDATES=(
   "/etc/ssl-proxy/config.yaml"
 )
@@ -18,28 +19,28 @@ fail() {
 }
 
 usage() {
-  cat <<'EOF'
+  cat <<EOF
 Usage:
-  domain-manage.sh list
-  domain-manage.sh get <domain>
-  domain-manage.sh status <domain>
-  domain-manage.sh check <domain>
-  domain-manage.sh logs <domain>
-  domain-manage.sh add <domain> [upstream_target]
-  domain-manage.sh set-target <domain> <upstream_target>
-  domain-manage.sh clear-target <domain>
-  domain-manage.sh set-port <domain> <upstream_port>    # deprecated alias
-  domain-manage.sh clear-port <domain>                  # deprecated alias
-  domain-manage.sh enable <domain>
-  domain-manage.sh disable <domain>
-  domain-manage.sh delete <domain>
-  domain-manage.sh purge <domain>
-  domain-manage.sh issue-now <domain> [--force]
-  domain-manage.sh sync-now
+  ${PROGRAM_NAME} list
+  ${PROGRAM_NAME} get <domain>
+  ${PROGRAM_NAME} status <domain>
+  ${PROGRAM_NAME} check <domain>
+  ${PROGRAM_NAME} logs <domain>
+  ${PROGRAM_NAME} add <domain> [upstream_target]
+  ${PROGRAM_NAME} set-target <domain> <upstream_target>
+  ${PROGRAM_NAME} clear-target <domain>
+  ${PROGRAM_NAME} set-port <domain> <upstream_port>    # deprecated alias
+  ${PROGRAM_NAME} clear-port <domain>                  # deprecated alias
+  ${PROGRAM_NAME} enable <domain>
+  ${PROGRAM_NAME} disable <domain>
+  ${PROGRAM_NAME} delete <domain>
+  ${PROGRAM_NAME} purge <domain>
+  ${PROGRAM_NAME} issue-now <domain> [--force]
+  ${PROGRAM_NAME} sync-now
 
 Notes:
   - upstream_target can be omitted on add, which creates a certificate-only domain.
-  - upstream_target accepts `6111`, `127.0.0.1:6111`, `10.0.0.25:6111`, `backend.internal:6111`, or `[2001:db8::10]:6111`.
+  - upstream_target accepts '6111', '127.0.0.1:6111', '10.0.0.25:6111', 'backend.internal:6111', or '[2001:db8::10]:6111'.
   - the script reads PostgreSQL DSN from /etc/ssl-proxy/config.yaml by default.
   - override config with: SSL_PROXY_CONFIG=/path/to/config.yaml
   - mutating commands accept --sync-now to force an immediate local refresh
@@ -1091,13 +1092,13 @@ main() {
         local dns_state
         dns_state="$(domain_points_to_this_host "$1")"
         if [[ "${dns_state}" == "unknown" ]]; then
-          fail "could not determine this host's public IPs; run 'domain-manage.sh status $1' to inspect DNS, or use --force"
+          fail "could not determine this host's public IPs; run '${PROGRAM_NAME} status $1' to inspect DNS, or use --force"
         fi
         if [[ "${dns_state}" == "dns_error" ]]; then
-          fail "dns resolution failed; run 'domain-manage.sh status $1' to inspect DNS, or use --force"
+          fail "dns resolution failed; run '${PROGRAM_NAME} status $1' to inspect DNS, or use --force"
         fi
         if [[ "${dns_state}" != "yes" ]]; then
-          fail "domain does not currently point to this host; run 'domain-manage.sh status $1' to inspect DNS, or use --force"
+          fail "domain does not currently point to this host; run '${PROGRAM_NAME} status $1' to inspect DNS, or use --force"
         fi
       fi
       run_db_tool "$subcommand" "$1"

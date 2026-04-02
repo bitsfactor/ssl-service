@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -90,9 +91,29 @@ def test_help_succeeds(tmp_path: Path) -> None:
   result = run_script(["help"], env=base_env(tmp_path))
 
   assert result.returncode == 0
+  assert result.stderr == ""
+  assert f"{SCRIPT.name} list" in result.stdout
   assert "issue-now <domain> [--force]" in result.stdout
   assert "check <domain>" in result.stdout
   assert "set-target <domain> <upstream_target>" in result.stdout
+
+
+def test_help_uses_invoked_program_name(tmp_path: Path) -> None:
+  alias_path = tmp_path / "domain-manage"
+  shutil.copy2(SCRIPT, alias_path)
+
+  env = base_env(tmp_path)
+  result = subprocess.run(
+    ["bash", str(alias_path), "help"],
+    text=True,
+    capture_output=True,
+    env=env,
+  )
+
+  assert result.returncode == 0
+  assert result.stderr == ""
+  assert "domain-manage list" in result.stdout
+  assert "domain-manage.sh list" not in result.stdout
 
 
 def test_issue_now_rejects_on_readonly_node_before_dns_or_db(tmp_path: Path) -> None:
