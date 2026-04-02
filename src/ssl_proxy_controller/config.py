@@ -77,6 +77,14 @@ def _normalize_bool(value: object) -> bool:
   return bool(value)
 
 
+def _require_int(name: str, value: int, *, minimum: int) -> int:
+  if isinstance(value, bool) or not isinstance(value, int):
+    raise ValueError(f"{name} must be an integer")
+  if value < minimum:
+    raise ValueError(f"{name} must be >= {minimum}")
+  return value
+
+
 def load_config(path: str | Path) -> AppConfig:
   config_path = Path(path)
   data = yaml.safe_load(config_path.read_text()) or {}
@@ -85,7 +93,7 @@ def load_config(path: str | Path) -> AppConfig:
   caddy = data.get("caddy", {})
   acme = data.get("acme", {})
 
-  return AppConfig(
+  config = AppConfig(
     mode=_normalize_mode(data["mode"]),
     postgres=PostgresConfig(**data["postgres"]),
     sync=SyncConfig(**data.get("sync", {})),
@@ -107,6 +115,15 @@ def load_config(path: str | Path) -> AppConfig:
     ),
     logging=LoggingConfig(**data.get("logging", {})),
   )
+  config.sync.poll_interval_seconds = _require_int("sync.poll_interval_seconds", config.sync.poll_interval_seconds, minimum=1)
+  config.sync.renew_before_days = _require_int("sync.renew_before_days", config.sync.renew_before_days, minimum=0)
+  config.sync.retry_backoff_seconds = _require_int("sync.retry_backoff_seconds", config.sync.retry_backoff_seconds, minimum=0)
+  config.sync.loop_error_backoff_seconds = _require_int("sync.loop_error_backoff_seconds", config.sync.loop_error_backoff_seconds, minimum=1)
+  if not config.caddy.reload_command:
+    raise ValueError("caddy.reload_command must not be empty")
+  if config.mode == "readwrite" and not config.acme.email.strip():
+    raise ValueError("acme.email is required in readwrite mode")
+  return config
 
 
 def as_dict(config: AppConfig) -> dict[str, Any]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import signal
 import sys
 import time
@@ -139,9 +140,7 @@ class Controller:
 
     for domain_dir in self.certs_dir.iterdir() if self.certs_dir.exists() else []:
       if domain_dir.is_dir() and domain_dir.name not in active_domains:
-        for item in domain_dir.iterdir():
-          item.unlink()
-        domain_dir.rmdir()
+        shutil.rmtree(domain_dir)
         changed = True
 
     for domain, certificate in certificates.items():

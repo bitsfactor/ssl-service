@@ -58,6 +58,8 @@ def test_load_config_uses_defaults_for_sync_values(tmp_path: Path) -> None:
 mode: readonly
 postgres:
   dsn: postgresql://example
+caddy:
+  reload_command: ["/usr/bin/caddy", "reload"]
 """
   )
 
@@ -94,6 +96,8 @@ postgres:
 paths:
   state_dir: /tmp/state
   log_dir: /tmp/log
+caddy:
+  reload_command: ["/usr/bin/caddy", "reload"]
 acme:
   email: ops@example.com
   webroot: /tmp/acme
@@ -116,7 +120,10 @@ def test_load_config_parses_string_boolean_for_staging(tmp_path: Path) -> None:
 mode: readwrite
 postgres:
   dsn: postgresql://example
+caddy:
+  reload_command: ["/usr/bin/caddy", "reload"]
 acme:
+  email: ops@example.com
   staging: "false"
 """
   )
@@ -124,3 +131,82 @@ acme:
   config = load_config(config_path)
 
   assert config.acme.staging is False
+
+
+@pytest.mark.parametrize(
+  ("sync_block", "message"),
+  [
+    ("poll_interval_seconds: 0", r"sync\.poll_interval_seconds must be >= 1"),
+    ("renew_before_days: -1", r"sync\.renew_before_days must be >= 0"),
+    ("retry_backoff_seconds: -1", r"sync\.retry_backoff_seconds must be >= 0"),
+    ("loop_error_backoff_seconds: 0", r"sync\.loop_error_backoff_seconds must be >= 1"),
+  ],
+)
+def test_load_config_rejects_invalid_sync_intervals(tmp_path: Path, sync_block: str, message: str) -> None:
+  config_path = tmp_path / "config.yaml"
+  config_path.write_text(
+    f"""
+mode: readwrite
+postgres:
+  dsn: postgresql://example
+caddy:
+  reload_command: ["/usr/bin/caddy", "reload"]
+acme:
+  email: ops@example.com
+sync:
+  {sync_block}
+"""
+  )
+
+  with pytest.raises(ValueError, match=message):
+    load_config(config_path)
+
+
+def test_load_config_rejects_non_integer_sync_values(tmp_path: Path) -> None:
+  config_path = tmp_path / "config.yaml"
+  config_path.write_text(
+    """
+mode: readwrite
+postgres:
+  dsn: postgresql://example
+caddy:
+  reload_command: ["/usr/bin/caddy", "reload"]
+acme:
+  email: ops@example.com
+sync:
+  poll_interval_seconds: "30"
+"""
+  )
+
+  with pytest.raises(ValueError, match=r"sync\.poll_interval_seconds must be an integer"):
+    load_config(config_path)
+
+
+def test_load_config_requires_reload_command(tmp_path: Path) -> None:
+  config_path = tmp_path / "config.yaml"
+  config_path.write_text(
+    """
+mode: readonly
+postgres:
+  dsn: postgresql://example
+"""
+  )
+
+  with pytest.raises(ValueError, match=r"caddy\.reload_command must not be empty"):
+    load_config(config_path)
+
+
+def test_load_config_requires_acme_email_in_readwrite_mode(tmp_path: Path) -> None:
+  config_path = tmp_path / "config.yaml"
+  config_path.write_text(
+    """
+mode: readwrite
+postgres:
+  dsn: postgresql://example
+caddy:
+  reload_command: ["/usr/bin/caddy", "reload"]
+"""
+  )
+
+  with pytest.raises(ValueError, match=r"acme\.email is required in readwrite mode"):
+    load_config(config_path)

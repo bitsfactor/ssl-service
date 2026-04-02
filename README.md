@@ -80,6 +80,6 @@ The current implementation uses `HTTP-01`, so wildcard domains such as `*.exampl
 - Multi-writer renewal coordination uses PostgreSQL advisory locks keyed by domain.
 - The operations entrypoint supports `install`, `start`, `stop`, `restart`, `status`, `logs`, `update`, `timer-status`, and `uninstall`.
 - The installed host also gets `/usr/local/bin/domain-manage` for route maintenance.
-- `domain-manage.sh check <domain>` is a pre-issuance health check for DNS and HTTP-01 reachability, and it expects to run on a `readwrite` node.
+- `domain-manage.sh check <domain>` is a pre-issuance health check for DNS and HTTP-01 reachability. It can run on any node, but it reports `check_node_mode: fail` on `readonly` nodes because issuance is not available there.
 - `domain-manage.sh issue-now <domain>` is only available on `readwrite` nodes.
 - `points_to_this_host: unknown` means the node could not confidently determine a public self-IP, so DNS direction could not be conclusively verified.

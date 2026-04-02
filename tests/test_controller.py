@@ -178,6 +178,22 @@ def test_sync_local_certificates_removes_stale_and_writes_active(tmp_path: Path)
   assert (controller.certs_dir / "active.example.com" / "privkey.pem").read_text() == "privkey"
 
 
+def test_sync_local_certificates_removes_stale_nested_directories(tmp_path: Path) -> None:
+  controller = Controller(make_config(tmp_path))
+  controller.ensure_directories()
+
+  stale_dir = controller.certs_dir / "stale.example.com"
+  (stale_dir / "archive").mkdir(parents=True)
+  (stale_dir / "archive" / "fullchain.pem").write_text("old")
+
+  certificate = make_certificate("active.example.com", not_after=datetime.now(tz=UTC) + timedelta(days=10))
+
+  changed = controller._sync_local_certificates({"active.example.com": certificate})
+
+  assert changed is True
+  assert not stale_dir.exists()
+
+
 def test_atomic_write_returns_false_when_content_is_unchanged(tmp_path: Path) -> None:
   path = tmp_path / "certs" / "example.com" / "fullchain.pem"
 
