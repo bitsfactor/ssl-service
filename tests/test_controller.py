@@ -77,7 +77,7 @@ def test_renew_skips_when_retry_after_is_in_future(tmp_path: Path) -> None:
   controller = Controller(make_config(tmp_path))
   fake_db = FakeDatabase()
   controller.database = fake_db
-  route = RouteRecord(domain="example.com", upstream_port=None, enabled=True, updated_at=datetime.now(tz=UTC))
+  route = RouteRecord(domain="example.com", upstream_target=None, enabled=True, updated_at=datetime.now(tz=UTC))
   cert = make_certificate(
     "example.com",
     not_after=datetime.now(tz=UTC) - timedelta(days=1),
@@ -96,7 +96,7 @@ def test_renew_records_error_with_backoff_on_failure(tmp_path: Path, monkeypatch
   controller = Controller(make_config(tmp_path))
   fake_db = FakeDatabase()
   controller.database = fake_db
-  route = RouteRecord(domain="example.com", upstream_port=None, enabled=True, updated_at=datetime.now(tz=UTC))
+  route = RouteRecord(domain="example.com", upstream_target=None, enabled=True, updated_at=datetime.now(tz=UTC))
 
   def fail_issue(*args, **kwargs):
     raise RuntimeError("boom")
@@ -121,7 +121,7 @@ def test_renew_upserts_certificate_on_success(tmp_path: Path, monkeypatch) -> No
   controller = Controller(make_config(tmp_path))
   fake_db = FakeDatabase()
   controller.database = fake_db
-  route = RouteRecord(domain="example.com", upstream_port=6111, enabled=True, updated_at=datetime.now(tz=UTC))
+  route = RouteRecord(domain="example.com", upstream_target="127.0.0.1:6111", enabled=True, updated_at=datetime.now(tz=UTC))
   certificate = make_certificate("example.com", not_after=datetime.now(tz=UTC) + timedelta(days=90))
 
   monkeypatch.setattr("ssl_proxy_controller.controller.issue_certificate", lambda *_args, **_kwargs: certificate)
@@ -137,7 +137,7 @@ def test_renew_skips_when_certificate_is_still_valid(tmp_path: Path) -> None:
   controller = Controller(make_config(tmp_path))
   fake_db = FakeDatabase()
   controller.database = fake_db
-  route = RouteRecord(domain="example.com", upstream_port=None, enabled=True, updated_at=datetime.now(tz=UTC))
+  route = RouteRecord(domain="example.com", upstream_target=None, enabled=True, updated_at=datetime.now(tz=UTC))
   cert = make_certificate("example.com", not_after=datetime.now(tz=UTC) + timedelta(days=90))
 
   controller._renew_if_needed([route], {"example.com": cert})
@@ -151,7 +151,7 @@ def test_renew_skips_when_advisory_lock_not_acquired(tmp_path: Path) -> None:
   fake_db = FakeDatabase()
   fake_db.lock_result = False
   controller.database = fake_db
-  route = RouteRecord(domain="example.com", upstream_port=None, enabled=True, updated_at=datetime.now(tz=UTC))
+  route = RouteRecord(domain="example.com", upstream_target=None, enabled=True, updated_at=datetime.now(tz=UTC))
 
   controller._renew_if_needed([route], {})
 
@@ -246,7 +246,7 @@ def test_sync_local_certificates_removes_stale_dir_when_record_has_no_material(t
 def test_write_caddyfile_detects_unchanged_hash(tmp_path: Path) -> None:
   controller = Controller(make_config(tmp_path))
   controller.ensure_directories()
-  route = RouteRecord(domain="example.com", upstream_port=None, enabled=True, updated_at=datetime.now(tz=UTC))
+  route = RouteRecord(domain="example.com", upstream_target=None, enabled=True, updated_at=datetime.now(tz=UTC))
   certificate = make_certificate("example.com", not_after=datetime.now(tz=UTC) + timedelta(days=10))
 
   first_changed = controller._write_caddyfile([route], {"example.com": certificate})
@@ -260,7 +260,7 @@ def test_write_caddyfile_detects_unchanged_hash(tmp_path: Path) -> None:
 def test_write_state_file_persists_versions(tmp_path: Path) -> None:
   controller = Controller(make_config(tmp_path))
   controller.ensure_directories()
-  route = RouteRecord(domain="example.com", upstream_port=6111, enabled=True, updated_at=datetime.now(tz=UTC))
+  route = RouteRecord(domain="example.com", upstream_target="127.0.0.1:6111", enabled=True, updated_at=datetime.now(tz=UTC))
   certificate = make_certificate("example.com", not_after=datetime.now(tz=UTC) + timedelta(days=10))
   (controller.generated_dir / "Caddyfile").write_text("test")
 
@@ -284,7 +284,7 @@ def test_run_once_in_readonly_mode_skips_renewal(monkeypatch, tmp_path: Path) ->
   config.mode = "readonly"
   controller = Controller(config)
   events: list[str] = []
-  route = RouteRecord(domain="example.com", upstream_port=None, enabled=True, updated_at=datetime.now(tz=UTC))
+  route = RouteRecord(domain="example.com", upstream_target=None, enabled=True, updated_at=datetime.now(tz=UTC))
   certificate = make_certificate("example.com", not_after=datetime.now(tz=UTC) + timedelta(days=10))
 
   class RuntimeDatabase:
@@ -337,7 +337,7 @@ def test_run_once_reloads_caddy_when_state_changes(monkeypatch, tmp_path: Path) 
 
 def test_run_once_filters_orphan_certificates_from_local_state(monkeypatch, tmp_path: Path) -> None:
   controller = Controller(make_config(tmp_path))
-  route = RouteRecord(domain="active.example.com", upstream_port=None, enabled=True, updated_at=datetime.now(tz=UTC))
+  route = RouteRecord(domain="active.example.com", upstream_target=None, enabled=True, updated_at=datetime.now(tz=UTC))
   active_certificate = make_certificate("active.example.com", not_after=datetime.now(tz=UTC) + timedelta(days=10))
   orphan_certificate = make_certificate("orphan.example.com", not_after=datetime.now(tz=UTC) + timedelta(days=10))
   captured: dict[str, dict[str, CertificateRecord]] = {}

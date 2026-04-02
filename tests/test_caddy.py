@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from ssl_proxy_controller.caddy import reload_caddy, render_caddyfile, state_payload
+from ssl_proxy_controller.caddy import reload_caddy, render_caddyfile, state_payload, validate_upstream_target
 from ssl_proxy_controller.db import CertificateRecord, RouteRecord
 
 
@@ -30,7 +30,7 @@ def make_certificate(domain: str) -> CertificateRecord:
 
 def test_render_caddyfile_renders_certificate_only_route_without_reverse_proxy(tmp_path: Path) -> None:
   output = tmp_path / "generated" / "Caddyfile"
-  routes = [RouteRecord(domain="example.com", upstream_port=None, enabled=True, updated_at=datetime.now(tz=UTC))]
+  routes = [RouteRecord(domain="example.com", upstream_target=None, enabled=True, updated_at=datetime.now(tz=UTC))]
   certificates = {"example.com": make_certificate("example.com")}
 
   result = render_caddyfile(
@@ -50,7 +50,7 @@ def test_render_caddyfile_renders_certificate_only_route_without_reverse_proxy(t
 
 def test_render_caddyfile_skips_https_block_for_missing_certificate_material(tmp_path: Path) -> None:
   output = tmp_path / "generated" / "Caddyfile"
-  routes = [RouteRecord(domain="example.com", upstream_port=8080, enabled=True, updated_at=datetime.now(tz=UTC))]
+  routes = [RouteRecord(domain="example.com", upstream_target="127.0.0.1:8080", enabled=True, updated_at=datetime.now(tz=UTC))]
   now = datetime.now(tz=UTC)
   certificates = {
     "example.com": CertificateRecord(
@@ -84,7 +84,7 @@ def test_render_caddyfile_skips_https_block_for_missing_certificate_material(tmp
 
 def test_render_caddyfile_renders_reverse_proxy_for_service_route(tmp_path: Path) -> None:
   output = tmp_path / "generated" / "Caddyfile"
-  routes = [RouteRecord(domain="example.com", upstream_port=6111, enabled=True, updated_at=datetime.now(tz=UTC))]
+  routes = [RouteRecord(domain="example.com", upstream_target="10.0.0.25:6111", enabled=True, updated_at=datetime.now(tz=UTC))]
   certificates = {"example.com": make_certificate("example.com")}
 
   render_caddyfile(
@@ -97,12 +97,34 @@ def test_render_caddyfile_renders_reverse_proxy_for_service_route(tmp_path: Path
 
   content = output.read_text()
   assert "https://example.com" in content
-  assert "reverse_proxy 127.0.0.1:6111" in content
+  assert "reverse_proxy 10.0.0.25:6111" in content
+
+
+def test_render_caddyfile_renders_ipv6_upstream_target(tmp_path: Path) -> None:
+  output = tmp_path / "generated" / "Caddyfile"
+  routes = [RouteRecord(domain="example.com", upstream_target="[2001:db8::10]:6111", enabled=True, updated_at=datetime.now(tz=UTC))]
+  certificates = {"example.com": make_certificate("example.com")}
+
+  render_caddyfile(
+    output_path=output,
+    routes=routes,
+    certificates=certificates,
+    acme_webroot=tmp_path / "acme",
+    admin_address="127.0.0.1:2019",
+  )
+
+  content = output.read_text()
+  assert "reverse_proxy [2001:db8::10]:6111" in content
 
 
 def test_reload_caddy_requires_reload_command() -> None:
   with pytest.raises(ValueError, match="must not be empty"):
     reload_caddy([])
+
+
+def test_validate_upstream_target_rejects_invalid_value() -> None:
+  with pytest.raises(ValueError, match="must not contain spaces or slashes"):
+    validate_upstream_target("bad host:8080")
 
 
 def test_reload_caddy_runs_subprocess(monkeypatch) -> None:

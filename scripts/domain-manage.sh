@@ -25,9 +25,11 @@ Usage:
   domain-manage.sh status <domain>
   domain-manage.sh check <domain>
   domain-manage.sh logs <domain>
-  domain-manage.sh add <domain> [upstream_port]
-  domain-manage.sh set-port <domain> <upstream_port>
-  domain-manage.sh clear-port <domain>
+  domain-manage.sh add <domain> [upstream_target]
+  domain-manage.sh set-target <domain> <upstream_target>
+  domain-manage.sh clear-target <domain>
+  domain-manage.sh set-port <domain> <upstream_port>    # deprecated alias
+  domain-manage.sh clear-port <domain>                  # deprecated alias
   domain-manage.sh enable <domain>
   domain-manage.sh disable <domain>
   domain-manage.sh delete <domain>
@@ -36,7 +38,8 @@ Usage:
   domain-manage.sh sync-now
 
 Notes:
-  - upstream_port can be omitted on add, which creates a certificate-only domain.
+  - upstream_target can be omitted on add, which creates a certificate-only domain.
+  - upstream_target accepts `6111`, `127.0.0.1:6111`, `10.0.0.25:6111`, `backend.internal:6111`, or `[2001:db8::10]:6111`.
   - the script reads PostgreSQL DSN from /etc/ssl-proxy/config.yaml by default.
   - override config with: SSL_PROXY_CONFIG=/path/to/config.yaml
   - mutating commands accept --sync-now to force an immediate local refresh
@@ -143,6 +146,95 @@ get_domain_details() {
   "${python_bin}" - "$@" <<'PY'
 from __future__ import annotations
 
+import ipaddress
+import os
+import re
+import sys
+from pathlib import Path
+
+import psycopg
+import yaml
+from psycopg.rows import dict_row
+
+
+def load_dsn(config_path: str) -> str:
+  data = yaml.safe_load(Path(config_path).read_text()) or {}
+  return data["postgres"]["dsn"]
+
+
+def validate_domain(domain: str) -> str:
+  candidate = domain.strip().lower().rstrip(".")
+  if not candidate:
+    raise SystemExit("domain is required")
+  wildcard = candidate.startswith("*.")
+  if wildcard:
+    raise SystemExit("wildcard domains are not supported with the current HTTP-01 flow")
+  base = candidate[2:] if wildcard else candidate
+  labels = base.split(".")
+  if len(labels) < 2:
+    raise SystemExit("domain must contain at least one dot")
+  for label in labels:
+    if not label or len(label) > 63:
+      raise SystemExit(f"invalid domain label: {label!r}")
+    if label.startswith("-") or label.endswith("-"):
+      raise SystemExit(f"invalid domain label: {label!r}")
+    if not all(ch.isalnum() or ch == "-" for ch in label):
+      raise SystemExit(f"invalid domain label: {label!r}")
+  return candidate
+
+
+def main(argv: list[str]) -> int:
+  if len(argv) < 2:
+    raise SystemExit("domain is required")
+  domain = validate_domain(argv[1])
+  dsn = load_dsn(os.environ["SSL_PROXY_CONFIG"])
+
+  try:
+    with psycopg.connect(dsn, row_factory=dict_row, sslmode="require") as conn:
+      with conn.cursor() as cur:
+        cur.execute(
+          """
+          SELECT
+            r.domain,
+            COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || r.upstream_port::text END) AS upstream_target,
+            r.enabled,
+            r.updated_at,
+            c.status AS certificate_status,
+            c.not_after AS certificate_not_after,
+            c.retry_after,
+            c.last_error
+          FROM routes r
+          LEFT JOIN certificates c ON c.domain = r.domain
+          WHERE r.domain = %s
+          """,
+          (domain,),
+        )
+        row = cur.fetchone()
+  except psycopg.Error as exc:
+    raise SystemExit(f"database connection failed: {exc}") from exc
+
+  if row is None:
+    raise SystemExit("domain not found")
+
+  print(yaml.safe_dump(dict(row), sort_keys=False))
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main(sys.argv))
+PY
+}
+
+get_domain_details_json() {
+  local python_bin config_path
+  python_bin="$(resolve_python)"
+  config_path="$(resolve_config_path)"
+
+  SSL_PROXY_CONFIG="${config_path}" \
+  "${python_bin}" - "$@" <<'PY'
+from __future__ import annotations
+
+import json
 import os
 import sys
 from pathlib import Path
@@ -184,31 +276,36 @@ def main(argv: list[str]) -> int:
   domain = validate_domain(argv[1])
   dsn = load_dsn(os.environ["SSL_PROXY_CONFIG"])
 
-  with psycopg.connect(dsn, row_factory=dict_row, sslmode="require") as conn:
-    with conn.cursor() as cur:
-      cur.execute(
-        """
-        SELECT
-          r.domain,
-          r.upstream_port,
-          r.enabled,
-          r.updated_at,
-          c.status AS certificate_status,
-          c.not_after AS certificate_not_after,
-          c.retry_after,
-          c.last_error
-        FROM routes r
-        LEFT JOIN certificates c ON c.domain = r.domain
-        WHERE r.domain = %s
-        """,
-        (domain,),
-      )
-      row = cur.fetchone()
+  try:
+    with psycopg.connect(dsn, row_factory=dict_row, sslmode="require") as conn:
+      with conn.cursor() as cur:
+        cur.execute(
+          """
+          SELECT
+            r.domain,
+            COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || r.upstream_port::text END) AS upstream_target,
+            r.enabled,
+            r.updated_at,
+            c.status AS certificate_status,
+            c.not_after AS certificate_not_after,
+            c.retry_after,
+            c.last_error
+          FROM routes r
+          LEFT JOIN certificates c ON c.domain = r.domain
+          WHERE r.domain = %s
+          """,
+          (domain,),
+        )
+        row = cur.fetchone()
+  except psycopg.Error as exc:
+    print(json.dumps({"ok": False, "error": f"database connection failed: {exc}", "details": {}}))
+    return 0
 
   if row is None:
-    raise SystemExit("domain not found")
+    print(json.dumps({"ok": False, "error": "domain not found", "details": {}}))
+    return 0
 
-  print(yaml.safe_dump(dict(row), sort_keys=False))
+  print(json.dumps({"ok": True, "error": "", "details": dict(row)}, default=str))
   return 0
 
 
@@ -442,26 +539,26 @@ PY
 
 status_command() {
   [[ $# -ge 1 ]] || fail "domain is required"
-  local domain details dns_json public_json http_json python_bin mode
+  local domain details_json dns_json public_json http_json python_bin mode
   domain="$(normalize_domain "$1")"
   python_bin="$(resolve_python)"
   mode="$(get_config_mode)"
-  details="$(get_domain_details "${domain}")"
+  details_json="$(get_domain_details_json "${domain}")"
   dns_json="$(resolve_dns_json "${domain}")"
   public_json="$(get_public_ips_json)"
   http_json="$(probe_http_json "${domain}")"
 
-  SSL_PROXY_MODE="${mode}" DETAILS_YAML="${details}" DNS_JSON="${dns_json}" PUBLIC_JSON="${public_json}" HTTP_JSON="${http_json}" "${python_bin}" - <<'PY'
+  SSL_PROXY_MODE="${mode}" DETAILS_JSON="${details_json}" DNS_JSON="${dns_json}" PUBLIC_JSON="${public_json}" HTTP_JSON="${http_json}" "${python_bin}" - <<'PY'
 from __future__ import annotations
 
 import json
 import ipaddress
 import os
-
-import yaml
+import sys
 
 mode = os.environ["SSL_PROXY_MODE"]
-details = yaml.safe_load(os.environ["DETAILS_YAML"]) or {}
+details_payload = json.loads(os.environ["DETAILS_JSON"])
+details = details_payload.get("details", {})
 dns = json.loads(os.environ["DNS_JSON"])
 public = json.loads(os.environ["PUBLIC_JSON"])
 http = json.loads(os.environ["HTTP_JSON"])
@@ -487,16 +584,18 @@ else:
   points_to_this_host = "no"
 
 print(f'current_node_mode: {mode}')
-print(f'domain: {details["domain"]}')
-print(f'enabled: {details["enabled"]}')
-upstream = details.get("upstream_port")
-print(f'upstream_port: {"" if upstream is None else upstream}')
-print(f'updated_at: {details["updated_at"].isoformat()}')
+print(f'database_lookup_ok: {"yes" if details_payload.get("ok") else "no"}')
+print(f'database_error: {details_payload.get("error", "")}')
+print(f'domain: {details.get("domain") or ""}')
+print(f'enabled: {details.get("enabled", "")}')
+upstream = details.get("upstream_target")
+print(f'upstream_target: {"" if upstream is None else upstream}')
+print(f'updated_at: {details.get("updated_at", "")}')
 print(f'certificate_status: {details.get("certificate_status") or ""}')
 not_after = details.get("certificate_not_after")
-print(f'certificate_not_after: {not_after.isoformat() if not_after else ""}')
+print(f'certificate_not_after: {not_after or ""}')
 retry_after = details.get("retry_after")
-print(f'retry_after: {retry_after.isoformat() if retry_after else ""}')
+print(f'retry_after: {retry_after or ""}')
 print(f'last_error: {details.get("last_error") or ""}')
 print(f'dns_error: {dns.get("error", "")}')
 print(f'dns_cname: {", ".join(dns.get("cname", []))}')
@@ -511,21 +610,23 @@ print(f'acme_http_reachable: {"yes" if http.get("reachable") else "no"}')
 print(f'acme_http_status_code: {http.get("status_code", 0)}')
 print(f'acme_http_redirect_location: {http.get("redirect_location", "")}')
 print(f'acme_http_error: {http.get("error", "")}')
+if not details_payload.get("ok"):
+  sys.exit(1)
 PY
 }
 
 check_command() {
   [[ $# -ge 1 ]] || fail "domain is required"
-  local domain details dns_json public_json http_json python_bin mode
+  local domain details_json dns_json public_json http_json python_bin mode
   domain="$(normalize_domain "$1")"
   python_bin="$(resolve_python)"
   mode="$(get_config_mode)"
-  details="$(get_domain_details "${domain}")"
+  details_json="$(get_domain_details_json "${domain}")"
   dns_json="$(resolve_dns_json "${domain}")"
   public_json="$(get_public_ips_json)"
   http_json="$(probe_http_json "${domain}")"
 
-  SSL_PROXY_MODE="${mode}" DETAILS_YAML="${details}" DNS_JSON="${dns_json}" PUBLIC_JSON="${public_json}" HTTP_JSON="${http_json}" "${python_bin}" - <<'PY'
+  SSL_PROXY_MODE="${mode}" DETAILS_JSON="${details_json}" DNS_JSON="${dns_json}" PUBLIC_JSON="${public_json}" HTTP_JSON="${http_json}" "${python_bin}" - <<'PY'
 from __future__ import annotations
 
 import json
@@ -533,10 +634,9 @@ import ipaddress
 import os
 import sys
 
-import yaml
-
 mode = os.environ["SSL_PROXY_MODE"]
-details = yaml.safe_load(os.environ["DETAILS_YAML"]) or {}
+details_payload = json.loads(os.environ["DETAILS_JSON"])
+details = details_payload.get("details", {})
 dns = json.loads(os.environ["DNS_JSON"])
 public = json.loads(os.environ["PUBLIC_JSON"])
 http = json.loads(os.environ["HTTP_JSON"])
@@ -563,7 +663,8 @@ else:
 
 checks = [
   ("node_mode", mode == "readwrite", f"mode={mode}"),
-  ("route_enabled", bool(details.get("enabled")), f'enabled={details.get("enabled")}'),
+  ("db_lookup", bool(details_payload.get("ok")), details_payload.get("error", "")),
+  ("route_enabled", bool(details.get("enabled")), "" if details_payload.get("ok") else "skipped"),
   ("dns_resolves", not bool(dns.get("error")), dns.get("error", "")),
   ("points_to_this_host", points_to_this_host is True, "unknown" if points_to_this_host is None else ""),
   ("acme_http_reachable", bool(http.get("reachable")), http.get("error") or str(http.get("status_code", 0))),
@@ -634,11 +735,54 @@ def validate_domain(domain: str) -> str:
   return candidate
 
 
-def parse_port(value: str) -> int:
-  port = int(value)
+def normalize_upstream_target(value: str) -> str:
+  candidate = value.strip()
+  if not candidate:
+    raise SystemExit("upstream_target must not be empty")
+  if any(ch.isspace() for ch in candidate) or "/" in candidate:
+    raise SystemExit("upstream_target must not contain spaces or slashes")
+
+  if candidate.isdigit():
+    port = int(candidate)
+    if port < 1 or port > 65535:
+      raise SystemExit("upstream_target port must be between 1 and 65535")
+    return f"127.0.0.1:{port}"
+
+  if candidate.startswith("["):
+    if "]:" not in candidate:
+      raise SystemExit("IPv6 upstream_target must use [addr]:port format")
+    host, port_text = candidate[1:].split("]:", 1)
+    try:
+      host = str(ipaddress.ip_address(host))
+    except ValueError as exc:
+      raise SystemExit(f"invalid IPv6 upstream_target host: {host}") from exc
+    host = f"[{host}]"
+  else:
+    if candidate.count(":") > 1:
+      raise SystemExit("IPv6 upstream_target must use [addr]:port format")
+    if ":" not in candidate:
+      raise SystemExit("upstream_target must be a port or host:port")
+    host, port_text = candidate.rsplit(":", 1)
+    if not host:
+      raise SystemExit("upstream_target host must not be empty")
+    try:
+      host = str(ipaddress.ip_address(host))
+    except ValueError:
+      if not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        raise SystemExit("upstream_target host contains invalid characters")
+      for label in host.split("."):
+        if not label:
+          raise SystemExit("upstream_target host contains an empty label")
+        if label.startswith("-") or label.endswith("-"):
+          raise SystemExit("upstream_target host contains an invalid label")
+      host = host.lower()
+
+  if not port_text.isdigit():
+    raise SystemExit("upstream_target port must be numeric")
+  port = int(port_text)
   if port < 1 or port > 65535:
-    raise SystemExit("upstream_port must be between 1 and 65535")
-  return port
+    raise SystemExit("upstream_target port must be between 1 and 65535")
+  return f"{host}:{port}"
 
 
 def print_rows(rows):
@@ -646,7 +790,7 @@ def print_rows(rows):
     print("no rows")
     return
   for row in rows:
-    upstream = "" if row["upstream_port"] is None else str(row["upstream_port"])
+    upstream = "" if row["upstream_target"] is None else str(row["upstream_target"])
     cert_status = row.get("certificate_status")
     cert_not_after = row.get("certificate_not_after")
     retry_after = row.get("retry_after")
@@ -663,7 +807,7 @@ def print_rows(rows):
     if cert_bits:
       cert_suffix = " " + " ".join(cert_bits)
     print(
-      f'domain={row["domain"]} upstream_port={upstream} enabled={row["enabled"]} updated_at={row["updated_at"].isoformat()}{cert_suffix}'
+      f'domain={row["domain"]} upstream_target={upstream} enabled={row["enabled"]} updated_at={row["updated_at"].isoformat()}{cert_suffix}'
     )
 
 
@@ -674,190 +818,206 @@ def main(argv: list[str]) -> int:
   subcommand = argv[1]
   dsn = load_dsn(config_path=os.environ["SSL_PROXY_CONFIG"])
 
-  with psycopg.connect(dsn, row_factory=dict_row, sslmode="require") as conn:
-    with conn.cursor() as cur:
-      if subcommand == "list":
-        cur.execute(
-          """
-          SELECT
-            r.domain,
-            r.upstream_port,
-            r.enabled,
-            r.updated_at,
-            c.status AS certificate_status,
-            c.not_after AS certificate_not_after,
-            c.retry_after,
-            c.last_error
-          FROM routes r
-          LEFT JOIN certificates c ON c.domain = r.domain
-          ORDER BY domain ASC
-          """
-        )
-        print_rows(cur.fetchall())
-        return 0
+  try:
+    with psycopg.connect(dsn, row_factory=dict_row, sslmode="require") as conn:
+      with conn.cursor() as cur:
+        if subcommand == "list":
+          cur.execute(
+            """
+            SELECT
+              r.domain,
+              COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || r.upstream_port::text END) AS upstream_target,
+              r.enabled,
+              r.updated_at,
+              c.status AS certificate_status,
+              c.not_after AS certificate_not_after,
+              c.retry_after,
+              c.last_error
+            FROM routes r
+            LEFT JOIN certificates c ON c.domain = r.domain
+            ORDER BY domain ASC
+            """
+          )
+          print_rows(cur.fetchall())
+          return 0
 
-      if len(argv) < 3:
-        raise SystemExit("domain is required")
+        if len(argv) < 3:
+          raise SystemExit("domain is required")
 
-      domain = validate_domain(argv[2])
+        domain = validate_domain(argv[2])
 
-      if subcommand == "get":
-        cur.execute(
-          """
-          SELECT
-            r.domain,
-            r.upstream_port,
-            r.enabled,
-            r.updated_at,
-            c.status AS certificate_status,
-            c.not_after AS certificate_not_after,
-            c.retry_after,
-            c.last_error
-          FROM routes r
-          LEFT JOIN certificates c ON c.domain = r.domain
-          WHERE r.domain = %s
-          """,
-          (domain,),
-        )
-        row = cur.fetchone()
-        print_rows([row] if row else [])
-        return 0
+        if subcommand == "get":
+          cur.execute(
+            """
+            SELECT
+              r.domain,
+              COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || r.upstream_port::text END) AS upstream_target,
+              r.enabled,
+              r.updated_at,
+              c.status AS certificate_status,
+              c.not_after AS certificate_not_after,
+              c.retry_after,
+              c.last_error
+            FROM routes r
+            LEFT JOIN certificates c ON c.domain = r.domain
+            WHERE r.domain = %s
+            """,
+            (domain,),
+          )
+          row = cur.fetchone()
+          if row is None:
+            raise SystemExit("domain not found")
+          print_rows([row])
+          return 0
 
-      if subcommand == "add":
-        upstream_port = None
-        if len(argv) >= 4 and argv[3] != "":
-          upstream_port = parse_port(argv[3])
-        cur.execute(
-          """
-          INSERT INTO routes (domain, upstream_port, enabled)
-          VALUES (%s, %s, TRUE)
-          ON CONFLICT (domain) DO UPDATE
-          SET upstream_port = EXCLUDED.upstream_port,
-              enabled = TRUE
-          RETURNING domain, upstream_port, enabled, updated_at, NULL::text AS certificate_status,
-                    NULL::timestamptz AS certificate_not_after, NULL::timestamptz AS retry_after, NULL::text AS last_error
-          """,
-          (domain, upstream_port),
-        )
-        print_rows([cur.fetchone()])
-        conn.commit()
-        return 0
+        if subcommand == "add":
+          upstream_target = None
+          if len(argv) >= 4 and argv[3] != "":
+            upstream_target = normalize_upstream_target(argv[3])
+          cur.execute(
+            """
+            INSERT INTO routes (domain, upstream_target, enabled)
+            VALUES (%s, %s, TRUE)
+            ON CONFLICT (domain) DO UPDATE
+            SET upstream_target = EXCLUDED.upstream_target,
+                upstream_port = NULL,
+                enabled = TRUE
+            RETURNING domain, upstream_target, enabled, updated_at, NULL::text AS certificate_status,
+                      NULL::timestamptz AS certificate_not_after, NULL::timestamptz AS retry_after, NULL::text AS last_error
+            """,
+            (domain, upstream_target),
+          )
+          print_rows([cur.fetchone()])
+          conn.commit()
+          return 0
 
-      if subcommand == "set-port":
-        if len(argv) < 4:
-          raise SystemExit("upstream_port is required")
-        cur.execute(
-          """
-          UPDATE routes
-          SET upstream_port = %s
-          WHERE domain = %s
-          RETURNING domain, upstream_port, enabled, updated_at, NULL::text AS certificate_status,
-                    NULL::timestamptz AS certificate_not_after, NULL::timestamptz AS retry_after, NULL::text AS last_error
-          """,
-          (parse_port(argv[3]), domain),
-        )
-        row = cur.fetchone()
-        if row is None:
-          raise SystemExit("domain not found")
-        print_rows([row])
-        conn.commit()
-        return 0
+        if subcommand == "set-target":
+          if len(argv) < 4:
+            raise SystemExit("upstream_target is required")
+          cur.execute(
+            """
+            UPDATE routes
+            SET upstream_target = %s
+              , upstream_port = NULL
+            WHERE domain = %s
+            RETURNING domain, upstream_target, enabled, updated_at, NULL::text AS certificate_status,
+                      NULL::timestamptz AS certificate_not_after, NULL::timestamptz AS retry_after, NULL::text AS last_error
+            """,
+            (normalize_upstream_target(argv[3]), domain),
+          )
+          row = cur.fetchone()
+          if row is None:
+            raise SystemExit("domain not found")
+          print_rows([row])
+          conn.commit()
+          return 0
 
-      if subcommand == "clear-port":
-        cur.execute(
-          """
-          UPDATE routes
-          SET upstream_port = NULL
-          WHERE domain = %s
-          RETURNING domain, upstream_port, enabled, updated_at, NULL::text AS certificate_status,
-                    NULL::timestamptz AS certificate_not_after, NULL::timestamptz AS retry_after, NULL::text AS last_error
-          """,
-          (domain,),
-        )
-        row = cur.fetchone()
-        if row is None:
-          raise SystemExit("domain not found")
-        print_rows([row])
-        conn.commit()
-        return 0
+        if subcommand == "clear-target":
+          cur.execute(
+            """
+            UPDATE routes
+            SET upstream_target = NULL,
+                upstream_port = NULL
+            WHERE domain = %s
+            RETURNING domain, upstream_target, enabled, updated_at, NULL::text AS certificate_status,
+                      NULL::timestamptz AS certificate_not_after, NULL::timestamptz AS retry_after, NULL::text AS last_error
+            """,
+            (domain,),
+          )
+          row = cur.fetchone()
+          if row is None:
+            raise SystemExit("domain not found")
+          print_rows([row])
+          conn.commit()
+          return 0
 
-      if subcommand == "enable":
-        cur.execute(
-          """
-          UPDATE routes
-          SET enabled = TRUE
-          WHERE domain = %s
-          RETURNING domain, upstream_port, enabled, updated_at, NULL::text AS certificate_status,
-                    NULL::timestamptz AS certificate_not_after, NULL::timestamptz AS retry_after, NULL::text AS last_error
-          """,
-          (domain,),
-        )
-        row = cur.fetchone()
-        if row is None:
-          raise SystemExit("domain not found")
-        print_rows([row])
-        conn.commit()
-        return 0
+        if subcommand == "enable":
+          cur.execute(
+            """
+            UPDATE routes
+            SET enabled = TRUE
+            WHERE domain = %s
+            RETURNING domain,
+                      COALESCE(upstream_target, CASE WHEN upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || upstream_port::text END) AS upstream_target,
+                      enabled,
+                      updated_at,
+                      NULL::text AS certificate_status,
+                      NULL::timestamptz AS certificate_not_after, NULL::timestamptz AS retry_after, NULL::text AS last_error
+            """,
+            (domain,),
+          )
+          row = cur.fetchone()
+          if row is None:
+            raise SystemExit("domain not found")
+          print_rows([row])
+          conn.commit()
+          return 0
 
-      if subcommand == "disable":
-        cur.execute(
-          """
-          UPDATE routes
-          SET enabled = FALSE
-          WHERE domain = %s
-          RETURNING domain, upstream_port, enabled, updated_at, NULL::text AS certificate_status,
-                    NULL::timestamptz AS certificate_not_after, NULL::timestamptz AS retry_after, NULL::text AS last_error
-          """,
-          (domain,),
-        )
-        row = cur.fetchone()
-        if row is None:
-          raise SystemExit("domain not found")
-        print_rows([row])
-        conn.commit()
-        return 0
+        if subcommand == "disable":
+          cur.execute(
+            """
+            UPDATE routes
+            SET enabled = FALSE
+            WHERE domain = %s
+            RETURNING domain,
+                      COALESCE(upstream_target, CASE WHEN upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || upstream_port::text END) AS upstream_target,
+                      enabled,
+                      updated_at,
+                      NULL::text AS certificate_status,
+                      NULL::timestamptz AS certificate_not_after, NULL::timestamptz AS retry_after, NULL::text AS last_error
+            """,
+            (domain,),
+          )
+          row = cur.fetchone()
+          if row is None:
+            raise SystemExit("domain not found")
+          print_rows([row])
+          conn.commit()
+          return 0
 
-      if subcommand == "delete":
-        cur.execute("DELETE FROM routes WHERE domain = %s RETURNING domain", (domain,))
-        row = cur.fetchone()
-        if row is None:
-          raise SystemExit("domain not found")
-        conn.commit()
-        print(f'deleted domain={row["domain"]}')
-        return 0
+        if subcommand == "delete":
+          cur.execute("DELETE FROM routes WHERE domain = %s RETURNING domain", (domain,))
+          row = cur.fetchone()
+          if row is None:
+            raise SystemExit("domain not found")
+          conn.commit()
+          print(f'deleted domain={row["domain"]}')
+          return 0
 
-      if subcommand == "purge":
-        cur.execute("DELETE FROM routes WHERE domain = %s RETURNING domain", (domain,))
-        route_row = cur.fetchone()
-        cur.execute("DELETE FROM certificates WHERE domain = %s RETURNING domain", (domain,))
-        certificate_row = cur.fetchone()
-        if route_row is None and certificate_row is None:
-          raise SystemExit("domain not found")
-        conn.commit()
-        print(f"purged domain={domain}")
-        return 0
+        if subcommand == "purge":
+          cur.execute("DELETE FROM routes WHERE domain = %s RETURNING domain", (domain,))
+          route_row = cur.fetchone()
+          cur.execute("DELETE FROM certificates WHERE domain = %s RETURNING domain", (domain,))
+          certificate_row = cur.fetchone()
+          if route_row is None and certificate_row is None:
+            raise SystemExit("domain not found")
+          conn.commit()
+          print(f"purged domain={domain}")
+          return 0
 
-      if subcommand == "issue-now":
-        cur.execute("SELECT domain, enabled FROM routes WHERE domain = %s", (domain,))
-        route_row = cur.fetchone()
-        if route_row is None:
-          raise SystemExit("domain not found in routes")
-        if not route_row["enabled"]:
-          raise SystemExit("domain is disabled; enable it before issue-now")
-        cur.execute(
-          """
-          UPDATE certificates
-          SET retry_after = NULL, updated_at = NOW()
-          WHERE domain = %s
-          RETURNING domain
-          """,
-          (domain,),
-        )
-        conn.commit()
-        print(f"issue-now queued for domain={domain}")
-        return 0
+        if subcommand == "issue-now":
+          cur.execute("SELECT domain, enabled FROM routes WHERE domain = %s", (domain,))
+          route_row = cur.fetchone()
+          if route_row is None:
+            raise SystemExit("domain not found in routes")
+          if not route_row["enabled"]:
+            raise SystemExit("domain is disabled; enable it before issue-now")
+          cur.execute(
+            """
+            UPDATE certificates
+            SET retry_after = NULL, updated_at = NOW()
+            WHERE domain = %s
+            RETURNING domain
+            """,
+            (domain,),
+          )
+          conn.commit()
+          print(f"issue-now queued for domain={domain}")
+          return 0
 
-      raise SystemExit(f"unknown subcommand: {subcommand}")
+        raise SystemExit(f"unknown subcommand: {subcommand}")
+  except psycopg.Error as exc:
+    raise SystemExit(f"database connection failed: {exc}") from exc
 
 
 if __name__ == "__main__":
@@ -919,7 +1079,7 @@ main() {
       [[ $# -ge 1 ]] || fail "domain is required"
       logs_command "$1"
       ;;
-    get|enable|disable|delete|purge|clear-port|issue-now)
+    get|enable|disable|delete|purge|clear-target|clear-port|issue-now)
       [[ $# -ge 1 ]] || fail "domain is required"
       if [[ "${subcommand}" == "issue-now" && "$(get_config_mode)" != "readwrite" ]]; then
         fail "issue-now is only available on readwrite nodes"
@@ -959,12 +1119,22 @@ main() {
         sync_now
       fi
       ;;
-    set-port)
-      [[ $# -ge 2 ]] || fail "domain and upstream_port are required"
+    set-target|set-port)
+      [[ $# -ge 2 ]] || fail "domain and upstream_target are required"
       if [[ "${sync_flag}" -eq 1 ]]; then
         preflight_sync_now
       fi
-      run_db_tool set-port "$1" "$2"
+      run_db_tool set-target "$1" "$2"
+      if [[ "${sync_flag}" -eq 1 ]]; then
+        sync_now
+      fi
+      ;;
+    clear-target|clear-port)
+      [[ $# -ge 1 ]] || fail "domain is required"
+      if [[ "${sync_flag}" -eq 1 ]]; then
+        preflight_sync_now
+      fi
+      run_db_tool clear-target "$1"
       if [[ "${sync_flag}" -eq 1 ]]; then
         sync_now
       fi

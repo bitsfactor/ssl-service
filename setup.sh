@@ -189,8 +189,36 @@ import psycopg
 dsn = os.environ["SSL_PROXY_TEST_DSN"]
 with psycopg.connect(dsn, connect_timeout=10, sslmode="require") as conn:
   with conn.cursor() as cur:
-    cur.execute("SELECT 1 FROM routes LIMIT 1")
-    cur.execute("SELECT 1 FROM certificates LIMIT 1")
+    cur.execute(
+      """
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'routes'
+      """
+    )
+    route_columns = {row[0] for row in cur.fetchall()}
+    cur.execute(
+      """
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'certificates'
+      """
+    )
+    certificate_columns = {row[0] for row in cur.fetchall()}
+
+missing = []
+if "domain" not in route_columns or "upstream_target" not in route_columns:
+  missing.append("routes(domain, upstream_target)")
+if "domain" not in certificate_columns:
+  missing.append("certificates(domain)")
+if missing:
+  raise SystemExit(
+    "readonly schema verification failed; missing required objects: "
+    + ", ".join(missing)
+    + ". Run 'setup.sh update' on a readwrite node first."
+  )
 print("readonly schema verified")
 PY
 }
@@ -445,20 +473,33 @@ restart_command() {
 
 status_command() {
   local public_ip
-  public_ip="$(curl -fsS --max-time 3 https://api.ipify.org || true)"
-  log "caddy: $(systemctl is-active "${CADDY_SERVICE_NAME}" 2>/dev/null || true)"
-  log "controller: $(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true)"
+  local caddy_status
+  local controller_status
+  public_ip="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
+  caddy_status="$(systemctl is-active "${CADDY_SERVICE_NAME}" 2>/dev/null || echo unavailable)"
+  controller_status="$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || echo unavailable)"
+  log "caddy: ${caddy_status}"
+  log "controller: ${controller_status}"
   if [[ -f "${CONFIG_PATH}" ]]; then
     log "config: ${CONFIG_PATH}"
     log "mode: $(get_config_value "mode")"
     log "dsn: $(mask_dsn "$(get_config_value "postgres.dsn")")"
   fi
   log "listening ports:"
-  ss -ltn '( sport = :80 or sport = :443 )' || true
+  local port_output
+  if ! port_output="$(ss -ltn '( sport = :80 or sport = :443 )' 2>/dev/null)"; then
+    log "unavailable"
+  elif [[ "$(printf '%s\n' "${port_output}" | wc -l)" -le 1 ]]; then
+    log "none"
+  else
+    printf '%s\n' "${port_output}"
+  fi
   log "recent update log:"
   tail -n 10 "${UPDATE_LOG}" 2>/dev/null || true
   if [[ -n "${public_ip}" ]]; then
     log "public_ip: ${public_ip}"
+  else
+    log "public_ip: unavailable"
   fi
 }
 

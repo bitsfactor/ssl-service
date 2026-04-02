@@ -12,7 +12,7 @@ from psycopg.rows import dict_row
 @dataclass(slots=True)
 class RouteRecord:
   domain: str
-  upstream_port: int | None
+  upstream_target: str | None
   enabled: bool
   updated_at: datetime
 
@@ -46,7 +46,11 @@ class Database:
       with connection.cursor() as cursor:
         cursor.execute(
           """
-          SELECT domain, upstream_port, enabled, updated_at
+          SELECT
+            domain,
+            COALESCE(upstream_target, CASE WHEN upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || upstream_port::text END) AS upstream_target,
+            enabled,
+            updated_at
           FROM routes
           WHERE enabled = TRUE
           ORDER BY domain ASC

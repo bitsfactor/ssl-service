@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +15,48 @@ from .db import CertificateRecord, RouteRecord
 class RenderResult:
   path: Path
   sha256: str
+
+
+def validate_upstream_target(upstream_target: str) -> str:
+  candidate = upstream_target.strip()
+  if not candidate:
+    raise ValueError("upstream_target must not be empty")
+  if any(ch.isspace() for ch in candidate) or "/" in candidate:
+    raise ValueError("upstream_target must not contain spaces or slashes")
+
+  if candidate.startswith("["):
+    if "]:" not in candidate:
+      raise ValueError("IPv6 upstream_target must use [addr]:port format")
+    host, port_text = candidate[1:].split("]:", 1)
+    try:
+      host = str(ipaddress.ip_address(host))
+    except ValueError as exc:
+      raise ValueError(f"invalid IPv6 upstream_target host: {host}") from exc
+    host = f"[{host}]"
+  else:
+    if candidate.count(":") != 1:
+      raise ValueError("upstream_target must use host:port format")
+    host, port_text = candidate.rsplit(":", 1)
+    if not host:
+      raise ValueError("upstream_target host must not be empty")
+    try:
+      host = str(ipaddress.ip_address(host))
+    except ValueError:
+      if not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        raise ValueError("upstream_target host contains invalid characters")
+      for label in host.split("."):
+        if not label:
+          raise ValueError("upstream_target host contains an empty label")
+        if label.startswith("-") or label.endswith("-"):
+          raise ValueError("upstream_target host contains an invalid label")
+      host = host.lower()
+
+  if not port_text.isdigit():
+    raise ValueError("upstream_target port must be numeric")
+  port = int(port_text)
+  if port < 1 or port > 65535:
+    raise ValueError("upstream_target port must be between 1 and 65535")
+  return f"{host}:{port}"
 
 
 def render_caddyfile(
@@ -54,7 +98,7 @@ def render_caddyfile(
       f"https://{route.domain} {{",
       f"  tls {domain_dir / 'fullchain.pem'} {domain_dir / 'privkey.pem'}",
     ]
-    if route.upstream_port is None:
+    if route.upstream_target is None:
       block.extend(
         [
           "  respond \"certificate-only route\" 200",
@@ -63,7 +107,7 @@ def render_caddyfile(
     else:
       block.extend(
         [
-          f"  reverse_proxy 127.0.0.1:{route.upstream_port}",
+          f"  reverse_proxy {validate_upstream_target(route.upstream_target)}",
         ]
       )
     block.extend(

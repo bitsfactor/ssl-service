@@ -15,7 +15,7 @@ Caddy-based front proxy with two operating modes:
 - `src/ssl_proxy_controller/`: controller implementation
 - `config.example.yaml`: node configuration
 - `sql/schema.sql`: PostgreSQL schema
-- `scripts/domain-manage.sh`: domain and upstream_port management helper
+- `scripts/domain-manage.sh`: domain and upstream target management helper
 - `systemd/`: service templates
 - `setup.sh`: full install and operations script
 
@@ -41,6 +41,8 @@ sudo bash setup.sh install
 
 ```bash
 bash scripts/domain-manage.sh add a.com 6111 --sync-now
+bash scripts/domain-manage.sh set-target a.com 10.0.0.25:6111 --sync-now
+bash scripts/domain-manage.sh set-target api.example.com backend.internal:8443 --sync-now
 bash scripts/domain-manage.sh add cert-only.example.com --sync-now
 bash scripts/domain-manage.sh list
 bash scripts/domain-manage.sh status a.com
@@ -61,11 +63,14 @@ In `readwrite` mode, `certbot` writes challenge files under `/var/lib/ssl-proxy/
 
 ## Database Contract
 
-`routes` is the authority for reverse proxy rules. Each enabled row maps a hostname to a local upstream port.
+`routes` is the authority for reverse proxy rules. Each enabled row maps a hostname to an upstream target.
 
 `certificates` stores PEM material and metadata. Read-only nodes consume it. Read-write nodes update it after issuance or renewal.
 
-`routes.upstream_port` can be `NULL`. In that case the domain is kept only for certificate issuance and renewal, and HTTPS requests will receive a static response instead of being proxied.
+`routes.upstream_target` can be `NULL`. In that case the domain is kept only for certificate issuance and renewal, and HTTPS requests will receive a static response instead of being proxied.
+
+`routes.upstream_target` accepts either a plain port like `6111` or a full target like `127.0.0.1:6111`, `10.0.0.25:6111`, or `backend.internal:6111`. Plain ports are normalized to `127.0.0.1:<port>`.
+IPv6 targets must use bracket form, for example `[2001:db8::10]:6111`.
 
 The current implementation uses `HTTP-01`, so wildcard domains such as `*.example.com` are not supported.
 

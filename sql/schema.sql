@@ -1,12 +1,21 @@
 CREATE TABLE IF NOT EXISTS routes (
   domain TEXT PRIMARY KEY,
   upstream_port INTEGER CHECK (upstream_port > 0 AND upstream_port < 65536),
+  upstream_target TEXT,
   enabled BOOLEAN NOT NULL DEFAULT TRUE,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 ALTER TABLE routes
 ALTER COLUMN upstream_port DROP NOT NULL;
+
+ALTER TABLE routes
+ADD COLUMN IF NOT EXISTS upstream_target TEXT;
+
+UPDATE routes
+SET upstream_target = '127.0.0.1:' || upstream_port::text
+WHERE upstream_target IS NULL
+  AND upstream_port IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS certificates (
   domain TEXT PRIMARY KEY,

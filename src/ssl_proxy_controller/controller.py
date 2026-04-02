@@ -112,7 +112,7 @@ class Controller:
         if current is not None and current.not_after > threshold:
           continue
         if current is not None and current.retry_after is not None and current.retry_after > datetime.now(tz=UTC):
-          LOGGER.info("renewal skipped because retry_after is in the future: %s", domain)
+          LOGGER.debug("renewal skipped because retry_after is in the future: %s", domain)
           continue
         lock_key = f"certificate:{domain}"
         if not self.database.try_advisory_lock(connection, lock_key):
