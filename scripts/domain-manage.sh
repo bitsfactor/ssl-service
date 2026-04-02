@@ -543,66 +543,6 @@ if __name__ == "__main__":
 PY
 }
 
-probe_http_json() {
-  local python_bin
-  python_bin="$(resolve_python)"
-  "${python_bin}" - "$@" <<'PY'
-from __future__ import annotations
-
-import json
-import sys
-import urllib.error
-import urllib.request
-
-
-class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-  def redirect_request(self, req, fp, code, msg, headers, newurl):
-    return None
-
-
-def main(argv: list[str]) -> int:
-  if len(argv) < 2:
-    raise SystemExit("domain is required")
-  domain = argv[1]
-  url = f"http://{domain}/.well-known/acme-challenge/ssl-proxy-healthcheck"
-  opener = urllib.request.build_opener(NoRedirectHandler)
-  request = urllib.request.Request(url, method="GET")
-  try:
-    with opener.open(request, timeout=5) as response:
-      print(json.dumps({
-        "reachable": True,
-        "status_code": response.getcode(),
-        "redirect_location": "",
-        "error": "",
-      }))
-      return 0
-  except urllib.error.HTTPError as exc:
-    redirect_location = exc.headers.get("Location", "")
-    reachable = exc.code in {200, 403}
-    if exc.code in {301, 302, 307, 308} and redirect_location.startswith(f"https://{domain}/"):
-      reachable = True
-    print(json.dumps({
-      "reachable": reachable,
-      "status_code": exc.code,
-      "redirect_location": redirect_location,
-      "error": "",
-    }))
-    return 0
-  except Exception as exc:
-    print(json.dumps({
-      "reachable": False,
-      "status_code": 0,
-      "redirect_location": "",
-      "error": str(exc),
-    }))
-    return 0
-
-
-if __name__ == "__main__":
-  raise SystemExit(main(sys.argv))
-PY
-}
-
 get_public_ips_json() {
   local python_bin
   python_bin="$(resolve_python)"
@@ -653,49 +593,6 @@ sources = {
 payload["source_ipv4"] = sources["ipv4"]
 payload["source_ipv6"] = sources["ipv6"]
 print(json.dumps(payload))
-PY
-}
-
-domain_points_to_this_host() {
-  [[ $# -ge 1 ]] || fail "domain is required"
-  local domain dns_json public_json python_bin
-  domain="$(normalize_domain "$1")"
-  python_bin="$(resolve_python)"
-  dns_json="$(resolve_dns_json "${domain}")"
-  public_json="$(get_public_ips_json)"
-
-  DNS_JSON="${dns_json}" PUBLIC_JSON="${public_json}" "${python_bin}" - <<'PY'
-from __future__ import annotations
-
-import json
-import ipaddress
-import os
-
-dns = json.loads(os.environ["DNS_JSON"])
-public = json.loads(os.environ["PUBLIC_JSON"])
-
-resolved = set(dns.get("ipv4", [])) | set(dns.get("ipv6", []))
-local_ips = {ip for ip in [public.get("ipv4", ""), public.get("ipv6", "")] if ip}
-public_sources = {public.get("source_ipv4", ""), public.get("source_ipv6", "")}
-has_public_view = "public" in public_sources
-
-def is_public_ip(value: str) -> bool:
-  try:
-    address = ipaddress.ip_address(value)
-  except ValueError:
-    return False
-  return address.is_global
-
-if dns.get("error"):
-  print("dns_error")
-elif not local_ips:
-  print("unknown")
-elif resolved & local_ips:
-  print("yes")
-elif not has_public_view and not any(is_public_ip(ip) for ip in local_ips):
-  print("unknown")
-else:
-  print("no")
 PY
 }
 
@@ -860,9 +757,13 @@ run_db_tool() {
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import psycopg
@@ -873,6 +774,65 @@ from psycopg.rows import dict_row
 def load_dsn(config_path: str) -> str:
   data = yaml.safe_load(Path(config_path).read_text()) or {}
   return data["postgres"]["dsn"]
+
+
+def candidate_zones(name: str) -> list[str]:
+  labels = name.strip().lower().rstrip(".").split(".")
+  return [".".join(labels[index:]) for index in range(len(labels) - 2, -1, -1) if len(labels[index:]) >= 2]
+
+
+def cloudflare_request(token: str, method: str, path: str, payload: dict | None = None) -> dict:
+  request = urllib.request.Request(
+    f"https://api.cloudflare.com/client/v4{path}",
+    method=method,
+    headers={
+      "Authorization": f"Bearer {token}",
+      "Content-Type": "application/json",
+    },
+    data=None if payload is None else json.dumps(payload).encode("utf-8"),
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=15) as response:
+      return json.loads(response.read().decode("utf-8"))
+  except urllib.error.HTTPError as exc:
+    body = exc.read().decode("utf-8", errors="replace")
+    raise SystemExit(f"Cloudflare API request failed: HTTP {exc.code}: {body}") from exc
+  except urllib.error.URLError as exc:
+    raise SystemExit(f"Cloudflare API request failed: {exc}") from exc
+
+
+def discover_cloudflare_zone(domain_or_zone: str, token: str) -> tuple[str, str]:
+  for candidate in candidate_zones(domain_or_zone):
+    query = urllib.parse.urlencode({"name": candidate, "per_page": 1})
+    payload = cloudflare_request(token, "GET", f"/zones?{query}")
+    if payload.get("success") and payload.get("result"):
+      zone = payload["result"][0]
+      return str(zone["name"]).lower(), str(zone["id"])
+  raise SystemExit(f"could not find a Cloudflare zone for: {domain_or_zone}")
+
+
+def validate_cloudflare_zone_token(domain_or_zone: str, token: str) -> tuple[str, str]:
+  zone_name, zone_id = discover_cloudflare_zone(domain_or_zone, token)
+  record_name = f"_ssl-proxy-token-check.{zone_name}"
+  payload = cloudflare_request(
+    token,
+    "POST",
+    f"/zones/{zone_id}/dns_records",
+    {
+      "type": "TXT",
+      "name": record_name,
+      "content": "ssl-proxy-verify",
+      "ttl": 60,
+    },
+  )
+  if not payload.get("success") or not payload.get("result"):
+    raise SystemExit(f"Cloudflare token could not create a DNS record for zone: {zone_name}")
+  record_id = str(payload["result"]["id"])
+  try:
+    cloudflare_request(token, "DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
+  except SystemExit as exc:
+    raise SystemExit(f"Cloudflare token validation partially failed: created a test record but could not delete it: {exc}") from exc
+  return zone_name, zone_id
 
 
 def validate_domain(domain: str) -> str:

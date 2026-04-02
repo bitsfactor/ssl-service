@@ -65,6 +65,13 @@ def render_caddyfile(
   certificates: dict[str, CertificateRecord],
   admin_address: str,
 ) -> RenderResult:
+  active_route_domains = [
+    route.domain
+    for route in routes
+    if (certificate := certificates.get(route.domain)) is not None
+    and bool(certificate.fullchain_pem)
+    and bool(certificate.private_key_pem)
+  ]
   lines: list[str] = [
     "{",
     f"  admin {admin_address}",
@@ -72,9 +79,8 @@ def render_caddyfile(
     "",
   ]
 
-  route_domains = [route.domain for route in routes]
-  if route_domains:
-    domains = " ".join(f"http://{domain}" for domain in route_domains)
+  if active_route_domains:
+    domains = " ".join(f"http://{domain}" for domain in active_route_domains)
     lines.extend(
       [
         f"{domains} {{",
@@ -113,7 +119,7 @@ def render_caddyfile(
     )
     lines.extend(block)
 
-  content = "\n".join(lines).strip() + "\n"
+  content = "\n".join(lines)
   output_path.parent.mkdir(parents=True, exist_ok=True)
   output_path.write_text(content)
   return RenderResult(path=output_path, sha256=hashlib.sha256(content.encode("utf-8")).hexdigest())

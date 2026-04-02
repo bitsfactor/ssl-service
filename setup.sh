@@ -8,6 +8,7 @@ CONFIG_PATH="${CONFIG_DIR}/config.yaml"
 STATE_DIR="/var/lib/ssl-proxy"
 LOG_DIR="/var/log/ssl-proxy"
 VENV_DIR="${INSTALL_DIR}/.venv"
+ACME_VENV_DIR="${INSTALL_DIR}/.acme-venv"
 SYSTEMD_DIR="/etc/systemd/system"
 TIMER_NAME="ssl-proxy-update.timer"
 SERVICE_NAME="ssl-proxy-controller.service"
@@ -43,7 +44,7 @@ require_systemd() {
 ensure_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y curl python3 python3-venv python3-pip rsync caddy certbot python3-certbot-dns-cloudflare
+  apt-get install -y curl python3 python3-venv python3-pip rsync caddy
 }
 
 ensure_layout() {
@@ -60,6 +61,7 @@ sync_repo() {
     --exclude '.codex' \
     --exclude '__pycache__' \
     --exclude '.venv' \
+    --exclude '.acme-venv' \
     "${source_dir}/" "${INSTALL_DIR}/"
 }
 
@@ -71,6 +73,34 @@ ensure_venv() {
   fi
   "${VENV_DIR}/bin/pip" install --upgrade pip >/dev/null
   "${VENV_DIR}/bin/pip" install "${source_dir}" >/dev/null
+}
+
+ensure_acme_venv() {
+  if [[ ! -x "${ACME_VENV_DIR}/bin/python" ]]; then
+    python3 -m venv "${ACME_VENV_DIR}"
+  fi
+  "${ACME_VENV_DIR}/bin/pip" install --upgrade pip >/dev/null
+  "${ACME_VENV_DIR}/bin/pip" install --upgrade "certbot>=2.11,<3.0" "certbot-dns-cloudflare>=2.11,<3.0" >/dev/null
+}
+
+certbot_binary_path() {
+  printf '%s' "${ACME_VENV_DIR}/bin/certbot"
+}
+
+verify_certbot_cloudflare_plugin() {
+  local certbot_bin
+  certbot_bin="$(certbot_binary_path)"
+  [[ -x "${certbot_bin}" ]] || fail "certbot binary not found at ${certbot_bin}"
+
+  local plugin_output
+  if ! plugin_output="$("${certbot_bin}" plugins 2>&1)"; then
+    printf '%s\n' "${plugin_output}" >&2
+    fail "failed to inspect certbot plugins"
+  fi
+  if ! printf '%s\n' "${plugin_output}" | grep -Fq 'dns-cloudflare'; then
+    printf '%s\n' "${plugin_output}" >&2
+    fail "certbot dns-cloudflare plugin is not available"
+  fi
 }
 
 seed_bootstrap_caddyfile() {
@@ -251,6 +281,7 @@ render_config() {
   SSL_PROXY_CONFIG_PATH="${CONFIG_PATH}" \
   SSL_PROXY_STATE_DIR="${STATE_DIR}" \
   SSL_PROXY_LOG_DIR="${LOG_DIR}" \
+  SSL_PROXY_CERTBOT_BINARY="$(certbot_binary_path)" \
   "${VENV_DIR}/bin/python" - <<'PY'
 import os
 from pathlib import Path
@@ -272,7 +303,7 @@ config = {
     "state_dir": os.environ["SSL_PROXY_STATE_DIR"],
     "log_dir": os.environ["SSL_PROXY_LOG_DIR"],
     "caddy_binary": "/usr/bin/caddy",
-    "certbot_binary": "/usr/bin/certbot",
+    "certbot_binary": os.environ["SSL_PROXY_CERTBOT_BINARY"],
   },
   "caddy": {
     "admin_url": "http://127.0.0.1:2019",
@@ -319,6 +350,26 @@ value = config
 for part in os.environ["SSL_PROXY_CONFIG_EXPR"].split("."):
   value = value[part]
 print(value)
+PY
+}
+
+normalize_config_certbot_binary() {
+  [[ -f "${CONFIG_PATH}" ]] || return 0
+  SSL_PROXY_CONFIG_PATH="${CONFIG_PATH}" \
+  SSL_PROXY_CERTBOT_BINARY="$(certbot_binary_path)" \
+  "${VENV_DIR}/bin/python" - <<'PY'
+import os
+from pathlib import Path
+
+import yaml
+
+config_path = Path(os.environ["SSL_PROXY_CONFIG_PATH"])
+config = yaml.safe_load(config_path.read_text()) or {}
+paths = dict(config.get("paths", {}))
+paths["certbot_binary"] = os.environ["SSL_PROXY_CERTBOT_BINARY"]
+config["paths"] = paths
+config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+config_path.chmod(0o600)
 PY
 }
 
@@ -408,6 +459,8 @@ install_command() {
   sync_repo
   record_source_dir
   ensure_venv
+  ensure_acme_venv
+  verify_certbot_cloudflare_plugin
   seed_bootstrap_caddyfile
 
   local mode
@@ -438,6 +491,7 @@ install_command() {
     dsn="$(get_config_value "postgres.dsn")"
     validate_dsn "${dsn}"
   fi
+  normalize_config_certbot_binary
   chmod 600 "${CONFIG_PATH}"
   if [[ "${mode}" == "readwrite" ]]; then
     run_schema "${dsn}"
@@ -514,7 +568,10 @@ update_command() {
   sync_repo
   record_source_dir
   ensure_venv
+  ensure_acme_venv
+  verify_certbot_cloudflare_plugin
   if [[ -f "${CONFIG_PATH}" ]]; then
+    normalize_config_certbot_binary
     chmod 600 "${CONFIG_PATH}"
     local mode
     local dsn

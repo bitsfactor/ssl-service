@@ -16,6 +16,29 @@ from .config import AppConfig
 from .db import CertificateRecord, Database
 
 
+def ensure_dns_cloudflare_plugin(certbot_binary: str) -> None:
+  try:
+    result = subprocess.run(
+      [certbot_binary, "plugins"],
+      check=True,
+      capture_output=True,
+      text=True,
+    )
+  except FileNotFoundError as exc:
+    raise RuntimeError(f"certbot binary not found: {certbot_binary}") from exc
+  except subprocess.CalledProcessError as exc:
+    stderr = (exc.stderr or "").strip()
+    stdout = (exc.stdout or "").strip()
+    details = stderr or stdout or str(exc)
+    raise RuntimeError(f"failed to inspect certbot plugins: {details}") from exc
+
+  plugin_output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+  if "dns-cloudflare" not in plugin_output:
+    raise RuntimeError(
+      "certbot dns-cloudflare plugin is not available; run setup.sh update to install the managed ACME runtime"
+    )
+
+
 @contextmanager
 def cloudflare_credentials_file(api_token: str):
   with NamedTemporaryFile("w", delete=False) as handle:
@@ -35,6 +58,8 @@ def issue_certificate(config: AppConfig, database: Database, domain: str) -> Cer
   zone_token = database.get_dns_zone_token_for_domain(domain)
   if zone_token is None:
     raise ValueError(f"no Cloudflare zone token configured for domain: {domain}")
+
+  ensure_dns_cloudflare_plugin(config.paths.certbot_binary)
 
   cert_name = domain.replace("*", "wildcard")
   with cloudflare_credentials_file(zone_token.api_token) as credentials_path:

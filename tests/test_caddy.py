@@ -92,9 +92,47 @@ def test_render_caddyfile_skips_https_block_for_missing_certificate_material(tmp
   )
 
   content = output.read_text()
-  assert "http://example.com" in content
+  assert "http://example.com" not in content
   assert "https://example.com" not in content
   assert "reverse_proxy" not in content
+
+
+def test_render_caddyfile_only_redirects_domains_with_certificate_material(tmp_path: Path) -> None:
+  output = tmp_path / "generated" / "Caddyfile"
+  now = datetime.now(tz=UTC)
+  routes = [
+    RouteRecord(domain="active.example.com", upstream_target="127.0.0.1:8080", enabled=True, updated_at=now),
+    RouteRecord(domain="pending.example.com", upstream_target="127.0.0.1:9090", enabled=True, updated_at=now),
+  ]
+  certificates = {
+    "active.example.com": make_certificate("active.example.com"),
+    "pending.example.com": CertificateRecord(
+      domain="pending.example.com",
+      fullchain_pem="",
+      private_key_pem="",
+      not_before=now,
+      not_after=now,
+      version=1,
+      status="error",
+      source="certbot",
+      retry_after=now,
+      updated_at=now,
+      last_error="failed",
+    ),
+  }
+
+  render_caddyfile(
+    output_path=output,
+    routes=routes,
+    certificates=certificates,
+    admin_address="127.0.0.1:2019",
+  )
+
+  content = output.read_text()
+  assert "http://active.example.com" in content
+  assert "http://pending.example.com" not in content
+  assert "https://active.example.com" in content
+  assert "https://pending.example.com" not in content
 
 
 def test_render_caddyfile_renders_reverse_proxy_for_service_route(tmp_path: Path) -> None:

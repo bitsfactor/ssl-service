@@ -34,8 +34,9 @@ After install, these commands are available:
 
 First, update DNS:
 
-- point the domain to the `readwrite` node
-- this project uses `HTTP-01`, so the node must be reachable on port `80`
+- make sure the domain is hosted in Cloudflare DNS
+- create or confirm a Cloudflare API token for the parent zone
+- the domain does not need to point to this node before certificate issuance
 
 Example: route `api.example.com` to local port `6111`
 
@@ -62,6 +63,7 @@ Optional pre-check:
 
 ```bash
 domain-manage check api.example.com
+domain-manage status api.example.com
 ```
 
 ## Check The Result

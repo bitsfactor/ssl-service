@@ -13,7 +13,7 @@ paths:
   state_dir: /var/lib/ssl-proxy
   log_dir: /var/log/ssl-proxy
   caddy_binary: /usr/bin/caddy
-  certbot_binary: /usr/bin/certbot
+  certbot_binary: /opt/ssl-proxy/.acme-venv/bin/certbot
 
 caddy:
   admin_url: http://127.0.0.1:2019
@@ -28,7 +28,9 @@ caddy:
 acme:
   email: ops@example.com
   staging: false
-  webroot: /var/lib/ssl-proxy/acme-webroot
+  challenge_type: dns-01
+  dns_provider: cloudflare
+  dns_propagation_seconds: 30
   certbot_args: []
 
 logging:
