@@ -32,6 +32,15 @@ class CertificateRecord:
   last_error: str | None
 
 
+@dataclass(slots=True)
+class DnsZoneTokenRecord:
+  zone_name: str
+  provider: str
+  zone_id: str
+  api_token: str
+  updated_at: datetime
+
+
 class Database:
   def __init__(self, dsn: str) -> None:
     self._dsn = dsn
@@ -71,6 +80,22 @@ class Database:
           """
         )
         return {row["domain"]: CertificateRecord(**row) for row in cursor.fetchall()}
+
+  def get_dns_zone_token_for_domain(self, domain: str) -> DnsZoneTokenRecord | None:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          SELECT zone_name, provider, zone_id, api_token, updated_at
+          FROM dns_zone_tokens
+          WHERE %s = zone_name OR %s LIKE '%%.' || zone_name
+          ORDER BY char_length(zone_name) DESC
+          LIMIT 1
+          """,
+          (domain, domain),
+        )
+        row = cursor.fetchone()
+        return None if row is None else DnsZoneTokenRecord(**row)
 
   def upsert_certificate(self, certificate: CertificateRecord) -> None:
     with self.connect() as connection:

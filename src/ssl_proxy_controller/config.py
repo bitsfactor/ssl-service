@@ -38,7 +38,9 @@ class CaddyConfig:
 class AcmeConfig:
   email: str = ""
   staging: bool = False
-  webroot: Path = Path("/var/lib/ssl-proxy/acme-webroot")
+  challenge_type: str = "dns-01"
+  dns_provider: str = "cloudflare"
+  dns_propagation_seconds: int = 30
   certbot_args: list[str] = field(default_factory=list)
 
 
@@ -85,6 +87,20 @@ def _require_int(name: str, value: int, *, minimum: int) -> int:
   return value
 
 
+def _normalize_challenge_type(value: object) -> str:
+  normalized = str(value or "dns-01").strip().lower()
+  if normalized != "dns-01":
+    raise ValueError("acme.challenge_type must be dns-01")
+  return normalized
+
+
+def _normalize_dns_provider(value: object) -> str:
+  normalized = str(value or "cloudflare").strip().lower()
+  if normalized != "cloudflare":
+    raise ValueError("acme.dns_provider must be cloudflare")
+  return normalized
+
+
 def load_config(path: str | Path) -> AppConfig:
   config_path = Path(path)
   data = yaml.safe_load(config_path.read_text()) or {}
@@ -110,7 +126,9 @@ def load_config(path: str | Path) -> AppConfig:
     acme=AcmeConfig(
       email=acme.get("email", ""),
       staging=_normalize_bool(acme.get("staging", False)),
-      webroot=Path(acme.get("webroot", "/var/lib/ssl-proxy/acme-webroot")),
+      challenge_type=_normalize_challenge_type(acme.get("challenge_type", "dns-01")),
+      dns_provider=_normalize_dns_provider(acme.get("dns_provider", "cloudflare")),
+      dns_propagation_seconds=acme.get("dns_propagation_seconds", 30),
       certbot_args=list(acme.get("certbot_args", [])),
     ),
     logging=LoggingConfig(**data.get("logging", {})),
@@ -119,6 +137,11 @@ def load_config(path: str | Path) -> AppConfig:
   config.sync.renew_before_days = _require_int("sync.renew_before_days", config.sync.renew_before_days, minimum=0)
   config.sync.retry_backoff_seconds = _require_int("sync.retry_backoff_seconds", config.sync.retry_backoff_seconds, minimum=0)
   config.sync.loop_error_backoff_seconds = _require_int("sync.loop_error_backoff_seconds", config.sync.loop_error_backoff_seconds, minimum=1)
+  config.acme.dns_propagation_seconds = _require_int(
+    "acme.dns_propagation_seconds",
+    config.acme.dns_propagation_seconds,
+    minimum=0,
+  )
   if not config.caddy.reload_command:
     raise ValueError("caddy.reload_command must not be empty")
   if config.mode == "readwrite" and not config.acme.email.strip():
@@ -149,7 +172,9 @@ def as_dict(config: AppConfig) -> dict[str, Any]:
     "acme": {
       "email": config.acme.email,
       "staging": config.acme.staging,
-      "webroot": str(config.acme.webroot),
+      "challenge_type": config.acme.challenge_type,
+      "dns_provider": config.acme.dns_provider,
+      "dns_propagation_seconds": config.acme.dns_propagation_seconds,
       "certbot_args": config.acme.certbot_args,
     },
     "logging": {"level": config.logging.level},

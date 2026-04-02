@@ -22,6 +22,8 @@ usage() {
   cat <<EOF
 Usage:
   ${PROGRAM_NAME} list
+  ${PROGRAM_NAME} list-certs
+  ${PROGRAM_NAME} list-zones
   ${PROGRAM_NAME} get <domain>
   ${PROGRAM_NAME} status <domain>
   ${PROGRAM_NAME} check <domain>
@@ -36,9 +38,11 @@ Usage:
   ${PROGRAM_NAME} delete <domain>
   ${PROGRAM_NAME} purge <domain>
   ${PROGRAM_NAME} issue-now <domain> [--force]
+  ${PROGRAM_NAME} set-zone-token <domain_or_zone>
   ${PROGRAM_NAME} sync-now
 
 Notes:
+  - certificate issuance uses DNS-01 with Cloudflare only.
   - upstream_target can be omitted on add, which creates a certificate-only domain.
   - upstream_target accepts '6111', '127.0.0.1:6111', '10.0.0.25:6111', 'backend.internal:6111', or '[2001:db8::10]:6111'.
   - the script reads PostgreSQL DSN from /etc/ssl-proxy/config.yaml by default.
@@ -100,6 +104,30 @@ print(mode)
 PY
 }
 
+ensure_zone_token_for_domain() {
+  [[ $# -ge 1 ]] || fail "domain is required"
+  local domain token output force_prompt="${2:-0}"
+  domain="$(normalize_domain "$1")"
+
+  if [[ "${force_prompt}" -ne 1 ]] && run_db_tool get-zone-for-domain "${domain}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  while true; do
+    read -r -s -p "Cloudflare API token for zone managing ${domain}: " token
+    printf '\n'
+    [[ -n "${token}" ]] || {
+      log "value is required"
+      continue
+    }
+    if output="$(run_db_tool upsert-zone-token "${domain}" "${token}" 2>&1)"; then
+      printf '%s\n' "${output}"
+      return 0
+    fi
+    printf '%s\n' "${output}" >&2
+  done
+}
+
 normalize_domain() {
   [[ $# -ge 1 ]] || fail "domain is required"
   local python_bin
@@ -116,7 +144,7 @@ def validate_domain(domain: str) -> str:
     raise SystemExit("domain is required")
   wildcard = candidate.startswith("*.")
   if wildcard:
-    raise SystemExit("wildcard domains are not supported with the current HTTP-01 flow")
+    raise SystemExit("wildcard domains are not supported")
   base = candidate[2:] if wildcard else candidate
   labels = base.split(".")
   if len(labels) < 2:
@@ -148,9 +176,14 @@ get_domain_details() {
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import psycopg
@@ -163,13 +196,73 @@ def load_dsn(config_path: str) -> str:
   return data["postgres"]["dsn"]
 
 
+def candidate_zones(name: str) -> list[str]:
+  labels = name.strip().lower().rstrip(".").split(".")
+  return [".".join(labels[index:]) for index in range(len(labels) - 2, -1, -1) if len(labels[index:]) >= 2]
+
+
+def cloudflare_request(token: str, method: str, path: str, payload: dict | None = None) -> dict:
+  request = urllib.request.Request(
+    f"https://api.cloudflare.com/client/v4{path}",
+    method=method,
+    headers={
+      "Authorization": f"Bearer {token}",
+      "Content-Type": "application/json",
+    },
+    data=None if payload is None else json.dumps(payload).encode("utf-8"),
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=15) as response:
+      return json.loads(response.read().decode("utf-8"))
+  except urllib.error.HTTPError as exc:
+    body = exc.read().decode("utf-8", errors="replace")
+    raise SystemExit(f"Cloudflare API request failed: HTTP {exc.code}: {body}") from exc
+  except urllib.error.URLError as exc:
+    raise SystemExit(f"Cloudflare API request failed: {exc}") from exc
+
+
+def discover_cloudflare_zone(domain_or_zone: str, token: str) -> tuple[str, str]:
+  for candidate in candidate_zones(domain_or_zone):
+    query = urllib.parse.urlencode({"name": candidate, "per_page": 1})
+    payload = cloudflare_request(token, "GET", f"/zones?{query}")
+    if payload.get("success") and payload.get("result"):
+      zone = payload["result"][0]
+      return str(zone["name"]).lower(), str(zone["id"])
+  raise SystemExit(f"could not find a Cloudflare zone for: {domain_or_zone}")
+
+
+def validate_cloudflare_zone_token(domain_or_zone: str, token: str) -> tuple[str, str]:
+  zone_name, zone_id = discover_cloudflare_zone(domain_or_zone, token)
+  suffix = hex(int(time.time() * 1000000))[2:]
+  record_name = f"_ssl-proxy-token-check-{suffix}.{zone_name}"
+  payload = cloudflare_request(
+    token,
+    "POST",
+    f"/zones/{zone_id}/dns_records",
+    {
+      "type": "TXT",
+      "name": record_name,
+      "content": f"ssl-proxy-verify-{suffix}",
+      "ttl": 60,
+    },
+  )
+  if not payload.get("success") or not payload.get("result"):
+    raise SystemExit(f"Cloudflare token could not create a DNS record for zone: {zone_name}")
+  record_id = str(payload["result"]["id"])
+  try:
+    cloudflare_request(token, "DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
+  except SystemExit as exc:
+    raise SystemExit(f"Cloudflare token validation partially failed: created a test record but could not delete it: {exc}") from exc
+  return zone_name, zone_id
+
+
 def validate_domain(domain: str) -> str:
   candidate = domain.strip().lower().rstrip(".")
   if not candidate:
     raise SystemExit("domain is required")
   wildcard = candidate.startswith("*.")
   if wildcard:
-    raise SystemExit("wildcard domains are not supported with the current HTTP-01 flow")
+    raise SystemExit("wildcard domains are not supported")
   base = candidate[2:] if wildcard else candidate
   labels = base.split(".")
   if len(labels) < 2:
@@ -256,7 +349,7 @@ def validate_domain(domain: str) -> str:
     raise SystemExit("domain is required")
   wildcard = candidate.startswith("*.")
   if wildcard:
-    raise SystemExit("wildcard domains are not supported with the current HTTP-01 flow")
+    raise SystemExit("wildcard domains are not supported")
   base = candidate[2:] if wildcard else candidate
   labels = base.split(".")
   if len(labels) < 2:
@@ -307,6 +400,74 @@ def main(argv: list[str]) -> int:
     return 0
 
   print(json.dumps({"ok": True, "error": "", "details": dict(row)}, default=str))
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main(sys.argv))
+PY
+}
+
+get_zone_token_status_json() {
+  local python_bin config_path
+  python_bin="$(resolve_python)"
+  config_path="$(resolve_config_path)"
+
+  SSL_PROXY_CONFIG="${config_path}" \
+  "${python_bin}" - "$@" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import psycopg
+import yaml
+from psycopg.rows import dict_row
+
+
+def load_dsn(config_path: str) -> str:
+  data = yaml.safe_load(Path(config_path).read_text()) or {}
+  return data["postgres"]["dsn"]
+
+
+def candidate_zones(name: str) -> list[str]:
+  labels = name.strip().lower().rstrip(".").split(".")
+  return [".".join(labels[index:]) for index in range(len(labels) - 2, -1, -1) if len(labels[index:]) >= 2]
+
+
+def main(argv: list[str]) -> int:
+  if len(argv) < 2:
+    raise SystemExit("domain is required")
+  domain = argv[1].strip().lower().rstrip(".")
+  dsn = load_dsn(os.environ["SSL_PROXY_CONFIG"])
+  candidates = candidate_zones(domain)
+  if not candidates:
+    print(json.dumps({"present": False, "zone_name": "", "provider": "", "error": ""}))
+    return 0
+  try:
+    with psycopg.connect(dsn, row_factory=dict_row, sslmode="require") as conn:
+      with conn.cursor() as cur:
+        cur.execute(
+          """
+          SELECT zone_name, provider
+          FROM dns_zone_tokens
+          WHERE zone_name = ANY(%s)
+          ORDER BY char_length(zone_name) DESC
+          LIMIT 1
+          """,
+          (candidates,),
+        )
+        row = cur.fetchone()
+  except psycopg.Error as exc:
+    print(json.dumps({"present": False, "zone_name": "", "provider": "", "error": f"database connection failed: {exc}"}))
+    return 0
+
+  if row is None:
+    print(json.dumps({"present": False, "zone_name": "", "provider": "", "error": ""}))
+    return 0
+  print(json.dumps({"present": True, "zone_name": row["zone_name"], "provider": row["provider"], "error": ""}))
   return 0
 
 
@@ -540,16 +701,16 @@ PY
 
 status_command() {
   [[ $# -ge 1 ]] || fail "domain is required"
-  local domain details_json dns_json public_json http_json python_bin mode
+  local domain details_json dns_json public_json zone_json python_bin mode
   domain="$(normalize_domain "$1")"
   python_bin="$(resolve_python)"
   mode="$(get_config_mode)"
   details_json="$(get_domain_details_json "${domain}")"
   dns_json="$(resolve_dns_json "${domain}")"
   public_json="$(get_public_ips_json)"
-  http_json="$(probe_http_json "${domain}")"
+  zone_json="$(get_zone_token_status_json "${domain}")"
 
-  SSL_PROXY_MODE="${mode}" DETAILS_JSON="${details_json}" DNS_JSON="${dns_json}" PUBLIC_JSON="${public_json}" HTTP_JSON="${http_json}" "${python_bin}" - <<'PY'
+  SSL_PROXY_MODE="${mode}" DETAILS_JSON="${details_json}" DNS_JSON="${dns_json}" PUBLIC_JSON="${public_json}" ZONE_JSON="${zone_json}" "${python_bin}" - <<'PY'
 from __future__ import annotations
 
 import json
@@ -562,7 +723,7 @@ details_payload = json.loads(os.environ["DETAILS_JSON"])
 details = details_payload.get("details", {})
 dns = json.loads(os.environ["DNS_JSON"])
 public = json.loads(os.environ["PUBLIC_JSON"])
-http = json.loads(os.environ["HTTP_JSON"])
+zone = json.loads(os.environ["ZONE_JSON"])
 
 resolved = set(dns.get("ipv4", [])) | set(dns.get("ipv6", []))
 local_ips = {ip for ip in [public.get("ipv4", ""), public.get("ipv6", "")] if ip}
@@ -598,6 +759,9 @@ print(f'certificate_not_after: {not_after or ""}')
 retry_after = details.get("retry_after")
 print(f'retry_after: {retry_after or ""}')
 print(f'last_error: {details.get("last_error") or ""}')
+print(f'dns_zone: {zone.get("zone_name", "")}')
+print(f'dns_provider: {zone.get("provider", "")}')
+print(f'zone_token_present: {"yes" if zone.get("present") else "no"}')
 print(f'dns_error: {dns.get("error", "")}')
 print(f'dns_cname: {", ".join(dns.get("cname", []))}')
 print(f'dns_ipv4: {", ".join(dns.get("ipv4", []))}')
@@ -607,10 +771,6 @@ print(f'local_public_ipv6: {public.get("ipv6", "")}')
 print(f'local_public_ipv4_source: {public.get("source_ipv4", "")}')
 print(f'local_public_ipv6_source: {public.get("source_ipv6", "")}')
 print(f'points_to_this_host: {points_to_this_host}')
-print(f'acme_http_reachable: {"yes" if http.get("reachable") else "no"}')
-print(f'acme_http_status_code: {http.get("status_code", 0)}')
-print(f'acme_http_redirect_location: {http.get("redirect_location", "")}')
-print(f'acme_http_error: {http.get("error", "")}')
 if not details_payload.get("ok"):
   sys.exit(1)
 PY
@@ -618,16 +778,16 @@ PY
 
 check_command() {
   [[ $# -ge 1 ]] || fail "domain is required"
-  local domain details_json dns_json public_json http_json python_bin mode
+  local domain details_json dns_json public_json zone_json python_bin mode
   domain="$(normalize_domain "$1")"
   python_bin="$(resolve_python)"
   mode="$(get_config_mode)"
   details_json="$(get_domain_details_json "${domain}")"
   dns_json="$(resolve_dns_json "${domain}")"
   public_json="$(get_public_ips_json)"
-  http_json="$(probe_http_json "${domain}")"
+  zone_json="$(get_zone_token_status_json "${domain}")"
 
-  SSL_PROXY_MODE="${mode}" DETAILS_JSON="${details_json}" DNS_JSON="${dns_json}" PUBLIC_JSON="${public_json}" HTTP_JSON="${http_json}" "${python_bin}" - <<'PY'
+  SSL_PROXY_MODE="${mode}" DETAILS_JSON="${details_json}" DNS_JSON="${dns_json}" PUBLIC_JSON="${public_json}" ZONE_JSON="${zone_json}" "${python_bin}" - <<'PY'
 from __future__ import annotations
 
 import json
@@ -640,7 +800,7 @@ details_payload = json.loads(os.environ["DETAILS_JSON"])
 details = details_payload.get("details", {})
 dns = json.loads(os.environ["DNS_JSON"])
 public = json.loads(os.environ["PUBLIC_JSON"])
-http = json.loads(os.environ["HTTP_JSON"])
+zone = json.loads(os.environ["ZONE_JSON"])
 
 resolved = set(dns.get("ipv4", [])) | set(dns.get("ipv6", []))
 local_ips = {ip for ip in [public.get("ipv4", ""), public.get("ipv6", "")] if ip}
@@ -666,9 +826,8 @@ checks = [
   ("node_mode", mode == "readwrite", f"mode={mode}"),
   ("db_lookup", bool(details_payload.get("ok")), details_payload.get("error", "")),
   ("route_enabled", bool(details.get("enabled")), "" if details_payload.get("ok") else "skipped"),
+  ("zone_token", bool(zone.get("present")), ""),
   ("dns_resolves", not bool(dns.get("error")), dns.get("error", "")),
-  ("points_to_this_host", points_to_this_host is True, "unknown" if points_to_this_host is None else ""),
-  ("acme_http_reachable", bool(http.get("reachable")), http.get("error") or str(http.get("status_code", 0))),
 ]
 
 failed = False
@@ -723,7 +882,7 @@ def validate_domain(domain: str) -> str:
 
   wildcard = candidate.startswith("*.")
   if wildcard:
-    raise SystemExit("wildcard domains are not supported with the current HTTP-01 flow")
+    raise SystemExit("wildcard domains are not supported")
   base = candidate[2:] if wildcard else candidate
   labels = base.split(".")
   if len(labels) < 2:
@@ -814,6 +973,16 @@ def print_rows(rows):
     )
 
 
+def print_zone_rows(rows):
+  if not rows:
+    print("no rows")
+    return
+  for row in rows:
+    print(
+      f'zone_name={row["zone_name"]} provider={row["provider"]} zone_id={row["zone_id"]} updated_at={row["updated_at"].isoformat()}'
+    )
+
+
 def main(argv: list[str]) -> int:
   if len(argv) < 2:
     raise SystemExit("missing subcommand")
@@ -844,8 +1013,93 @@ def main(argv: list[str]) -> int:
           print_rows(cur.fetchall())
           return 0
 
+        if subcommand == "list-certs":
+          cur.execute(
+            """
+            SELECT
+              c.domain,
+              NULL::text AS upstream_target,
+              TRUE AS enabled,
+              c.updated_at,
+              c.status AS certificate_status,
+              c.not_after AS certificate_not_after,
+              c.retry_after,
+              c.last_error
+            FROM certificates c
+            ORDER BY c.domain ASC
+            """
+          )
+          print_rows(cur.fetchall())
+          return 0
+
+        if subcommand == "list-zones":
+          cur.execute(
+            """
+            SELECT zone_name, provider, zone_id, updated_at
+            FROM dns_zone_tokens
+            ORDER BY zone_name ASC
+            """
+          )
+          print_zone_rows(cur.fetchall())
+          return 0
+
         if len(argv) < 3:
           raise SystemExit("domain is required")
+
+        if subcommand == "get-zone":
+          zone_name = argv[2].strip().lower().rstrip(".")
+          cur.execute(
+            """
+            SELECT zone_name, provider, zone_id, updated_at
+            FROM dns_zone_tokens
+            WHERE zone_name = %s
+            """,
+            (zone_name,),
+          )
+          row = cur.fetchone()
+          if row is None:
+            raise SystemExit("zone not found")
+          print_zone_rows([row])
+          return 0
+
+        if subcommand == "get-zone-for-domain":
+          domain = validate_domain(argv[2])
+          cur.execute(
+            """
+            SELECT zone_name, provider, zone_id, updated_at
+            FROM dns_zone_tokens
+            WHERE %s = zone_name OR %s LIKE '%%.' || zone_name
+            ORDER BY char_length(zone_name) DESC
+            LIMIT 1
+            """,
+            (domain, domain),
+          )
+          row = cur.fetchone()
+          if row is None:
+            raise SystemExit("zone token not found for domain")
+          print_zone_rows([row])
+          return 0
+
+        if subcommand == "upsert-zone-token":
+          domain_or_zone = argv[2].strip().lower().rstrip(".")
+          if len(argv) < 4:
+            raise SystemExit("Cloudflare API token is required")
+          zone_name, zone_id = validate_cloudflare_zone_token(domain_or_zone, argv[3].strip())
+          cur.execute(
+            """
+            INSERT INTO dns_zone_tokens (zone_name, provider, zone_id, api_token)
+            VALUES (%s, 'cloudflare', %s, %s)
+            ON CONFLICT (zone_name) DO UPDATE
+            SET provider = EXCLUDED.provider,
+                zone_id = EXCLUDED.zone_id,
+                api_token = EXCLUDED.api_token
+            RETURNING zone_name, provider, zone_id, updated_at
+            """,
+            (zone_name, zone_id, argv[3].strip()),
+          )
+          print_zone_rows([cur.fetchone()])
+          conn.commit()
+          return 0
 
         domain = validate_domain(argv[2])
 
@@ -1067,8 +1321,8 @@ main() {
   done
 
   case "${subcommand}" in
-    list)
-      run_db_tool list
+    list|list-certs)
+      run_db_tool "${subcommand}"
       ;;
     status)
       [[ $# -ge 1 ]] || fail "domain is required"
@@ -1082,41 +1336,33 @@ main() {
       [[ $# -ge 1 ]] || fail "domain is required"
       logs_command "$1"
       ;;
-    get|enable|disable|delete|purge|clear-target|clear-port|issue-now)
+    get|enable|disable|delete|purge|clear-target|clear-port|issue-now|get-zone|get-zone-for-domain)
       [[ $# -ge 1 ]] || fail "domain is required"
+      local normalized_domain
+      normalized_domain="$(normalize_domain "$1")"
       if [[ "${subcommand}" == "issue-now" && "$(get_config_mode)" != "readwrite" ]]; then
         fail "issue-now is only available on readwrite nodes"
       fi
       if [[ "${subcommand}" == "issue-now" || "${sync_flag}" -eq 1 ]]; then
         preflight_sync_now
       fi
-      if [[ "${subcommand}" == "issue-now" && "${force_flag}" -ne 1 ]]; then
-        local dns_state
-        dns_state="$(domain_points_to_this_host "$1")"
-        if [[ "${dns_state}" == "unknown" ]]; then
-          fail "could not determine this host's public IPs; run '${PROGRAM_NAME} status $1' to inspect DNS, or use --force"
-        fi
-        if [[ "${dns_state}" == "dns_error" ]]; then
-          fail "dns resolution failed; run '${PROGRAM_NAME} status $1' to inspect DNS, or use --force"
-        fi
-        if [[ "${dns_state}" != "yes" ]]; then
-          fail "domain does not currently point to this host; run '${PROGRAM_NAME} status $1' to inspect DNS, or use --force"
-        fi
-      fi
-      run_db_tool "$subcommand" "$1"
+      run_db_tool "$subcommand" "${normalized_domain}"
       if [[ "${subcommand}" == "issue-now" || "${sync_flag}" -eq 1 ]]; then
         sync_now
       fi
       ;;
     add)
       [[ $# -ge 1 ]] || fail "domain is required"
+      local normalized_domain
+      normalized_domain="$(normalize_domain "$1")"
+      ensure_zone_token_for_domain "${normalized_domain}"
       if [[ "${sync_flag}" -eq 1 ]]; then
         preflight_sync_now
       fi
       if [[ $# -ge 2 ]]; then
-        run_db_tool add "$1" "$2"
+        run_db_tool add "${normalized_domain}" "$2"
       else
-        run_db_tool add "$1"
+        run_db_tool add "${normalized_domain}"
       fi
       if [[ "${sync_flag}" -eq 1 ]]; then
         sync_now
@@ -1124,23 +1370,35 @@ main() {
       ;;
     set-target|set-port)
       [[ $# -ge 2 ]] || fail "domain and upstream_target are required"
+      local normalized_domain
+      normalized_domain="$(normalize_domain "$1")"
+      ensure_zone_token_for_domain "${normalized_domain}"
       if [[ "${sync_flag}" -eq 1 ]]; then
         preflight_sync_now
       fi
-      run_db_tool set-target "$1" "$2"
+      run_db_tool set-target "${normalized_domain}" "$2"
       if [[ "${sync_flag}" -eq 1 ]]; then
         sync_now
       fi
       ;;
     clear-target|clear-port)
       [[ $# -ge 1 ]] || fail "domain is required"
+      local normalized_domain
+      normalized_domain="$(normalize_domain "$1")"
       if [[ "${sync_flag}" -eq 1 ]]; then
         preflight_sync_now
       fi
-      run_db_tool clear-target "$1"
+      run_db_tool clear-target "${normalized_domain}"
       if [[ "${sync_flag}" -eq 1 ]]; then
         sync_now
       fi
+      ;;
+    list-zones)
+      run_db_tool list-zones
+      ;;
+    set-zone-token)
+      [[ $# -ge 1 ]] || fail "domain or zone is required"
+      ensure_zone_token_for_domain "$(normalize_domain "$1")" 1
       ;;
     sync-now)
       sync_now

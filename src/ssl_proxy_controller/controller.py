@@ -47,7 +47,6 @@ class Controller:
       self.certs_dir,
       self.state_dir / "state",
       self.config.paths.log_dir,
-      self.config.acme.webroot,
     ]:
       path.mkdir(parents=True, exist_ok=True)
 
@@ -121,7 +120,7 @@ class Controller:
           continue
         try:
           LOGGER.info("issuing or renewing certificate for %s", domain)
-          certificate = issue_certificate(self.config, domain)
+          certificate = issue_certificate(self.config, self.database, domain)
           self.database.upsert_certificate(certificate)
         except Exception as exc:
           LOGGER.exception("certificate issuance failed for %s", domain)
@@ -165,7 +164,6 @@ class Controller:
       output_path=output_path,
       routes=routes,
       certificates=certificates,
-      acme_webroot=self.config.acme.webroot,
       admin_address=normalize_admin_address(self.config.caddy.admin_url),
     )
     prior_state = self._read_runtime_state()

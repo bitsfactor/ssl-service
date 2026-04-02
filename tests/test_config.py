@@ -28,7 +28,9 @@ caddy:
 acme:
   email: ops@example.com
   staging: true
-  webroot: /tmp/acme
+  challenge_type: dns-01
+  dns_provider: cloudflare
+  dns_propagation_seconds: 45
 logging:
   level: DEBUG
 """
@@ -47,7 +49,9 @@ logging:
   assert config.caddy.reload_command == ["/usr/bin/caddy", "reload"]
   assert config.acme.email == "ops@example.com"
   assert config.acme.staging is True
-  assert config.acme.webroot == Path("/tmp/acme")
+  assert config.acme.challenge_type == "dns-01"
+  assert config.acme.dns_provider == "cloudflare"
+  assert config.acme.dns_propagation_seconds == 45
   assert config.logging.level == "DEBUG"
 
 
@@ -100,7 +104,7 @@ caddy:
   reload_command: ["/usr/bin/caddy", "reload"]
 acme:
   email: ops@example.com
-  webroot: /tmp/acme
+  dns_propagation_seconds: 30
 """
   )
 
@@ -110,7 +114,9 @@ acme:
   assert payload["mode"] == "readwrite"
   assert payload["postgres"]["dsn"] == "postgresql://example"
   assert payload["paths"]["state_dir"] == "/tmp/state"
-  assert payload["acme"]["webroot"] == "/tmp/acme"
+  assert payload["acme"]["challenge_type"] == "dns-01"
+  assert payload["acme"]["dns_provider"] == "cloudflare"
+  assert payload["acme"]["dns_propagation_seconds"] == 30
 
 
 def test_load_config_parses_string_boolean_for_staging(tmp_path: Path) -> None:
@@ -159,6 +165,25 @@ sync:
   )
 
   with pytest.raises(ValueError, match=message):
+    load_config(config_path)
+
+
+def test_load_config_rejects_invalid_acme_dns_config(tmp_path: Path) -> None:
+  config_path = tmp_path / "config.yaml"
+  config_path.write_text(
+    """
+mode: readwrite
+postgres:
+  dsn: postgresql://example
+caddy:
+  reload_command: ["/usr/bin/caddy", "reload"]
+acme:
+  email: ops@example.com
+  challenge_type: http-01
+"""
+  )
+
+  with pytest.raises(ValueError, match=r"acme\.challenge_type must be dns-01"):
     load_config(config_path)
 
 

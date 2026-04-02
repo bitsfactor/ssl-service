@@ -16,7 +16,7 @@ def make_config(tmp_path: Path) -> AppConfig:
     sync=SyncConfig(poll_interval_seconds=1, renew_before_days=30, retry_backoff_seconds=3600, loop_error_backoff_seconds=1),
     paths=PathsConfig(state_dir=tmp_path / "state", log_dir=tmp_path / "log"),
     caddy=CaddyConfig(admin_url="http://127.0.0.1:2019", reload_command=["/usr/bin/true"]),
-    acme=AcmeConfig(email="ops@example.com", staging=False, webroot=tmp_path / "acme"),
+    acme=AcmeConfig(email="ops@example.com", staging=False),
     logging=LoggingConfig(level="INFO"),
   )
 

@@ -1,44 +1,64 @@
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 from cryptography import x509
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 from .config import AppConfig
-from .db import CertificateRecord
+from .db import CertificateRecord, Database
 
 
-def issue_certificate(config: AppConfig, domain: str) -> CertificateRecord:
+@contextmanager
+def cloudflare_credentials_file(api_token: str):
+  with NamedTemporaryFile("w", delete=False) as handle:
+    handle.write(f"dns_cloudflare_api_token = {api_token}\n")
+    temp_path = Path(handle.name)
+  os.chmod(temp_path, stat.S_IRUSR | stat.S_IWUSR)
+  try:
+    yield temp_path
+  finally:
+    temp_path.unlink(missing_ok=True)
+
+
+def issue_certificate(config: AppConfig, database: Database, domain: str) -> CertificateRecord:
   if not config.acme.email:
     raise ValueError("acme.email is required in readwrite mode")
-  if domain.startswith("*."):
-    raise ValueError("wildcard domains are not supported with the current HTTP-01 flow")
 
-  config.acme.webroot.mkdir(parents=True, exist_ok=True)
+  zone_token = database.get_dns_zone_token_for_domain(domain)
+  if zone_token is None:
+    raise ValueError(f"no Cloudflare zone token configured for domain: {domain}")
+
   cert_name = domain.replace("*", "wildcard")
-  command = [
-    config.paths.certbot_binary,
-    "certonly",
-    "--non-interactive",
-    "--agree-tos",
-    "--webroot",
-    "--webroot-path",
-    str(config.acme.webroot),
-    "--email",
-    config.acme.email,
-    "--cert-name",
-    cert_name,
-    "-d",
-    domain,
-  ]
-  if config.acme.staging:
-    command.append("--test-cert")
-  command.extend(config.acme.certbot_args)
-  subprocess.run(command, check=True)
+  with cloudflare_credentials_file(zone_token.api_token) as credentials_path:
+    command = [
+      config.paths.certbot_binary,
+      "certonly",
+      "--non-interactive",
+      "--agree-tos",
+      "--dns-cloudflare",
+      "--dns-cloudflare-credentials",
+      str(credentials_path),
+      "--dns-cloudflare-propagation-seconds",
+      str(config.acme.dns_propagation_seconds),
+      "--email",
+      config.acme.email,
+      "--cert-name",
+      cert_name,
+      "-d",
+      domain,
+    ]
+    if config.acme.staging:
+      command.append("--test-cert")
+    command.extend(config.acme.certbot_args)
+    subprocess.run(command, check=True)
 
   live_dir = Path("/etc/letsencrypt/live") / cert_name
   fullchain_pem = live_dir.joinpath("fullchain.pem").read_text()

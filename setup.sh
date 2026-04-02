@@ -43,12 +43,12 @@ require_systemd() {
 ensure_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y curl python3 python3-venv python3-pip rsync caddy certbot
+  apt-get install -y curl python3 python3-venv python3-pip rsync caddy certbot python3-certbot-dns-cloudflare
 }
 
 ensure_layout() {
   mkdir -p "${INSTALL_DIR}" "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}"
-  mkdir -p "${STATE_DIR}/generated" "${STATE_DIR}/state" "${STATE_DIR}/certs" "${STATE_DIR}/acme-webroot"
+  mkdir -p "${STATE_DIR}/generated" "${STATE_DIR}/state" "${STATE_DIR}/certs"
   touch "${UPDATE_LOG}"
 }
 
@@ -288,7 +288,9 @@ config = {
   "acme": {
     "email": os.environ["SSL_PROXY_ACME_EMAIL"],
     "staging": False,
-    "webroot": f"{os.environ['SSL_PROXY_STATE_DIR']}/acme-webroot",
+    "challenge_type": "dns-01",
+    "dns_provider": "cloudflare",
+    "dns_propagation_seconds": 30,
     "certbot_args": [],
   },
   "logging": {

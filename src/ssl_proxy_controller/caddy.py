@@ -63,7 +63,6 @@ def render_caddyfile(
   output_path: Path,
   routes: list[RouteRecord],
   certificates: dict[str, CertificateRecord],
-  acme_webroot: Path,
   admin_address: str,
 ) -> RenderResult:
   lines: list[str] = [
@@ -73,19 +72,13 @@ def render_caddyfile(
     "",
   ]
 
-  challenge_domains = [route.domain for route in routes]
-  if challenge_domains:
-    domains = " ".join(f"http://{domain}" for domain in challenge_domains)
+  route_domains = [route.domain for route in routes]
+  if route_domains:
+    domains = " ".join(f"http://{domain}" for domain in route_domains)
     lines.extend(
       [
         f"{domains} {{",
-        "  route {",
-        "    handle /.well-known/acme-challenge/* {",
-        f"      root * {acme_webroot}",
-        "      file_server",
-        "    }",
-        "    redir https://{host}{uri} 308",
-        "  }",
+        "  redir https://{host}{uri} 308",
         "}",
         "",
       ]

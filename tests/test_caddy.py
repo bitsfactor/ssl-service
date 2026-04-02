@@ -37,19 +37,18 @@ def test_render_caddyfile_renders_certificate_only_route_without_reverse_proxy(t
     output_path=output,
     routes=routes,
     certificates=certificates,
-    acme_webroot=tmp_path / "acme",
     admin_address="127.0.0.1:2019",
   )
 
   content = output.read_text()
   assert "http://example.com" in content
-  assert "route {" in content
+  assert "redir https://{host}{uri} 308" in content
   assert 'respond "certificate-only route" 200' in content
   assert "reverse_proxy" not in content
   assert result.sha256
 
 
-def test_render_caddyfile_wraps_acme_http_handling_in_route_block(tmp_path: Path) -> None:
+def test_render_caddyfile_redirects_http_to_https(tmp_path: Path) -> None:
   output = tmp_path / "generated" / "Caddyfile"
   routes = [RouteRecord(domain="example.com", upstream_target=None, enabled=True, updated_at=datetime.now(tz=UTC))]
   certificates = {"example.com": make_certificate("example.com")}
@@ -58,13 +57,10 @@ def test_render_caddyfile_wraps_acme_http_handling_in_route_block(tmp_path: Path
     output_path=output,
     routes=routes,
     certificates=certificates,
-    acme_webroot=tmp_path / "acme",
     admin_address="127.0.0.1:2019",
   )
 
   content = output.read_text()
-  assert "route {" in content
-  assert "handle /.well-known/acme-challenge/* {" in content
   assert "redir https://{host}{uri} 308" in content
 
 
@@ -92,7 +88,6 @@ def test_render_caddyfile_skips_https_block_for_missing_certificate_material(tmp
     output_path=output,
     routes=routes,
     certificates=certificates,
-    acme_webroot=tmp_path / "acme",
     admin_address="127.0.0.1:2019",
   )
 
@@ -111,7 +106,6 @@ def test_render_caddyfile_renders_reverse_proxy_for_service_route(tmp_path: Path
     output_path=output,
     routes=routes,
     certificates=certificates,
-    acme_webroot=tmp_path / "acme",
     admin_address="127.0.0.1:2019",
   )
 
@@ -129,7 +123,6 @@ def test_render_caddyfile_renders_ipv6_upstream_target(tmp_path: Path) -> None:
     output_path=output,
     routes=routes,
     certificates=certificates,
-    acme_webroot=tmp_path / "acme",
     admin_address="127.0.0.1:2019",
   )
 

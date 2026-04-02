@@ -98,7 +98,29 @@ class FakeCursor:
     return None
 
   def execute(self, query, params=None):
-    if "UPDATE routes" in query and "SET upstream_target = %s" in query:
+    if "FROM dns_zone_tokens" in query:
+      self._row = {
+        "zone_name": "example.com",
+        "provider": "cloudflare",
+        "zone_id": "zone-id",
+        "updated_at": datetime(2026, 4, 2, tzinfo=UTC),
+      }
+      self._rows = [self._row]
+    elif "FROM certificates c" in query and "NULL::text AS upstream_target" in query:
+      self._rows = [
+        {
+          "domain": "api.example.com",
+          "upstream_target": None,
+          "enabled": True,
+          "updated_at": datetime(2026, 4, 2, tzinfo=UTC),
+          "certificate_status": "active",
+          "certificate_not_after": datetime(2026, 7, 1, tzinfo=UTC),
+          "retry_after": None,
+          "last_error": None,
+        }
+      ]
+      self._row = None
+    elif "UPDATE routes" in query and "SET upstream_target = %s" in query:
       self._row = {
         "domain": params[1],
         "upstream_target": params[0],
@@ -111,12 +133,13 @@ class FakeCursor:
       }
     else:
       self._row = None
+      self._rows = []
 
   def fetchone(self):
     return self._row
 
   def fetchall(self):
-    return []
+    return getattr(self, "_rows", [])
 
 
 class FakeConnection:
@@ -165,6 +188,7 @@ def test_help_succeeds(tmp_path: Path) -> None:
   assert result.returncode == 0
   assert result.stderr == ""
   assert f"{SCRIPT.name} list" in result.stdout
+  assert "list-zones" in result.stdout
   assert "issue-now <domain> [--force]" in result.stdout
   assert "check <domain>" in result.stdout
   assert "set-target <domain> <upstream_target>" in result.stdout
@@ -226,6 +250,20 @@ def test_status_reports_db_failure_without_traceback(tmp_path: Path) -> None:
   assert "database_lookup_ok: no" in result.stdout
   assert "database_error: database connection failed:" in result.stdout
   assert "Traceback" not in result.stderr
+
+
+def test_list_certs_lists_certificate_rows_without_routes(tmp_path: Path) -> None:
+  fake_site = install_fake_psycopg(tmp_path)
+  env = base_env(tmp_path)
+  env["PYTHONPATH"] = f"{fake_site}:{env.get('PYTHONPATH', '')}".rstrip(":")
+
+  result = run_script(["list-certs"], env=env)
+
+  assert result.returncode == 0
+  assert result.stderr == ""
+  assert "domain=api.example.com" in result.stdout
+  assert "certificate_status=active" in result.stdout
+  assert "upstream_target=" in result.stdout
 
 
 def test_set_target_accepts_remote_ip_upstream(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 from ssl_proxy_controller.acme import issue_certificate
+from ssl_proxy_controller.db import DnsZoneTokenRecord
 from ssl_proxy_controller.config import AcmeConfig, AppConfig, CaddyConfig, LoggingConfig, PathsConfig, PostgresConfig, SyncConfig
 
 
@@ -20,17 +21,21 @@ def make_config(tmp_path: Path) -> AppConfig:
     postgres=PostgresConfig(dsn="postgresql://example"),
     sync=SyncConfig(),
     paths=PathsConfig(state_dir=tmp_path / "state", log_dir=tmp_path / "log"),
-    caddy=CaddyConfig(),
-    acme=AcmeConfig(email="ops@example.com", webroot=tmp_path / "acme"),
+    caddy=CaddyConfig(reload_command=["/usr/bin/caddy", "reload"]),
+    acme=AcmeConfig(email="ops@example.com"),
     logging=LoggingConfig(),
   )
 
 
-def test_issue_certificate_rejects_wildcard_domain(tmp_path: Path) -> None:
-  config = make_config(tmp_path)
-
-  with pytest.raises(ValueError, match="wildcard domains are not supported"):
-    issue_certificate(config, "*.example.com")
+class FakeDatabase:
+  def get_dns_zone_token_for_domain(self, domain: str) -> DnsZoneTokenRecord | None:
+    return DnsZoneTokenRecord(
+      zone_name="example.com",
+      provider="cloudflare",
+      zone_id="zone-id",
+      api_token="token",
+      updated_at=datetime.now(tz=UTC),
+    )
 
 
 def test_issue_certificate_requires_email(tmp_path: Path) -> None:
@@ -38,7 +43,16 @@ def test_issue_certificate_requires_email(tmp_path: Path) -> None:
   config.acme.email = ""
 
   with pytest.raises(ValueError, match="acme.email is required"):
-    issue_certificate(config, "example.com")
+    issue_certificate(config, FakeDatabase(), "example.com")
+
+
+def test_issue_certificate_requires_zone_token(tmp_path: Path) -> None:
+  class EmptyDatabase:
+    def get_dns_zone_token_for_domain(self, domain: str):
+      return None
+
+  with pytest.raises(ValueError, match="no Cloudflare zone token configured"):
+    issue_certificate(make_config(tmp_path), EmptyDatabase(), "example.com")
 
 
 def test_issue_certificate_reads_certbot_output(monkeypatch, tmp_path: Path) -> None:
@@ -81,10 +95,11 @@ def test_issue_certificate_reads_certbot_output(monkeypatch, tmp_path: Path) -> 
   monkeypatch.setattr(subprocess, "run", fake_run)
   monkeypatch.setattr("ssl_proxy_controller.acme.Path", fake_path)
 
-  record = issue_certificate(config, "example.com")
+  record = issue_certificate(config, FakeDatabase(), "example.com")
 
   assert command_calls
-  assert "--webroot-path" in command_calls[0]
+  assert "--dns-cloudflare" in command_calls[0]
+  assert "--dns-cloudflare-credentials" in command_calls[0]
   assert record.domain == "example.com"
   assert record.status == "active"
   assert "BEGIN CERTIFICATE" in record.fullchain_pem
