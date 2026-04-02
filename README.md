@@ -1,6 +1,6 @@
 # ssl-server
 
-A Caddy-based front proxy service that:
+A front proxy service that:
 
 - listens on `80/443`
 - routes traffic by domain
