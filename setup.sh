@@ -18,6 +18,7 @@ UPDATE_SCHEDULE="*-*-* 04:00:00"
 UPDATE_LOG="${STATE_DIR}/update.log"
 DEFAULT_DSN=""
 SOURCE_DIR_FILE="${INSTALL_DIR}/.source_dir"
+SHELL_PROMPT_PROFILE="/etc/profile.d/ssl-proxy-shell.sh"
 
 log() {
   printf '%s\n' "$*"
@@ -51,6 +52,66 @@ ensure_layout() {
   mkdir -p "${INSTALL_DIR}" "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}"
   mkdir -p "${STATE_DIR}/generated" "${STATE_DIR}/state" "${STATE_DIR}/certs"
   touch "${UPDATE_LOG}"
+}
+
+install_shell_prompt() {
+  cat > "${SHELL_PROMPT_PROFILE}" <<'EOF'
+# shellcheck shell=bash
+
+case $- in
+  *i*) ;;
+  *) return 0 2>/dev/null || exit 0 ;;
+esac
+
+ssl_proxy_prompt_mode() {
+  local config_path="/etc/ssl-proxy/config.yaml"
+  local mode="unknown"
+  if [[ -r "${config_path}" ]]; then
+    mode="$(awk '$1 == "mode:" { print $2; exit }' "${config_path}" 2>/dev/null)"
+  fi
+  printf '%s' "${mode:-unknown}"
+}
+
+ssl_proxy_apply_prompt() {
+  local mode color label reset host_color path_color
+  mode="$(ssl_proxy_prompt_mode)"
+  reset='\[\033[0m\]'
+  host_color='\[\033[1;37m\]'
+  path_color='\[\033[1;33m\]'
+
+  case "${mode}" in
+    readwrite)
+      color='\[\033[1;31m\]'
+      label='RW'
+      ;;
+    readonly)
+      color='\[\033[1;34m\]'
+      label='RO'
+      ;;
+    *)
+      color='\[\033[1;35m\]'
+      label='??'
+      ;;
+  esac
+
+  PS1="${color}[${label}]${reset} ${host_color}\u@\h${reset}:${path_color}\w${reset}\\$ "
+}
+
+ssl_proxy_apply_prompt
+unset -f ssl_proxy_apply_prompt
+unset -f ssl_proxy_prompt_mode
+EOF
+  chmod 0644 "${SHELL_PROMPT_PROFILE}"
+
+  if [[ -f /etc/bash.bashrc ]] && ! grep -Fq "${SHELL_PROMPT_PROFILE}" /etc/bash.bashrc; then
+    cat >> /etc/bash.bashrc <<EOF
+
+# Load ssl-proxy prompt customizations for interactive bash shells.
+if [ -r "${SHELL_PROMPT_PROFILE}" ]; then
+  . "${SHELL_PROMPT_PROFILE}"
+fi
+EOF
+  fi
 }
 
 sync_repo() {
@@ -498,6 +559,7 @@ install_command() {
   else
     validate_readonly_schema "${dsn}"
   fi
+  install_shell_prompt
   install_units
   systemctl restart "${CADDY_SERVICE_NAME}"
   systemctl restart "${SERVICE_NAME}"
@@ -584,6 +646,7 @@ update_command() {
       validate_readonly_schema "${dsn}"
     fi
   fi
+  install_shell_prompt
   install_units
   systemctl restart "${CADDY_SERVICE_NAME}" "${SERVICE_NAME}"
   if wait_for_controller; then

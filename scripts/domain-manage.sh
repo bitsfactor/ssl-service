@@ -8,6 +8,42 @@ PROGRAM_NAME="$(basename "${BASH_SOURCE[0]}")"
 CONFIG_CANDIDATES=(
   "/etc/ssl-proxy/config.yaml"
 )
+UI_INTERACTIVE=0
+LAST_DOMAIN=""
+LAST_UPSTREAM=""
+LAST_ZONE_TARGET=""
+DEFAULT_MENU_ACTION=""
+UI_LAST_STATUS=0
+
+ui_supports_color() {
+  [[ -t 1 ]] || return 1
+  [[ "${TERM:-}" != "dumb" ]] || return 1
+  return 0
+}
+
+if ui_supports_color; then
+  COLOR_RESET=$'\033[0m'
+  COLOR_BOLD=$'\033[1m'
+  COLOR_DIM=$'\033[2m'
+  COLOR_RED=$'\033[31m'
+  COLOR_GREEN=$'\033[32m'
+  COLOR_YELLOW=$'\033[33m'
+  COLOR_BLUE=$'\033[34m'
+  COLOR_MAGENTA=$'\033[35m'
+  COLOR_CYAN=$'\033[36m'
+  COLOR_WHITE=$'\033[37m'
+else
+  COLOR_RESET=""
+  COLOR_BOLD=""
+  COLOR_DIM=""
+  COLOR_RED=""
+  COLOR_GREEN=""
+  COLOR_YELLOW=""
+  COLOR_BLUE=""
+  COLOR_MAGENTA=""
+  COLOR_CYAN=""
+  COLOR_WHITE=""
+fi
 
 log() {
   printf '%s\n' "$*"
@@ -15,15 +51,22 @@ log() {
 
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
+  if [[ "${UI_INTERACTIVE}" -eq 1 ]]; then
+    return 1
+  fi
   exit 1
 }
 
 usage() {
   cat <<EOF
 Usage:
+  ${PROGRAM_NAME}                         # interactive menu
+  ${PROGRAM_NAME} overview
   ${PROGRAM_NAME} list
   ${PROGRAM_NAME} list-certs
   ${PROGRAM_NAME} list-zones
+  ${PROGRAM_NAME} shell
+  ${PROGRAM_NAME} prompt-init
   ${PROGRAM_NAME} get <domain>
   ${PROGRAM_NAME} status <domain>
   ${PROGRAM_NAME} check <domain>
@@ -42,6 +85,8 @@ Usage:
   ${PROGRAM_NAME} sync-now
 
 Notes:
+  - running without arguments opens the interactive menu.
+  - 'overview' shows local node mode and service state.
   - certificate issuance uses DNS-01 with Cloudflare only.
   - upstream_target can be omitted on add, which creates a certificate-only domain.
   - upstream_target accepts '6111', '127.0.0.1:6111', '10.0.0.25:6111', 'backend.internal:6111', or '[2001:db8::10]:6111'.
@@ -50,6 +95,893 @@ Notes:
   - mutating commands accept --sync-now to force an immediate local refresh
   - automatic retry backoff defaults to 3600 seconds after ACME failure
 EOF
+}
+
+shell_prompt_color() {
+  local mode="$1"
+  case "${mode}" in
+    readwrite) printf '%s' '1;31' ;;
+    readonly) printf '%s' '1;34' ;;
+    *) printf '%s' '1;35' ;;
+  esac
+}
+
+shell_prompt_label() {
+  local mode="$1"
+  case "${mode}" in
+    readwrite) printf '%s' 'RW' ;;
+    readonly) printf '%s' 'RO' ;;
+    *) printf '%s' '??' ;;
+  esac
+}
+
+prompt_init_command() {
+  local mode color label
+  mode="$(get_config_mode)"
+  color="$(shell_prompt_color "${mode}")"
+  label="$(shell_prompt_label "${mode}")"
+  cat <<EOF
+case \$- in
+  *i*) ;;
+  *) return 0 2>/dev/null || exit 0 ;;
+esac
+PS1='\[\033[${color}m\][${label}]\[\033[0m\] \[\033[1;37m\]\u@\h\[\033[0m\]:\[\033[1;33m\]\w\[\033[0m\]\\$ '
+if [[ "\${TERM:-}" == xterm* || "\${TERM:-}" == screen* || "\${TERM:-}" == tmux* || "\${TERM:-}" == rxvt* ]]; then
+  printf '\033]0;[%s] %s@%s: %s\007' '${label}' "\${USER}" "\${HOSTNAME%%.*}" "\${PWD/#\${HOME}/~}"
+fi
+EOF
+}
+
+ui_mode_color() {
+  local mode="$1"
+  case "${mode}" in
+    readwrite) printf '%s' "${COLOR_RED}" ;;
+    readonly) printf '%s' "${COLOR_BLUE}" ;;
+    *) printf '%s' "${COLOR_MAGENTA}" ;;
+  esac
+}
+
+ui_print_header() {
+  local mode="$1"
+  local mode_color
+  mode_color="$(ui_mode_color "${mode}")"
+  if [[ -t 1 ]]; then
+    printf '\033c'
+  fi
+  printf '%s[%s]%s %sssl-proxy domain manager%s\n' "${mode_color}" "$(shell_prompt_label "${mode}")" "${COLOR_RESET}" "${COLOR_BOLD}" "${COLOR_RESET}"
+  printf '%shost:%s %s  %smode:%s %s  %sconfig:%s %s\n' \
+    "${COLOR_DIM}" "${COLOR_RESET}" "${HOSTNAME%%.*}" \
+    "${COLOR_DIM}" "${COLOR_RESET}" "${mode}" \
+    "${COLOR_DIM}" "${COLOR_RESET}" "$(resolve_config_path)"
+  printf '%s\n' "--------------------------------------------------------------------------------"
+}
+
+ui_print_dashboard_summary() {
+  local mode="$1"
+  local controller_status caddy_status root_state
+  controller_status="$(service_state_summary ssl-proxy-controller.service)"
+  caddy_status="$(service_state_summary caddy.service)"
+  root_state="no"
+  [[ "${EUID}" -eq 0 ]] && root_state="yes"
+
+  printf '%sCurrent State%s\n' "${COLOR_BOLD}" "${COLOR_RESET}"
+  printf '  mode=%s%s%s  controller=%s  caddy=%s  root=%s\n' \
+    "$(ui_mode_color "${mode}")" "${mode}" "${COLOR_RESET}" \
+    "${controller_status}" \
+    "${caddy_status}" \
+    "${root_state}"
+  if [[ -n "${LAST_DOMAIN}" || -n "${LAST_UPSTREAM}" || -n "${LAST_ZONE_TARGET}" ]]; then
+    printf '  context:'
+    [[ -n "${LAST_DOMAIN}" ]] && printf ' domain=%s' "${LAST_DOMAIN}"
+    [[ -n "${LAST_UPSTREAM}" ]] && printf ' upstream=%s' "${LAST_UPSTREAM}"
+    [[ -n "${LAST_ZONE_TARGET}" ]] && printf ' zone=%s' "${LAST_ZONE_TARGET}"
+    printf '\n'
+  fi
+  printf '\n'
+}
+
+ui_print_menu() {
+  cat <<EOF
+${COLOR_DIM}Tip: you can type a number or a command name like status, sync, help, or exit.${COLOR_RESET}
+
+${COLOR_BOLD}Overview${COLOR_RESET}
+  20. node overview
+
+${COLOR_BOLD}Inspect${COLOR_RESET}
+  1. list routes
+  2. list certificates
+  3. list zones
+  4. status for a domain
+  5. check health for a domain
+  6. logs for a domain
+  7. get raw route row
+
+${COLOR_BOLD}Change Routes${COLOR_RESET}
+  8. add a domain
+  9. set upstream target
+  10. clear upstream target
+  11. enable domain
+  12. disable domain
+  13. delete route
+  14. purge route and certificate
+
+${COLOR_BOLD}Operations${COLOR_RESET}
+  15. issue certificate now
+  16. set Cloudflare zone token
+  17. sync now
+  18. open colored shell
+  19. help
+  0. exit
+EOF
+}
+
+ui_info() {
+  printf '%s[i]%s %s\n' "${COLOR_CYAN}" "${COLOR_RESET}" "$*"
+}
+
+ui_success() {
+  printf '%s[ok]%s %s\n' "${COLOR_GREEN}" "${COLOR_RESET}" "$*"
+}
+
+ui_warn() {
+  printf '%s[warn]%s %s\n' "${COLOR_YELLOW}" "${COLOR_RESET}" "$*"
+}
+
+ui_error() {
+  printf '%s[error]%s %s\n' "${COLOR_RED}" "${COLOR_RESET}" "$*" >&2
+}
+
+ui_section_title() {
+  local title="$1"
+  printf '%s%s%s\n' "${COLOR_BOLD}" "${title}" "${COLOR_RESET}"
+}
+
+ui_target_banner() {
+  local kind="$1"
+  local target="$2"
+  ui_section_title "${kind}"
+  printf '  target: %s\n\n' "${target}"
+}
+
+ui_pause() {
+  [[ "${UI_INTERACTIVE}" -eq 1 ]] || return 0
+  printf '\n'
+  read -r -p "Press Enter to continue..." _
+}
+
+ui_trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "${value}"
+}
+
+ui_prompt() {
+  local prompt="$1"
+  local default_value="${2:-}"
+  local value
+  if [[ -n "${default_value}" ]]; then
+    read -r -p "${prompt} [${default_value}]: " value || return 1
+    if [[ -z "${value}" ]]; then
+      value="${default_value}"
+    fi
+  else
+    read -r -p "${prompt}: " value || return 1
+  fi
+  ui_trim "${value}"
+}
+
+ui_prompt_optional() {
+  local prompt="$1"
+  local default_value="${2:-}"
+  local value
+  if [[ -n "${default_value}" ]]; then
+    read -r -p "${prompt} [${default_value}] (blank to clear): " value || return 1
+    if [[ -z "${value}" ]]; then
+      printf '%s' ""
+      return 0
+    fi
+  else
+    read -r -p "${prompt} (blank to leave empty): " value || return 1
+  fi
+  ui_trim "${value}"
+}
+
+ui_confirm() {
+  local prompt="$1"
+  local answer
+  read -r -p "${prompt} [y/N]: " answer || return 1
+  [[ "${answer}" == "y" || "${answer}" == "Y" ]]
+}
+
+ui_confirm_exact() {
+  local prompt="$1"
+  local expected="$2"
+  local answer
+  read -r -p "${prompt} [type '${expected}']: " answer || return 1
+  [[ "$(ui_trim "${answer}")" == "${expected}" ]]
+}
+
+ui_domain_input() {
+  local prompt="${1:-Domain}"
+  local value
+  value="$(ui_prompt "${prompt}" "${LAST_DOMAIN}")" || return 1
+  [[ -n "${value}" ]] || return 1
+  value="$(normalize_domain "${value}")"
+  LAST_DOMAIN="${value}"
+  printf '%s' "${value}"
+}
+
+ui_zone_target_input() {
+  local value
+  value="$(ui_prompt "Domain or zone" "${LAST_ZONE_TARGET}")" || return 1
+  [[ -n "${value}" ]] || return 1
+  LAST_ZONE_TARGET="${value}"
+  printf '%s' "${value}"
+}
+
+ui_upstream_input() {
+  local prompt="${1:-Upstream target}"
+  local value
+  value="$(ui_prompt "${prompt}" "${LAST_UPSTREAM}")" || return 1
+  [[ -n "${value}" ]] || return 1
+  LAST_UPSTREAM="${value}"
+  printf '%s' "${value}"
+}
+
+ui_show_output() {
+  local status="$1"
+  local output="$2"
+  if [[ -n "${output}" ]]; then
+    printf '%s\n' "${output}"
+  fi
+  if [[ "${status}" -eq 0 ]]; then
+    ui_success "command completed"
+  else
+    ui_error "command failed with exit code ${status}"
+  fi
+}
+
+ui_show_route_context() {
+  local domain="$1"
+  local details_json python_bin
+  python_bin="$(resolve_python)"
+  details_json="$(get_domain_details_json "${domain}")"
+  DETAILS_JSON="${details_json}" "${python_bin}" - <<'PY'
+from __future__ import annotations
+
+import json
+import os
+
+payload = json.loads(os.environ["DETAILS_JSON"])
+details = payload.get("details", {})
+if not payload.get("ok"):
+  print(f"Current Route\n  lookup: unavailable\n  reason: {payload.get('error', '')}\n")
+  raise SystemExit(0)
+
+upstream = details.get("upstream_target") or "(certificate-only)"
+enabled = details.get("enabled")
+certificate = details.get("certificate_status") or "-"
+updated_at = details.get("updated_at") or "-"
+print("Current Route")
+print(f"  domain: {details.get('domain') or '-'}")
+print(f"  enabled: {enabled}")
+print(f"  upstream: {upstream}")
+print(f"  certificate: {certificate}")
+print(f"  updated_at: {updated_at}")
+print()
+PY
+}
+
+ui_pretty_status_output() {
+  local output="$1"
+  local status="${2:-0}"
+  local python_bin
+  python_bin="$(resolve_python)"
+  STATUS_TEXT="${output}" STATUS_CODE="${status}" "${python_bin}" - <<'PY'
+from __future__ import annotations
+
+import os
+
+text = os.environ["STATUS_TEXT"]
+status_code = int(os.environ["STATUS_CODE"])
+rows = {}
+for line in text.splitlines():
+  if ":" not in line:
+    continue
+  key, value = line.split(":", 1)
+  rows[key.strip()] = value.strip()
+
+green = "\033[32m"
+yellow = "\033[33m"
+red = "\033[31m"
+cyan = "\033[36m"
+bold = "\033[1m"
+reset = "\033[0m"
+
+def colorize(value: str, *, yes_words: set[str] | None = None) -> str:
+  yes_words = yes_words or {"yes", "active", "true", "readwrite"}
+  low = value.lower()
+  if low in yes_words:
+    return f"{green}{value}{reset}"
+  if low in {"no", "false", "inactive", "readonly"}:
+    return f"{yellow}{value}{reset}"
+  if low:
+    return value
+  return f"{red}(empty){reset}"
+
+domain = rows.get("domain", "")
+print(f"{bold}Domain Summary{reset}")
+print(f"  domain: {domain or '(unknown)'}")
+print(f"  node_mode: {colorize(rows.get('current_node_mode', ''))}")
+print(f"  enabled: {colorize(rows.get('enabled', ''), yes_words={'true'})}")
+print(f"  upstream: {rows.get('upstream_target', '') or '(certificate-only)'}")
+print(f"  certificate: {colorize(rows.get('certificate_status', ''), yes_words={'active'})}")
+print(f"  points_to_this_host: {colorize(rows.get('points_to_this_host', ''), yes_words={'yes'})}")
+print(f"  zone_token_present: {colorize(rows.get('zone_token_present', ''), yes_words={'yes'})}")
+print(f"  command_status: {'ok' if status_code == 0 else f'failed ({status_code})'}")
+
+if rows.get("certificate_not_after"):
+  print(f"{cyan}certificate_not_after:{reset} {rows['certificate_not_after']}")
+if rows.get("updated_at"):
+  print(f"{cyan}updated_at:{reset} {rows['updated_at']}")
+if rows.get("dns_ipv4") or rows.get("dns_ipv6"):
+  print(f"{cyan}dns:{reset} v4={rows.get('dns_ipv4', '') or '-'} v6={rows.get('dns_ipv6', '') or '-'}")
+if rows.get("database_error"):
+  print(f"{red}database_error:{reset} {rows['database_error']}")
+if rows.get("dns_error"):
+  print(f"{red}dns_error:{reset} {rows['dns_error']}")
+if rows.get("last_error"):
+  print(f"{red}last_error:{reset} {rows['last_error']}")
+
+print()
+print(f"{bold}Raw Output{reset}")
+print(text)
+PY
+}
+
+ui_pretty_check_output() {
+  local output="$1"
+  local status="${2:-0}"
+  local python_bin
+  python_bin="$(resolve_python)"
+  CHECK_TEXT="${output}" STATUS_CODE="${status}" "${python_bin}" - <<'PY'
+from __future__ import annotations
+
+import os
+
+text = os.environ["CHECK_TEXT"]
+status_code = int(os.environ["STATUS_CODE"])
+green = "\033[32m"
+yellow = "\033[33m"
+red = "\033[31m"
+bold = "\033[1m"
+reset = "\033[0m"
+
+print(f"{bold}Health Checks{reset}")
+for line in text.splitlines():
+  if ":" not in line:
+    print(line)
+    continue
+  key, rest = line.split(":", 1)
+  rest = rest.strip()
+  color = green if rest.startswith("ok") else red if rest.startswith("fail") else yellow
+  print(f"  {key.strip()}: {color}{rest}{reset}")
+if status_code != 0:
+  print(f"  command_status: {red}failed ({status_code}){reset}")
+print()
+print(f"{bold}Raw Output{reset}")
+print(text)
+PY
+}
+
+ui_pretty_overview_output() {
+  local output="$1"
+  local python_bin
+  python_bin="$(resolve_python)"
+  OVERVIEW_TEXT="${output}" "${python_bin}" - <<'PY'
+from __future__ import annotations
+
+import os
+
+text = os.environ["OVERVIEW_TEXT"]
+rows = {}
+for line in text.splitlines():
+  if ":" not in line:
+    continue
+  key, value = line.split(":", 1)
+  rows[key.strip()] = value.strip()
+
+green = "\033[32m"
+yellow = "\033[33m"
+red = "\033[31m"
+blue = "\033[34m"
+bold = "\033[1m"
+reset = "\033[0m"
+
+def colorize_service(value: str) -> str:
+  if value == "active":
+    return f"{green}{value}{reset}"
+  if value in {"inactive", "failed", "activating", "deactivating"}:
+    return f"{yellow}{value}{reset}"
+  if value in {"bus-denied", "no-systemctl"}:
+    return f"{red}{value}{reset}"
+  return value or f"{red}(empty){reset}"
+
+mode = rows.get("mode", "")
+mode_color = red if mode == "readwrite" else blue if mode == "readonly" else yellow
+print(f"{bold}Node Overview{reset}")
+print(f"  mode: {mode_color}{mode or '(unknown)'}{reset}")
+print(f"  config_path: {rows.get('config_path', '') or '(missing)'}")
+print(f"  controller_status: {colorize_service(rows.get('controller_status', ''))}")
+print(f"  caddy_status: {colorize_service(rows.get('caddy_status', ''))}")
+print(f"  is_root: {green if rows.get('is_root') == 'yes' else yellow}{rows.get('is_root', '(unknown)')}{reset}")
+print(f"  last_domain: {rows.get('last_domain', '') or '-'}")
+print(f"  last_upstream: {rows.get('last_upstream', '') or '-'}")
+print(f"  last_zone_target: {rows.get('last_zone_target', '') or '-'}")
+print()
+print(f"{bold}Raw Output{reset}")
+print(text)
+PY
+}
+
+ui_pretty_route_rows_output() {
+  local output="$1"
+  local status="${2:-0}"
+  local kind="${3:-routes}"
+  local python_bin
+  python_bin="$(resolve_python)"
+  ROWS_TEXT="${output}" STATUS_CODE="${status}" ROWS_KIND="${kind}" "${python_bin}" - <<'PY'
+from __future__ import annotations
+
+import os
+import shlex
+
+text = os.environ["ROWS_TEXT"]
+status_code = int(os.environ["STATUS_CODE"])
+kind = os.environ["ROWS_KIND"]
+
+green = "\033[32m"
+yellow = "\033[33m"
+red = "\033[31m"
+bold = "\033[1m"
+reset = "\033[0m"
+
+if status_code != 0:
+  title = {
+    "routes": "Routes",
+    "certs": "Certificates",
+    "zones": "Zones",
+  }.get(kind, kind.title())
+  print(f"{bold}{title}{reset}")
+  print(f"  command_status: {red}failed ({status_code}){reset}")
+  if text:
+    first = text.splitlines()[0]
+    print(f"  error: {red}{first}{reset}")
+  print()
+  print(f"{bold}Raw Output{reset}")
+  print(text)
+  raise SystemExit(0)
+
+lines = [line.strip() for line in text.splitlines() if line.strip()]
+if lines == ["no rows"] or not lines:
+  print(f"{bold}{kind.title()}{reset}")
+  print("  no rows")
+  print()
+  print(f"{bold}Raw Output{reset}")
+  print(text)
+  raise SystemExit(0)
+
+rows: list[dict[str, str]] = []
+for line in lines:
+  parsed: dict[str, str] = {}
+  for token in shlex.split(line):
+    if "=" not in token:
+      continue
+    key, value = token.split("=", 1)
+    parsed[key] = value
+  rows.append(parsed)
+
+title = {
+  "routes": "Routes",
+  "certs": "Certificates",
+  "zones": "Zones",
+}.get(kind, kind.title())
+print(f"{bold}{title}{reset}")
+
+if kind == "zones":
+  for row in rows:
+    print(f"  {row.get('zone_name', '-')}")
+    print(f"    provider: {row.get('provider', '-')}")
+    print(f"    zone_id: {row.get('zone_id', '-')}")
+    print(f"    updated_at: {row.get('updated_at', '-')}")
+else:
+  for row in rows:
+    name = row.get("domain", "-")
+    cert = row.get("certificate_status", "-")
+    enabled = row.get("enabled", "-")
+    upstream = row.get("upstream_target", "") or "(certificate-only)"
+    cert_colored = f"{green}{cert}{reset}" if cert == "active" else f"{yellow}{cert}{reset}" if cert not in {"-", ""} else "-"
+    enabled_colored = f"{green}{enabled}{reset}" if enabled == "True" else f"{yellow}{enabled}{reset}" if enabled != "-" else "-"
+    summary_bits: list[str] = []
+    if kind == "routes":
+      summary_bits.append(f"enabled={enabled_colored}")
+      summary_bits.append(f"upstream={upstream}")
+    summary_bits.append(f"cert={cert_colored}")
+    if row.get("certificate_not_after"):
+      summary_bits.append(f"not_after={row['certificate_not_after']}")
+    if row.get("retry_after"):
+      summary_bits.append(f"retry_after={row['retry_after']}")
+    if row.get("updated_at"):
+      summary_bits.append(f"updated_at={row['updated_at']}")
+    print(f"  {name}")
+    print(f"    {' | '.join(summary_bits)}")
+    if row.get("last_error"):
+      print(f"    last_error: {red}{row['last_error']}{reset}")
+
+print()
+print(f"{bold}Raw Output{reset}")
+print(text)
+PY
+}
+
+ui_pretty_logs_output() {
+  local output="$1"
+  local status="${2:-0}"
+  local domain="${3:-}"
+  local python_bin
+  python_bin="$(resolve_python)"
+  LOG_TEXT="${output}" STATUS_CODE="${status}" LOG_DOMAIN="${domain}" "${python_bin}" - <<'PY'
+from __future__ import annotations
+
+import os
+
+text = os.environ["LOG_TEXT"]
+status_code = int(os.environ["STATUS_CODE"])
+domain = os.environ["LOG_DOMAIN"]
+red = "\033[31m"
+yellow = "\033[33m"
+cyan = "\033[36m"
+bold = "\033[1m"
+reset = "\033[0m"
+
+print(f"{bold}Logs{reset}")
+print(f"  domain: {domain or '(unknown)'}")
+if status_code != 0:
+  print(f"  command_status: {red}failed ({status_code}){reset}")
+  if text:
+    print(f"  error: {red}{text.splitlines()[0]}{reset}")
+else:
+  lines = [line for line in text.splitlines() if line.strip()]
+  if lines:
+    print(f"  matches: {len(lines)}")
+    print(f"  latest: {cyan}{lines[-1][:80]}{'...' if len(lines[-1]) > 80 else ''}{reset}")
+  else:
+    print(f"  status: {yellow}no matching log lines found{reset}")
+print()
+print(f"{bold}Raw Output{reset}")
+print(text)
+PY
+}
+
+ui_run_capture() {
+  local output status
+  set +e
+  output="$("$@" 2>&1)"
+  status=$?
+  set -e
+  UI_LAST_STATUS="${status}"
+  ui_show_output "${status}" "${output}"
+  return 0
+}
+
+ui_run_capture_pretty() {
+  local formatter="$1"
+  local formatter_arg="${2:-}"
+  shift
+  shift
+  local output status
+  set +e
+  output="$("$@" 2>&1)"
+  status=$?
+  set -e
+  UI_LAST_STATUS="${status}"
+  if [[ -n "${formatter}" ]]; then
+    output="$("${formatter}" "${output}" "${status}" "${formatter_arg}")"
+  fi
+  ui_show_output "${status}" "${output}"
+  return 0
+}
+
+service_state_summary() {
+  local service="$1"
+  local output status
+  if ! command -v systemctl >/dev/null 2>&1; then
+    printf '%s' "no-systemctl"
+    return 0
+  fi
+  set +e
+  output="$(systemctl is-active "${service}" 2>&1)"
+  status=$?
+  set -e
+  output="$(ui_trim "${output}")"
+  if [[ "${status}" -eq 0 ]]; then
+    printf '%s' "${output:-active}"
+    return 0
+  fi
+  case "${output}" in
+    *"Failed to connect to bus"*|*"Operation not permitted"*)
+      printf '%s' "bus-denied"
+      ;;
+    inactive|failed|activating|deactivating)
+      printf '%s' "${output}"
+      ;;
+    *)
+      printf '%s' "${output:-unknown}"
+      ;;
+  esac
+}
+
+interactive_offer_sync_now() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    ui_info "run as root if you want to use sync-now immediately"
+    return 0
+  fi
+  if ui_confirm "Run sync-now on this node now?"; then
+    ui_run_capture sync_now
+  fi
+}
+
+ui_run_mutation() {
+  local summary="$1"
+  local followup="${2:-}"
+  shift
+  shift
+  ui_run_capture "$@"
+  if [[ "${UI_LAST_STATUS}" -eq 0 ]]; then
+    DEFAULT_MENU_ACTION="4"
+    ui_info "${summary}"
+    if [[ -n "${followup}" ]]; then
+      ui_info "next: ${followup}"
+    fi
+    interactive_offer_sync_now
+  fi
+}
+
+interactive_add_domain() {
+  local domain upstream
+  domain="$(ui_domain_input "New domain")" || { ui_warn "cancelled"; return 0; }
+  LAST_DOMAIN="${domain}"
+  ui_target_banner "Add Domain" "${domain}"
+  ui_show_route_context "${domain}"
+  ensure_zone_token_for_domain "${domain}" || return 0
+  upstream="$(ui_prompt_optional "Upstream target" "${LAST_UPSTREAM}")" || { ui_warn "cancelled"; return 0; }
+  if [[ -n "${upstream}" ]]; then
+    LAST_UPSTREAM="${upstream}"
+    ui_run_mutation \
+      "route created with upstream target" \
+      "run menu 4 for status, menu 5 for checks, then confirm DNS points to this host" \
+      run_db_tool add "${domain}" "${upstream}"
+  else
+    ui_run_mutation \
+      "created certificate-only route" \
+      "run menu 4 for status and menu 15 if you need to re-issue now" \
+      run_db_tool add "${domain}"
+  fi
+}
+
+interactive_set_target() {
+  local domain upstream
+  domain="$(ui_domain_input)" || { ui_warn "cancelled"; return 0; }
+  LAST_DOMAIN="${domain}"
+  ui_target_banner "Set Upstream Target" "${domain}"
+  ui_show_route_context "${domain}"
+  ensure_zone_token_for_domain "${domain}" || return 0
+  upstream="$(ui_upstream_input)" || { ui_warn "cancelled"; return 0; }
+  LAST_UPSTREAM="${upstream}"
+  ui_run_mutation \
+    "upstream updated; readonly nodes should pick this up on their next poll" \
+    "run menu 4 for status, menu 6 for logs, and sync-now if you want this node refreshed immediately" \
+    run_db_tool set-target "${domain}" "${upstream}"
+}
+
+interactive_clear_target() {
+  local domain
+  domain="$(ui_domain_input)" || { ui_warn "cancelled"; return 0; }
+  LAST_DOMAIN="${domain}"
+  ui_target_banner "Clear Upstream Target" "${domain}"
+  ui_show_route_context "${domain}"
+  ui_confirm "Clear upstream target for ${domain}?" || { ui_warn "cancelled"; return 0; }
+  ui_run_mutation \
+    "route is now certificate-only" \
+    "run menu 4 to confirm upstream is empty and certificate state is still healthy" \
+    run_db_tool clear-target "${domain}"
+}
+
+interactive_enable_disable() {
+  local action="$1"
+  local domain
+  domain="$(ui_domain_input)" || { ui_warn "cancelled"; return 0; }
+  LAST_DOMAIN="${domain}"
+  ui_target_banner "${action^} Domain" "${domain}"
+  ui_show_route_context "${domain}"
+  ui_confirm "${action^} ${domain}?" || { ui_warn "cancelled"; return 0; }
+  ui_run_mutation \
+    "route updated" \
+    "run menu 4 for status and menu 1 to review the route list" \
+    run_db_tool "${action}" "${domain}"
+}
+
+interactive_delete_like() {
+  local action="$1"
+  local domain description
+  domain="$(ui_domain_input)" || { ui_warn "cancelled"; return 0; }
+  LAST_DOMAIN="${domain}"
+  ui_target_banner "${action^} Domain" "${domain}"
+  ui_show_route_context "${domain}"
+  if [[ "${action}" == "purge" ]]; then
+    description="delete the route and certificate records"
+  else
+    description="delete the route record"
+  fi
+  ui_warn "This will ${description} for ${domain}."
+  ui_confirm_exact "Confirm destructive action for ${domain}" "${domain}" || { ui_warn "cancelled"; return 0; }
+  ui_run_mutation "destructive action completed" run_db_tool "${action}" "${domain}"
+}
+
+interactive_issue_now() {
+  local mode domain
+  mode="$(get_config_mode)"
+  if [[ "${mode}" != "readwrite" ]]; then
+    ui_warn "issue-now is only available on readwrite nodes"
+    return 0
+  fi
+  domain="$(ui_domain_input)" || { ui_warn "cancelled"; return 0; }
+  LAST_DOMAIN="${domain}"
+  ui_target_banner "Issue Certificate Now" "${domain}"
+  ui_show_route_context "${domain}"
+  preflight_sync_now || return 0
+  ui_run_capture run_db_tool issue-now "${domain}"
+  if [[ "${UI_LAST_STATUS}" -eq 0 ]]; then
+    ui_run_capture sync_now
+    ui_info "certificate issuance has been queued and local controller restarted"
+  fi
+}
+
+interactive_set_zone_token() {
+  local target
+  target="$(ui_zone_target_input)" || { ui_warn "cancelled"; return 0; }
+  LAST_ZONE_TARGET="${target}"
+  ui_target_banner "Set Zone Token" "${target}"
+  ensure_zone_token_for_domain "${target}" 1 || return 0
+  ui_success "zone token updated"
+}
+
+interactive_sync_now() {
+  preflight_sync_now || return 0
+  ui_run_capture sync_now
+}
+
+node_overview_command() {
+  local mode config_path controller_status caddy_status python_bin
+  mode="$(get_config_mode)"
+  config_path="$(resolve_config_path)"
+  python_bin="$(resolve_python)"
+  controller_status="$(service_state_summary ssl-proxy-controller.service)"
+  caddy_status="$(service_state_summary caddy.service)"
+  "${python_bin}" - <<PY
+from __future__ import annotations
+
+mode = ${mode@Q}
+config_path = ${config_path@Q}
+controller_status = ${controller_status@Q}
+caddy_status = ${caddy_status@Q}
+last_domain = ${LAST_DOMAIN@Q}
+last_upstream = ${LAST_UPSTREAM@Q}
+last_zone_target = ${LAST_ZONE_TARGET@Q}
+is_root = ${EUID}
+
+print(f"mode: {mode}")
+print(f"config_path: {config_path}")
+print(f"controller_status: {controller_status}")
+print(f"caddy_status: {caddy_status}")
+print(f"is_root: {'yes' if is_root == 0 else 'no'}")
+print(f"last_domain: {last_domain}")
+print(f"last_upstream: {last_upstream}")
+print(f"last_zone_target: {last_zone_target}")
+PY
+}
+
+interactive_menu() {
+  local mode choice domain
+  mode="$(get_config_mode)"
+  UI_INTERACTIVE=1
+
+  while true; do
+    mode="$(get_config_mode)"
+    ui_print_header "${mode}"
+    ui_print_dashboard_summary "${mode}"
+    ui_print_menu
+    printf '\n'
+    choice="$(ui_prompt "Choose an action [0-20]" "${DEFAULT_MENU_ACTION}")" || return 0
+    choice="${choice,,}"
+
+    case "${choice}" in
+      20|overview)
+        DEFAULT_MENU_ACTION="20"
+        ui_run_capture_pretty ui_pretty_overview_output "" node_overview_command
+        ;;
+      1|list|routes)
+        DEFAULT_MENU_ACTION="1"
+        ui_run_capture_pretty ui_pretty_route_rows_output routes run_db_tool list
+        ;;
+      2|list-certs|certs)
+        DEFAULT_MENU_ACTION="2"
+        ui_run_capture_pretty ui_pretty_route_rows_output certs run_db_tool list-certs
+        ;;
+      3|list-zones|zones)
+        DEFAULT_MENU_ACTION="3"
+        ui_run_capture_pretty ui_pretty_route_rows_output zones run_db_tool list-zones
+        ;;
+      4|status)
+        domain="$(ui_domain_input)" || { ui_warn "cancelled"; ui_pause; continue; }
+        LAST_DOMAIN="${domain}"
+        DEFAULT_MENU_ACTION="4"
+        ui_target_banner "Status" "${domain}"
+        ui_run_capture_pretty ui_pretty_status_output "" status_command "${domain}"
+        ;;
+      5|check)
+        domain="$(ui_domain_input)" || { ui_warn "cancelled"; ui_pause; continue; }
+        LAST_DOMAIN="${domain}"
+        DEFAULT_MENU_ACTION="5"
+        ui_target_banner "Check" "${domain}"
+        ui_run_capture_pretty ui_pretty_check_output "" check_command "${domain}"
+        ;;
+      6|logs)
+        domain="$(ui_domain_input)" || { ui_warn "cancelled"; ui_pause; continue; }
+        LAST_DOMAIN="${domain}"
+        DEFAULT_MENU_ACTION="6"
+        ui_target_banner "Logs" "${domain}"
+        ui_run_capture_pretty ui_pretty_logs_output "${domain}" logs_command "${domain}"
+        ;;
+      7|get)
+        domain="$(ui_domain_input)" || { ui_warn "cancelled"; ui_pause; continue; }
+        LAST_DOMAIN="${domain}"
+        DEFAULT_MENU_ACTION="7"
+        ui_target_banner "Get Route" "${domain}"
+        ui_run_capture run_db_tool get "${domain}"
+        ;;
+      8|add) DEFAULT_MENU_ACTION=""; interactive_add_domain ;;
+      9|set-target|target) DEFAULT_MENU_ACTION=""; interactive_set_target ;;
+      10|clear-target) DEFAULT_MENU_ACTION=""; interactive_clear_target ;;
+      11|enable) DEFAULT_MENU_ACTION=""; interactive_enable_disable enable ;;
+      12|disable) DEFAULT_MENU_ACTION=""; interactive_enable_disable disable ;;
+      13|delete) DEFAULT_MENU_ACTION=""; interactive_delete_like delete ;;
+      14|purge) DEFAULT_MENU_ACTION=""; interactive_delete_like purge ;;
+      15|issue-now|issue) DEFAULT_MENU_ACTION=""; interactive_issue_now ;;
+      16|set-zone-token|zone-token|token) DEFAULT_MENU_ACTION=""; interactive_set_zone_token ;;
+      17|sync-now|sync) DEFAULT_MENU_ACTION=""; interactive_sync_now ;;
+      18|shell) shell_command ;;
+      19|help) usage ;;
+      0|q|quit|exit)
+        return 0
+        ;;
+      *)
+        ui_warn "invalid choice"
+        ;;
+    esac
+    ui_pause
+  done
+}
+
+shell_command() {
+  local bash_bin rcfile
+  bash_bin="$(command -v bash)"
+  [[ -n "${bash_bin}" ]] || fail "bash is required"
+  rcfile="$(mktemp)"
+  trap 'rm -f "${rcfile}"' EXIT
+  prompt_init_command > "${rcfile}"
+  exec "${bash_bin}" --rcfile "${rcfile}" -i
 }
 
 resolve_config_path() {
@@ -106,17 +1038,36 @@ PY
 
 ensure_zone_token_for_domain() {
   [[ $# -ge 1 ]] || fail "domain is required"
-  local domain token output force_prompt="${2:-0}"
+  local domain token output force_prompt="${2:-0}" zone_lookup_output
   domain="$(normalize_domain "$1")"
 
-  if [[ "${force_prompt}" -ne 1 ]] && run_db_tool get-zone-for-domain "${domain}" >/dev/null 2>&1; then
-    return 0
+  if [[ "${force_prompt}" -ne 1 ]]; then
+    set +e
+    zone_lookup_output="$(run_db_tool get-zone-for-domain "${domain}" 2>&1)"
+    local zone_lookup_status=$?
+    set -e
+    if [[ "${zone_lookup_status}" -eq 0 ]]; then
+      return 0
+    fi
+    if [[ "${UI_INTERACTIVE}" -eq 1 ]] && [[ "${zone_lookup_output}" == *"database connection failed:"* ]]; then
+      ui_error "could not verify existing zone token: ${zone_lookup_output}"
+      return 1
+    fi
   fi
 
   while true; do
-    read -r -s -p "Cloudflare API token for zone managing ${domain}: " token
+    if ! read -r -s -p "Cloudflare API token for zone managing ${domain}: " token; then
+      printf '\n'
+      ui_warn "token entry cancelled"
+      return 1
+    fi
     printf '\n'
+    token="$(ui_trim "${token}")"
     [[ -n "${token}" ]] || {
+      if [[ "${UI_INTERACTIVE}" -eq 1 ]]; then
+        ui_warn "token is required"
+        return 1
+      fi
       log "value is required"
       continue
     }
@@ -125,6 +1076,7 @@ ensure_zone_token_for_domain() {
       return 0
     fi
     printf '%s\n' "${output}" >&2
+    [[ "${UI_INTERACTIVE}" -eq 1 ]] && return 1
   done
 }
 
@@ -1258,6 +2210,10 @@ main() {
   local subcommand="${1:-}"
   local sync_flag=0
   local force_flag=0
+  if [[ -z "${subcommand}" ]]; then
+    interactive_menu
+    return 0
+  fi
   shift || true
 
   while [[ $# -gt 0 ]]; do
@@ -1281,6 +2237,15 @@ main() {
   done
 
   case "${subcommand}" in
+    overview)
+      node_overview_command
+      ;;
+    shell)
+      shell_command
+      ;;
+    prompt-init)
+      prompt_init_command
+      ;;
     list|list-certs)
       run_db_tool "${subcommand}"
       ;;
@@ -1358,7 +2323,7 @@ main() {
       ;;
     set-zone-token)
       [[ $# -ge 1 ]] || fail "domain or zone is required"
-      ensure_zone_token_for_domain "$(normalize_domain "$1")" 1
+      ensure_zone_token_for_domain "$1" 1
       ;;
     sync-now)
       sync_now
