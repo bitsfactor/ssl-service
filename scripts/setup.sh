@@ -207,9 +207,28 @@ ui_yes_no() {
 
 ui_pause() {
   ui_has_tty || return 0
-  printf '\n%sPress Enter to continue...%s' "${COLOR_DIM}" "${COLOR_RESET}"
+  printf '\n%sPress Enter to return to the menu...%s' "${COLOR_DIM}" "${COLOR_RESET}"
   local _
   read -r _
+}
+
+is_managed_setup_invocation() {
+  local current_path managed_path
+  current_path="$(realpath "${SCRIPT_PATH}" 2>/dev/null || printf '%s' "${SCRIPT_PATH}")"
+  managed_path="$(realpath "${MANAGED_SETUP_PATH}" 2>/dev/null || printf '%s' "${MANAGED_SETUP_PATH}")"
+  [[ "${current_path}" == "${managed_path}" ]]
+}
+
+is_source_tree_invocation() {
+  [[ -f "${REPO_DIR}/pyproject.toml" && "${SCRIPT_DIR}" == "${REPO_DIR}/scripts" ]]
+}
+
+should_auto_update_from_external_setup() {
+  runtime_exists || return 1
+  ui_has_tty || return 1
+  is_managed_setup_invocation && return 1
+  is_source_tree_invocation && return 1
+  return 0
 }
 
 prompt_required() {
@@ -1124,12 +1143,12 @@ domain_command() {
 
 interactive_menu() {
   local selection action default_index=0
+  local exit_index=$((${#STATE_MENU_ACTIONS[@]} - 1))
   while true; do
     ui_clear_screen
     ui_status_header
     selection="$(ui_menu_select "ssl-service control" "${default_index}" "${STATE_MENU_LABELS[@]}")" || return 0
     action="${STATE_MENU_ACTIONS[selection]}"
-    default_index="${selection}"
     case "${action}" in
       install) install_command ;;
       reconfigure) reconfigure_command ;;
@@ -1141,6 +1160,7 @@ interactive_menu() {
       exit) return 0 ;;
       *) fail "invalid choice" ;;
     esac
+    default_index="${exit_index}"
     ui_pause
   done
 }
@@ -1192,6 +1212,11 @@ main() {
       domain_command "$@"
       ;;
     "")
+      if should_auto_update_from_external_setup; then
+        log "Existing installation detected. Updating runtime from this setup.sh."
+        update_command
+        exit 0
+      fi
       if ui_has_tty; then
         interactive_menu
       else

@@ -20,6 +20,8 @@ Or download only the installer:
 curl -fsSL -o setup.sh https://github.com/bitsfactor/ssl-service/raw/main/scripts/setup.sh && bash setup.sh
 ```
 
+If the machine is already installed, rerunning a freshly downloaded `setup.sh` will update the local runtime automatically.
+
 Production behavior:
 
 - installs runtime files under `/root/.ssl-service`

@@ -121,3 +121,18 @@ def test_runtime_control_commands_require_root() -> None:
   for function_name in ("stop_runtime", "start_runtime", "restart_runtime"):
     block = content.split(f"{function_name}() {{", 1)[1].split("\n}\n\n", 1)[0]
     assert "require_root" in block
+
+
+def test_interactive_menu_resets_default_selection_to_exit_after_actions() -> None:
+  content = SCRIPT.read_text()
+
+  menu_block = content.split("interactive_menu() {", 1)[1].split("\n}\n\nmain()", 1)[0]
+  assert 'default_index="${exit_index}"' in menu_block
+  assert 'Press Enter to return to the menu' in content
+
+
+def test_external_setup_without_source_tree_can_auto_update_existing_runtime() -> None:
+  content = SCRIPT.read_text()
+
+  assert 'should_auto_update_from_external_setup' in content
+  assert 'Existing installation detected. Updating runtime from this setup.sh.' in content
