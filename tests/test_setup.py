@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 import os
@@ -44,6 +45,7 @@ def test_help_lists_domain_and_reconfigure_subcommands(tmp_path: Path) -> None:
 
   assert result.returncode == 0
   assert "setup.sh reconfigure" in result.stdout
+  assert "setup.sh build-status" in result.stdout
   assert "setup.sh domain <domain-command> [args...]" in result.stdout
   assert ".ssl-service" in result.stdout
 
@@ -133,6 +135,45 @@ def test_project_metadata_uses_ssl_service_name() -> None:
   assert 'name = "ssl-service"' in content
 
 
+def test_build_status_command_reads_latest_workflow_run_from_api(tmp_path: Path) -> None:
+  payload = {
+    "workflow_runs": [
+      {
+        "name": "Publish Image",
+        "run_number": 42,
+        "status": "completed",
+        "conclusion": "success",
+        "head_branch": "main",
+        "head_sha": "abc123",
+        "created_at": "2026-04-10T12:00:00Z",
+        "updated_at": "2026-04-10T12:05:00Z",
+        "html_url": "https://github.com/test/ssl-service/actions/runs/42",
+      }
+    ]
+  }
+  payload_path = tmp_path / "workflow-runs.json"
+  payload_path.write_text(json.dumps(payload))
+
+  env = base_env(tmp_path)
+  env["SSL_SERVICE_GITHUB_WORKFLOW_RUNS_URL"] = payload_path.resolve().as_uri()
+  result = subprocess.run(
+    ["bash", str(SCRIPT), "build-status"],
+    text=True,
+    capture_output=True,
+    check=False,
+    env=env,
+  )
+
+  assert result.returncode == 0
+  assert "workflow: Publish Image" in result.stdout
+  assert "run_number: 42" in result.stdout
+  assert "status: completed" in result.stdout
+  assert "conclusion: success" in result.stdout
+  assert "branch: main" in result.stdout
+  assert "sha: abc123" in result.stdout
+  assert "actions/runs/42" in result.stdout
+
+
 def test_update_stops_and_cleans_legacy_runtime() -> None:
   content = SCRIPT.read_text()
 
@@ -158,6 +199,7 @@ def test_interactive_menu_resets_default_selection_to_exit_after_actions() -> No
   menu_block = content.split("interactive_menu() {", 1)[1].split("\n}\n\nmain()", 1)[0]
   assert 'default_index="${exit_index}"' in menu_block
   assert 'Press Enter to return to the menu' in content
+  assert '"Show image build status"' in content
 
 
 def test_external_setup_without_source_tree_can_auto_update_existing_runtime() -> None:

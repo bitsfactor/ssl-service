@@ -25,11 +25,16 @@ ALIAS_MARKER_END="# <<< ssl-service alias <<<"
 DEFAULT_ACME_EMAIL="domain@bitsfactor.com"
 DEFAULT_IMAGE="${SSL_SERVICE_IMAGE:-ghcr.io/bitsfactor/ssl-service:latest}"
 GITHUB_CONTENT_BASE_URL="${SSL_SERVICE_GITHUB_CONTENT_BASE_URL:-https://github.com/bitsfactor/ssl-service/raw/${SSL_SERVICE_INSTALL_REF:-main}}"
-STATE_MENU_ACTIONS=(install reconfigure status logs restart update uninstall exit)
+GITHUB_API_BASE_URL="${SSL_SERVICE_GITHUB_API_BASE_URL:-https://api.github.com}"
+GITHUB_REPOSITORY="${SSL_SERVICE_GITHUB_REPOSITORY:-bitsfactor/ssl-service}"
+GITHUB_WORKFLOW_FILE="${SSL_SERVICE_GITHUB_WORKFLOW_FILE:-publish-image.yml}"
+GITHUB_WORKFLOW_RUNS_URL="${SSL_SERVICE_GITHUB_WORKFLOW_RUNS_URL:-}"
+STATE_MENU_ACTIONS=(install reconfigure status build-status logs restart update uninstall exit)
 STATE_MENU_LABELS=(
   "Install or overwrite runtime"
   "Change database or mode"
   "Show service status"
+  "Show image build status"
   "Tail service logs"
   "Restart container"
   "Pull latest image and recreate"
@@ -83,6 +88,7 @@ Usage:
   ${PROGRAM_NAME} install [--mode readonly|readwrite] [--dsn <postgres_dsn>] [--acme-email <email>] [--force-reconfigure]
   ${PROGRAM_NAME} reconfigure
   ${PROGRAM_NAME} status
+  ${PROGRAM_NAME} build-status
   ${PROGRAM_NAME} logs
   ${PROGRAM_NAME} start
   ${PROGRAM_NAME} stop
@@ -1076,6 +1082,66 @@ status_command() {
   fi
 }
 
+build_status_command() {
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required"
+  SSL_SERVICE_GITHUB_API_BASE_URL="${GITHUB_API_BASE_URL}" \
+  SSL_SERVICE_GITHUB_REPOSITORY="${GITHUB_REPOSITORY}" \
+  SSL_SERVICE_GITHUB_WORKFLOW_FILE="${GITHUB_WORKFLOW_FILE}" \
+  SSL_SERVICE_GITHUB_WORKFLOW_RUNS_URL="${GITHUB_WORKFLOW_RUNS_URL}" \
+  python3 - <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+
+api_base = os.environ["SSL_SERVICE_GITHUB_API_BASE_URL"].rstrip("/")
+repository = os.environ["SSL_SERVICE_GITHUB_REPOSITORY"].strip("/")
+workflow = os.environ["SSL_SERVICE_GITHUB_WORKFLOW_FILE"].strip("/")
+workflow_runs_url = os.environ.get("SSL_SERVICE_GITHUB_WORKFLOW_RUNS_URL", "").strip()
+if workflow_runs_url:
+  url = workflow_runs_url
+else:
+  repository_path = urllib.parse.quote(repository, safe="/")
+  workflow_path = urllib.parse.quote(workflow, safe="")
+  url = f"{api_base}/repos/{repository_path}/actions/workflows/{workflow_path}/runs?per_page=1"
+request = urllib.request.Request(
+  url,
+  headers={
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "ssl-service-build-status",
+  },
+)
+
+try:
+  with urllib.request.urlopen(request, timeout=15) as response:
+    payload = json.load(response)
+except urllib.error.HTTPError as exc:
+  detail = exc.read().decode("utf-8", errors="replace").strip()
+  message = detail or str(exc)
+  raise SystemExit(f"failed to query GitHub Actions API: {message}")
+except urllib.error.URLError as exc:
+  raise SystemExit(f"failed to query GitHub Actions API: {exc.reason}")
+
+runs = payload.get("workflow_runs") or []
+if not runs:
+  raise SystemExit("no workflow runs found for Publish Image")
+
+run = runs[0]
+print(f"workflow: {run.get('name') or '-'}")
+print(f"run_number: {run.get('run_number') or '-'}")
+print(f"status: {run.get('status') or '-'}")
+print(f"conclusion: {run.get('conclusion') or '-'}")
+print(f"branch: {run.get('head_branch') or '-'}")
+print(f"sha: {run.get('head_sha') or '-'}")
+print(f"created_at: {run.get('created_at') or '-'}")
+print(f"updated_at: {run.get('updated_at') or '-'}")
+print(f"url: {run.get('html_url') or '-'}")
+PY
+}
+
 logs_command() {
   require_root
   [[ -f "${COMPOSE_PATH}" ]] || fail "runtime is not installed"
@@ -1161,6 +1227,7 @@ interactive_menu() {
       install) install_command ;;
       reconfigure) reconfigure_command ;;
       status) status_command ;;
+      build-status) build_status_command ;;
       logs) logs_command ;;
       restart) restart_runtime ;;
       update) update_command ;;
@@ -1190,6 +1257,10 @@ main() {
     status)
       shift
       status_command "$@"
+      ;;
+    build-status)
+      shift
+      build_status_command "$@"
       ;;
     logs)
       shift

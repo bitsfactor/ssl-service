@@ -123,7 +123,7 @@ def test_setup_menu_renders_and_exit_can_be_selected_in_tty(tmp_path: Path) -> N
     child.expect("ssl-service control")
     child.expect("Install or overwrite runtime")
     child.expect("Exit")
-    for _ in range(7):
+    for _ in range(8):
       child.send("\x1b[B")
     child.send("\r")
     child.expect(pexpect.EOF)
@@ -168,7 +168,7 @@ def test_setup_uninstall_confirmation_can_cancel_and_return_to_menu(tmp_path: Pa
   try:
     child.expect("ssl-service control")
     child.expect("Uninstall runtime")
-    for _ in range(6):
+    for _ in range(7):
       child.send("\x1b[B")
     child.send("\r")
     child.expect("Proceed with uninstall\\?")
