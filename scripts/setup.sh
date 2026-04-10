@@ -206,6 +206,47 @@ ui_yes_no() {
   [[ "${answer}" == "y" || "${answer}" == "Y" ]]
 }
 
+ui_confirm_uninstall() {
+  local keep_config="$1"
+  local keep_data="$2"
+
+  if ui_has_tty; then
+    ui_clear_screen
+    ui_setup_header >&2
+    printf '%s%s%s\n' "${COLOR_BOLD}${COLOR_RED}" "Uninstall ssl-proxy" "${COLOR_RESET}" >&2
+    printf '%sThis will stop services and remove managed files from this host.%s\n\n' "${COLOR_DIM}" "${COLOR_RESET}" >&2
+    printf '%sDelete:%s\n' "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+    printf '  %s\n' "${INSTALL_DIR}" >&2
+    printf '  %s\n' "/usr/local/bin/ssl-proxy" >&2
+    printf '  %s\n' "/usr/local/bin/domain-manage" >&2
+    printf '  %s\n' "${SYSTEMD_DIR}/caddy.service" >&2
+    printf '  %s\n' "${SYSTEMD_DIR}/ssl-proxy-controller.service" >&2
+    printf '  %s\n' "${SYSTEMD_DIR}/${UPDATE_SERVICE_NAME}" >&2
+    printf '  %s\n' "${SYSTEMD_DIR}/${TIMER_NAME}" >&2
+    printf '  %s\n' "${SHELL_PROMPT_PROFILE}" >&2
+    if [[ "${keep_config}" -ne 1 ]]; then
+      printf '  %s\n' "${CONFIG_DIR}" >&2
+    fi
+    if [[ "${keep_data}" -ne 1 ]]; then
+      printf '  %s\n' "${STATE_DIR}" >&2
+      printf '  %s\n' "${LOG_DIR}" >&2
+    fi
+    if [[ "${keep_config}" -eq 1 || "${keep_data}" -eq 1 ]]; then
+      printf '\n%sPreserve:%s\n' "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+      if [[ "${keep_config}" -eq 1 ]]; then
+        printf '  %s\n' "${CONFIG_DIR}" >&2
+      fi
+      if [[ "${keep_data}" -eq 1 ]]; then
+        printf '  %s\n' "${STATE_DIR}" >&2
+        printf '  %s\n' "${LOG_DIR}" >&2
+      fi
+    fi
+    printf '\n' >&2
+  fi
+
+  ui_yes_no "Proceed with uninstall?" "no"
+}
+
 ui_pause() {
   ui_has_tty || return 0
   printf '\n%sPress Enter to continue...%s' "${COLOR_DIM}" "${COLOR_RESET}"
@@ -1037,7 +1078,7 @@ uninstall_command() {
   done
 
   if [[ "${yes}" -ne 1 ]]; then
-    ui_yes_no "Proceed with uninstall?" "no" || exit 0
+    ui_confirm_uninstall "${keep_config}" "${keep_data}" || exit 0
   fi
 
   systemctl disable --now "${TIMER_NAME}" "${SERVICE_NAME}" "${CADDY_SERVICE_NAME}" >/dev/null 2>&1 || true
