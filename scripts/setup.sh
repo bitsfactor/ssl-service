@@ -20,6 +20,7 @@ UPDATE_LOG="${STATE_DIR}/update.log"
 DEFAULT_DSN=""
 SOURCE_DIR_FILE="${INSTALL_DIR}/.source_dir"
 SHELL_PROMPT_PROFILE="/etc/profile.d/ssl-proxy-shell.sh"
+DEFAULT_ACME_EMAIL="domain@bitsfactor.com"
 
 log() {
   printf '%s\n' "$*"
@@ -602,7 +603,7 @@ install_command() {
       if [[ "${mode}" == "readwrite" ]]; then
         acme_email="$(prompt_required "ACME email")"
       else
-        acme_email="$(prompt_with_default "ACME email" "ops@example.com")"
+        acme_email="${DEFAULT_ACME_EMAIL}"
       fi
     fi
 
@@ -627,7 +628,7 @@ install_command() {
       if [[ "${mode}" == "readwrite" ]]; then
         acme_email="$(prompt_required "ACME email")"
       else
-        acme_email="$(prompt_with_default "ACME email" "ops@example.com")"
+        acme_email="${DEFAULT_ACME_EMAIL}"
       fi
     fi
 

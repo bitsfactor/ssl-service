@@ -26,7 +26,7 @@ caddy:
     - caddyfile
 
 acme:
-  email: ops@example.com
+  email: domain@bitsfactor.com
   staging: false
   challenge_type: dns-01
   dns_provider: cloudflare

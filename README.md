@@ -11,13 +11,13 @@ A front proxy service that:
 One-command install on a fresh Linux server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leoleoaabbcc/ssl-server/main/scripts/install.sh | sudo bash
+git clone git@github.com:leoleoaabbcc/ssl-server.git && cd ssl-server && bash scripts/setup.sh install
 ```
 
 If you prefer to clone the repo first:
 
 ```bash
-sudo bash scripts/setup.sh install
+bash scripts/setup.sh install
 ```
 
 The installer will ask for:
@@ -25,6 +25,10 @@ The installer will ask for:
 - mode: `readonly` or `readwrite`
 - PostgreSQL DSN
 - ACME email for `readwrite`
+
+If you are already logged in as `root`, do not prepend `sudo`.
+
+For `readonly`, the installer does not prompt for ACME email and uses `domain@bitsfactor.com`.
 
 Mode summary:
 
