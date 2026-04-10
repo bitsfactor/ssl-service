@@ -10,6 +10,7 @@ STATE_DIR="/var/lib/ssl-proxy"
 LOG_DIR="/var/log/ssl-proxy"
 VENV_DIR="${INSTALL_DIR}/.venv"
 ACME_VENV_DIR="${INSTALL_DIR}/.acme-venv"
+TOOLS_VENV_DIR="${INSTALL_DIR}/.tools-venv"
 SYSTEMD_DIR="/etc/systemd/system"
 TIMER_NAME="ssl-proxy-update.timer"
 SERVICE_NAME="ssl-proxy-controller.service"
@@ -21,6 +22,50 @@ DEFAULT_DSN=""
 SOURCE_DIR_FILE="${INSTALL_DIR}/.source_dir"
 SHELL_PROMPT_PROFILE="/etc/profile.d/ssl-proxy-shell.sh"
 DEFAULT_ACME_EMAIL="domain@bitsfactor.com"
+SETUP_MENU_ACTIONS=(install domain start stop restart status logs update timer-status uninstall exit)
+SETUP_MENU_LABELS=(
+  "Install or reconfigure this node"
+  "Open domain manager"
+  "Start services"
+  "Stop services"
+  "Restart services"
+  "Show service status"
+  "Tail service logs"
+  "Update code and restart"
+  "Show update timer status"
+  "Uninstall this node"
+  "Exit"
+)
+
+ui_supports_color() {
+  [[ -t 1 ]] || return 1
+  [[ "${TERM:-}" != "dumb" ]] || return 1
+  return 0
+}
+
+if ui_supports_color; then
+  COLOR_RESET=$'\033[0m'
+  COLOR_BOLD=$'\033[1m'
+  COLOR_DIM=$'\033[2m'
+  COLOR_RED=$'\033[31m'
+  COLOR_GREEN=$'\033[32m'
+  COLOR_YELLOW=$'\033[33m'
+  COLOR_BLUE=$'\033[34m'
+  COLOR_CYAN=$'\033[36m'
+  COLOR_WHITE=$'\033[37m'
+  COLOR_REVERSE=$'\033[7m'
+else
+  COLOR_RESET=""
+  COLOR_BOLD=""
+  COLOR_DIM=""
+  COLOR_RED=""
+  COLOR_GREEN=""
+  COLOR_YELLOW=""
+  COLOR_BLUE=""
+  COLOR_CYAN=""
+  COLOR_WHITE=""
+  COLOR_REVERSE=""
+fi
 
 log() {
   printf '%s\n' "$*"
@@ -35,6 +80,7 @@ usage() {
   cat <<'EOF'
 Usage:
   setup.sh install [--mode readonly|readwrite] [--dsn <postgres_dsn>] [--acme-email <email>] [--force-reconfigure]
+  setup.sh domain <domain-command> [args...]
   setup.sh start
   setup.sh stop
   setup.sh restart
@@ -49,6 +95,149 @@ Notes:
   - --acme-email is required for non-interactive readwrite installs.
   - --force-reconfigure overwrites an existing config without asking.
 EOF
+}
+
+ui_has_tty() {
+  [[ -t 0 && -t 1 ]]
+}
+
+ui_clear_screen() {
+  if [[ -t 1 ]]; then
+    printf '\033c' >&2
+  fi
+}
+
+ui_trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "${value}"
+}
+
+ui_read_key() {
+  local key
+  IFS= read -rsn1 key || return 1
+  if [[ "${key}" == $'\x1b' ]]; then
+    local next rest
+    IFS= read -rsn1 -t 0.05 next || true
+    if [[ "${next}" == "[" ]]; then
+      IFS= read -rsn1 -t 0.05 rest || true
+      key+="${next}${rest}"
+    else
+      key+="${next}"
+    fi
+  fi
+  printf '%s' "${key}"
+}
+
+ui_menu_select() {
+  local title="$1"
+  local default_index="$2"
+  shift 2
+  local -a items=("$@")
+  local selected=0 key index
+
+  if [[ "${default_index}" =~ ^[0-9]+$ ]] && (( default_index >= 0 && default_index < ${#items[@]} )); then
+    selected="${default_index}"
+  fi
+
+  if ! ui_has_tty; then
+    printf '%s' "${selected}"
+    return 0
+  fi
+
+  while true; do
+    ui_clear_screen
+    printf '%s%s%s\n' "${COLOR_BOLD}${COLOR_CYAN}" "${title}" "${COLOR_RESET}" >&2
+    printf '%sUse Up/Down arrows and Enter to select.%s\n\n' "${COLOR_DIM}" "${COLOR_RESET}" >&2
+    for index in "${!items[@]}"; do
+      if [[ "${index}" -eq "${selected}" ]]; then
+        printf '%s%s> %s%s\n' "${COLOR_REVERSE}${COLOR_WHITE}" "${COLOR_BOLD}" "${items[index]}" "${COLOR_RESET}" >&2
+      else
+        printf '  %s\n' "${items[index]}" >&2
+      fi
+    done
+
+    key="$(ui_read_key)" || return 1
+    case "${key}" in
+      $'\x1b[A'|k)
+        selected=$(( (selected - 1 + ${#items[@]}) % ${#items[@]} ))
+        ;;
+      $'\x1b[B'|j)
+        selected=$(( (selected + 1) % ${#items[@]} ))
+        ;;
+      ""|$'\n'|$'\r')
+        printf '%s' "${selected}"
+        return 0
+        ;;
+    esac
+  done
+}
+
+ui_yes_no() {
+  local prompt="$1"
+  local default_answer="${2:-no}"
+  local default_index=1
+  local index
+
+  if [[ "${default_answer}" == "yes" ]]; then
+    default_index=0
+  fi
+
+  if ui_has_tty; then
+    index="$(ui_menu_select "${prompt}" "${default_index}" "Yes" "No")" || return 1
+    [[ "${index}" == "0" ]]
+    return $?
+  fi
+
+  local answer
+  if [[ "${default_answer}" == "yes" ]]; then
+    read -r -p "${prompt} [Y/n]: " answer || return 1
+    answer="$(ui_trim "${answer}")"
+    [[ -z "${answer}" || "${answer}" == "y" || "${answer}" == "Y" ]]
+    return 0
+  fi
+
+  read -r -p "${prompt} [y/N]: " answer || return 1
+  answer="$(ui_trim "${answer}")"
+  [[ "${answer}" == "y" || "${answer}" == "Y" ]]
+}
+
+ui_pause() {
+  ui_has_tty || return 0
+  printf '\n%sPress Enter to continue...%s' "${COLOR_DIM}" "${COLOR_RESET}"
+  local _
+  read -r _
+}
+
+ui_setup_header() {
+  local mode="unconfigured"
+  if [[ -f "${CONFIG_PATH}" ]]; then
+    mode="$(awk '$1 == "mode:" { print $2; exit }' "${CONFIG_PATH}" 2>/dev/null || printf '%s' "unknown")"
+  fi
+  printf '%s%s%s\n' "${COLOR_BOLD}${COLOR_BLUE}" "ssl-proxy control" "${COLOR_RESET}"
+  printf '%shost:%s %s  %smode:%s %s  %sconfig:%s %s\n\n' \
+    "${COLOR_DIM}" "${COLOR_RESET}" "${HOSTNAME%%.*}" \
+    "${COLOR_DIM}" "${COLOR_RESET}" "${mode}" \
+    "${COLOR_DIM}" "${COLOR_RESET}" "${CONFIG_PATH}"
+}
+
+domain_script_path() {
+  if [[ -x "${REPO_DIR}/scripts/domain-manage.sh" ]]; then
+    printf '%s' "${REPO_DIR}/scripts/domain-manage.sh"
+    return 0
+  fi
+  if [[ -x "${INSTALL_DIR}/scripts/domain-manage.sh" ]]; then
+    printf '%s' "${INSTALL_DIR}/scripts/domain-manage.sh"
+    return 0
+  fi
+  fail "domain management script not found"
+}
+
+domain_command() {
+  local script_path
+  script_path="$(domain_script_path)"
+  SSL_PROXY_DOMAIN_PROGRAM_NAME="ssl-proxy domain" bash "${script_path}" "$@"
 }
 
 require_linux() {
@@ -158,6 +347,16 @@ ensure_venv() {
   "${VENV_DIR}/bin/pip" install "${source_dir}" >/dev/null
 }
 
+ensure_tools_venv() {
+  local source_dir
+  source_dir="$(resolve_source_dir)"
+  if [[ ! -x "${TOOLS_VENV_DIR}/bin/python" ]]; then
+    python3 -m venv "${TOOLS_VENV_DIR}"
+  fi
+  "${TOOLS_VENV_DIR}/bin/pip" install --upgrade pip >/dev/null
+  "${TOOLS_VENV_DIR}/bin/pip" install "${source_dir}[test]" >/dev/null
+}
+
 ensure_acme_venv() {
   if [[ ! -x "${ACME_VENV_DIR}/bin/python" ]]; then
     python3 -m venv "${ACME_VENV_DIR}"
@@ -215,7 +414,7 @@ prompt_with_default() {
   local prompt="$1"
   local default_value="$2"
   local value
-  read -r -p "${prompt} [${default_value}]: " value
+  read -r -p "${prompt} [${default_value}]: " value || fail "input cancelled for: ${prompt}"
   if [[ -z "${value}" ]]; then
     value="${default_value}"
   fi
@@ -252,7 +451,7 @@ prompt_required() {
   local prompt="$1"
   local value
   while true; do
-    read -r -p "${prompt}: " value
+    read -r -p "${prompt}: " value || fail "input cancelled for: ${prompt}"
     if [[ -n "${value}" ]]; then
       printf '%s' "${value}"
       return 0
@@ -262,9 +461,22 @@ prompt_required() {
 }
 
 select_mode() {
+  if ui_has_tty; then
+    local selected
+    selected="$(ui_menu_select "Select node mode" 0 \
+      "readonly  - follow database state and do not issue certificates" \
+      "readwrite - manage certificates and write state back to PostgreSQL")" || return 1
+    case "${selected}" in
+      0) printf '%s' "readonly" ;;
+      1) printf '%s' "readwrite" ;;
+      *) fail "invalid mode selection" ;;
+    esac
+    return 0
+  fi
+
   local value
   while true; do
-    read -r -p "Select mode (readonly/readwrite) [readonly]: " value
+    read -r -p "Select mode (readonly/readwrite) [readonly]: " value || fail "input cancelled for mode selection"
     value="${value:-readonly}"
     case "${value}" in
       readonly|readwrite)
@@ -477,9 +689,7 @@ PY
 
 config_exists_prompt() {
   if [[ -f "${CONFIG_PATH}" ]]; then
-    local answer
-    read -r -p "Config already exists at ${CONFIG_PATH}. Reconfigure it? [y/N]: " answer
-    [[ "${answer}" == "y" || "${answer}" == "Y" ]] || return 1
+    ui_yes_no "Config already exists at ${CONFIG_PATH}. Reconfigure it?" "no" || return 1
   fi
   return 0
 }
@@ -510,7 +720,7 @@ Unit=${UPDATE_SERVICE_NAME}
 WantedBy=timers.target
 EOF
   install -m 0755 "${INSTALL_DIR}/scripts/setup.sh" /usr/local/bin/ssl-proxy
-  install -m 0755 "${INSTALL_DIR}/scripts/domain-manage.sh" /usr/local/bin/domain-manage
+  rm -f /usr/local/bin/domain-manage
   systemctl daemon-reload
   systemctl enable "${CADDY_SERVICE_NAME}" "${SERVICE_NAME}" "${TIMER_NAME}" >/dev/null
 }
@@ -533,23 +743,16 @@ append_update_log() {
 }
 
 install_command() {
-  require_linux
-  require_root
-  require_systemd
-  ensure_packages
-  ensure_layout
-  check_bind_ports
-  sync_repo
-  record_source_dir
-  ensure_venv
-  ensure_acme_venv
-  verify_certbot_cloudflare_plugin
-  seed_bootstrap_caddyfile
-
   local mode=""
   local dsn=""
   local acme_email=""
   local force_reconfigure=0
+  local interactive_input=0
+  local config_missing=1
+
+  if ui_has_tty; then
+    interactive_input=1
+  fi
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -582,6 +785,36 @@ install_command() {
     fail "--mode must be readonly or readwrite"
   fi
 
+  [[ -f "${CONFIG_PATH}" ]] && config_missing=0
+
+  if [[ "${interactive_input}" -ne 1 && ( "${force_reconfigure}" -eq 1 || "${config_missing}" -eq 1 ) ]]; then
+    [[ -n "${mode}" ]] || fail "--mode is required when install runs without a TTY"
+    [[ -n "${dsn}" ]] || fail "--dsn is required when install runs without a TTY"
+    if [[ "${mode}" == "readwrite" && -z "${acme_email}" ]]; then
+      fail "--acme-email is required for readwrite install without a TTY"
+    fi
+  fi
+
+  if [[ "${interactive_input}" -ne 1 && "${config_missing}" -eq 0 && "${force_reconfigure}" -ne 1 ]]; then
+    if [[ -n "${mode}" || -n "${dsn}" || -n "${acme_email}" ]]; then
+      fail "existing config detected; use --force-reconfigure to apply new install parameters without a TTY"
+    fi
+  fi
+
+  require_linux
+  require_root
+  require_systemd
+  ensure_packages
+  ensure_layout
+  check_bind_ports
+  sync_repo
+  record_source_dir
+  ensure_venv
+  ensure_tools_venv
+  ensure_acme_venv
+  verify_certbot_cloudflare_plugin
+  seed_bootstrap_caddyfile
+
   if [[ "${force_reconfigure}" -eq 1 || ! -f "${CONFIG_PATH}" ]]; then
     if [[ -z "${mode}" ]]; then
       mode="$(select_mode)"
@@ -595,6 +828,7 @@ install_command() {
       fi
     fi
     while ! validate_dsn "${dsn}"; do
+      [[ "${interactive_input}" -eq 1 ]] || fail "database connection failed for supplied --dsn"
       log "database connection failed"
       dsn="$(prompt_required "PostgreSQL DSN")"
     done
@@ -609,6 +843,13 @@ install_command() {
 
     render_config "${mode}" "${dsn}" "${acme_email}"
   elif config_exists_prompt; then
+    if [[ "${interactive_input}" -ne 1 ]]; then
+      [[ -n "${mode}" ]] || fail "--mode is required when reconfiguring without a TTY"
+      [[ -n "${dsn}" ]] || fail "--dsn is required when reconfiguring without a TTY"
+      if [[ "${mode}" == "readwrite" && -z "${acme_email}" ]]; then
+        fail "--acme-email is required for readwrite reconfigure without a TTY"
+      fi
+    fi
     if [[ -z "${mode}" ]]; then
       mode="$(select_mode)"
     fi
@@ -620,6 +861,7 @@ install_command() {
       fi
     fi
     while ! validate_dsn "${dsn}"; do
+      [[ "${interactive_input}" -eq 1 ]] || fail "database connection failed for supplied --dsn"
       log "database connection failed"
       dsn="$(prompt_required "PostgreSQL DSN")"
     done
@@ -717,6 +959,7 @@ update_command() {
   sync_repo
   record_source_dir
   ensure_venv
+  ensure_tools_venv
   ensure_acme_venv
   verify_certbot_cloudflare_plugin
   if [[ -f "${CONFIG_PATH}" ]]; then
@@ -768,8 +1011,7 @@ uninstall_command() {
   done
 
   if [[ "${yes}" -ne 1 ]]; then
-    read -r -p "Proceed with uninstall? [y/N]: " confirm
-    [[ "${confirm}" == "y" || "${confirm}" == "Y" ]] || exit 0
+    ui_yes_no "Proceed with uninstall?" "no" || exit 0
   fi
 
   systemctl disable --now "${TIMER_NAME}" "${SERVICE_NAME}" "${CADDY_SERVICE_NAME}" >/dev/null 2>&1 || true
@@ -803,31 +1045,31 @@ uninstall_command() {
 }
 
 interactive_menu() {
-  cat <<'EOF'
-1. install
-2. start
-3. stop
-4. restart
-5. status
-6. logs
-7. update
-8. timer-status
-9. uninstall
-EOF
-  local choice
-  read -r -p "Choose an action [1-9]: " choice
-  case "${choice}" in
-    1) install_command ;;
-    2) start_command ;;
-    3) stop_command ;;
-    4) restart_command ;;
-    5) status_command ;;
-    6) logs_command ;;
-    7) update_command ;;
-    8) timer_status_command ;;
-    9) uninstall_command ;;
-    *) fail "invalid choice" ;;
-  esac
+  local selection action default_index=0
+  while true; do
+    if ui_has_tty; then
+      ui_clear_screen
+      ui_setup_header
+    fi
+    selection="$(ui_menu_select "ssl-proxy control" "${default_index}" "${SETUP_MENU_LABELS[@]}")" || return 0
+    action="${SETUP_MENU_ACTIONS[selection]}"
+    default_index="${selection}"
+    case "${action}" in
+      install) install_command ;;
+      domain) domain_command ;;
+      start) start_command ;;
+      stop) stop_command ;;
+      restart) restart_command ;;
+      status) status_command ;;
+      logs) logs_command ;;
+      update) update_command ;;
+      timer-status) timer_status_command ;;
+      uninstall) uninstall_command ;;
+      exit) return 0 ;;
+      *) fail "invalid choice" ;;
+    esac
+    ui_pause
+  done
 }
 
 main() {
@@ -836,6 +1078,7 @@ main() {
     -h|--help|help)
       usage
       ;;
+    domain) shift; domain_command "$@" ;;
     install) shift; install_command "$@" ;;
     start) shift; start_command "$@" ;;
     stop) shift; stop_command "$@" ;;
@@ -845,7 +1088,14 @@ main() {
     update) shift; update_command "$@" ;;
     timer-status) shift; timer_status_command "$@" ;;
     uninstall) shift; uninstall_command "$@" ;;
-    "") interactive_menu ;;
+    "")
+      if ui_has_tty; then
+        interactive_menu
+      else
+        usage
+        exit 1
+      fi
+      ;;
     *) fail "unknown command: ${command}" ;;
   esac
 }

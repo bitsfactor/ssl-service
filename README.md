@@ -27,6 +27,7 @@ The installer will ask for:
 - ACME email for `readwrite`
 
 If you are already logged in as `root`, do not prepend `sudo`.
+Interactive menus use Up/Down arrows and Enter.
 
 For `readonly`, the installer does not prompt for ACME email and uses `domain@bitsfactor.com`.
 
@@ -38,7 +39,6 @@ Mode summary:
 After install, these commands are available:
 
 - `ssl-proxy`
-- `domain-manage`
 
 ## Add Your First Domain
 
@@ -51,29 +51,29 @@ First, update DNS:
 Example: route `api.example.com` to local port `6111`
 
 ```bash
-sudo domain-manage add api.example.com 6111 --sync-now
-sudo domain-manage issue-now api.example.com
+sudo ssl-proxy domain add api.example.com 6111 --sync-now
+sudo ssl-proxy domain issue-now api.example.com
 ```
 
 Route to another server:
 
 ```bash
-sudo domain-manage add api.example.com 10.0.0.25:8080 --sync-now
-sudo domain-manage issue-now api.example.com
+sudo ssl-proxy domain add api.example.com 10.0.0.25:8080 --sync-now
+sudo ssl-proxy domain issue-now api.example.com
 ```
 
 Certificate only, no backend yet:
 
 ```bash
-sudo domain-manage add api.example.com --sync-now
-sudo domain-manage issue-now api.example.com
+sudo ssl-proxy domain add api.example.com --sync-now
+sudo ssl-proxy domain issue-now api.example.com
 ```
 
 Optional pre-check:
 
 ```bash
-domain-manage check api.example.com
-domain-manage status api.example.com
+ssl-proxy domain check api.example.com
+ssl-proxy domain status api.example.com
 ```
 
 ## Check The Result
@@ -81,7 +81,7 @@ domain-manage status api.example.com
 Check domain status:
 
 ```bash
-domain-manage status api.example.com
+ssl-proxy domain status api.example.com
 ```
 
 Check service status:
@@ -113,16 +113,16 @@ sudo ssl-proxy uninstall
 Domain management:
 
 ```bash
-domain-manage list
-domain-manage get <domain>
-domain-manage status <domain>
-domain-manage check <domain>
-domain-manage logs <domain>
-sudo domain-manage add <domain> [target] --sync-now
-sudo domain-manage set-target <domain> <target> --sync-now
-sudo domain-manage clear-target <domain> --sync-now
-sudo domain-manage issue-now <domain>
-sudo domain-manage sync-now
+ssl-proxy domain list
+ssl-proxy domain get <domain>
+ssl-proxy domain status <domain>
+ssl-proxy domain check <domain>
+ssl-proxy domain logs <domain>
+sudo ssl-proxy domain add <domain> [target] --sync-now
+sudo ssl-proxy domain set-target <domain> <target> --sync-now
+sudo ssl-proxy domain clear-target <domain> --sync-now
+sudo ssl-proxy domain issue-now <domain>
+sudo ssl-proxy domain sync-now
 ```
 
 ## Notes

@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEPLOY_DIR="/opt/ssl-proxy"
-PROGRAM_NAME="$(basename "${BASH_SOURCE[0]}")"
+PROGRAM_NAME="${SSL_PROXY_DOMAIN_PROGRAM_NAME:-$(basename "${BASH_SOURCE[0]}")}"
 CONFIG_CANDIDATES=(
   "/etc/ssl-proxy/config.yaml"
 )
@@ -14,6 +14,52 @@ LAST_UPSTREAM=""
 LAST_ZONE_TARGET=""
 DEFAULT_MENU_ACTION=""
 UI_LAST_STATUS=0
+DOMAIN_MENU_ACTIONS=(
+  overview
+  list
+  list-certs
+  list-zones
+  status
+  check
+  logs
+  get
+  add
+  set-target
+  clear-target
+  enable
+  disable
+  delete
+  purge
+  issue-now
+  set-zone-token
+  sync-now
+  shell
+  help
+  exit
+)
+DOMAIN_MENU_LABELS=(
+  "Node overview"
+  "List routes"
+  "List certificates"
+  "List zones"
+  "Status for a domain"
+  "Check health for a domain"
+  "Logs for a domain"
+  "Get raw route row"
+  "Add a domain"
+  "Set upstream target"
+  "Clear upstream target"
+  "Enable domain"
+  "Disable domain"
+  "Delete route"
+  "Purge route and certificate"
+  "Issue certificate now"
+  "Set Cloudflare zone token"
+  "Sync now"
+  "Open colored shell"
+  "Help"
+  "Exit"
+)
 
 ui_supports_color() {
   [[ -t 1 ]] || return 1
@@ -32,6 +78,7 @@ if ui_supports_color; then
   COLOR_MAGENTA=$'\033[35m'
   COLOR_CYAN=$'\033[36m'
   COLOR_WHITE=$'\033[37m'
+  COLOR_REVERSE=$'\033[7m'
 else
   COLOR_RESET=""
   COLOR_BOLD=""
@@ -43,6 +90,7 @@ else
   COLOR_MAGENTA=""
   COLOR_CYAN=""
   COLOR_WHITE=""
+  COLOR_REVERSE=""
 fi
 
 log() {
@@ -141,19 +189,23 @@ ui_mode_color() {
   esac
 }
 
+ui_clear_screen() {
+  if [[ -t 1 ]]; then
+    printf '\033c' >&2
+  fi
+}
+
 ui_print_header() {
   local mode="$1"
   local mode_color
   mode_color="$(ui_mode_color "${mode}")"
-  if [[ -t 1 ]]; then
-    printf '\033c'
-  fi
-  printf '%s[%s]%s %sssl-proxy domain manager%s\n' "${mode_color}" "$(shell_prompt_label "${mode}")" "${COLOR_RESET}" "${COLOR_BOLD}" "${COLOR_RESET}"
+  ui_clear_screen
+  printf '%s[%s]%s %sssl-proxy domain manager%s\n' "${mode_color}" "$(shell_prompt_label "${mode}")" "${COLOR_RESET}" "${COLOR_BOLD}" "${COLOR_RESET}" >&2
   printf '%shost:%s %s  %smode:%s %s  %sconfig:%s %s\n' \
     "${COLOR_DIM}" "${COLOR_RESET}" "${HOSTNAME%%.*}" \
     "${COLOR_DIM}" "${COLOR_RESET}" "${mode}" \
-    "${COLOR_DIM}" "${COLOR_RESET}" "$(resolve_config_path)"
-  printf '%s\n' "--------------------------------------------------------------------------------"
+    "${COLOR_DIM}" "${COLOR_RESET}" "$(resolve_config_path)" >&2
+  printf '%s\n' "--------------------------------------------------------------------------------" >&2
 }
 
 ui_print_dashboard_summary() {
@@ -164,55 +216,64 @@ ui_print_dashboard_summary() {
   root_state="no"
   [[ "${EUID}" -eq 0 ]] && root_state="yes"
 
-  printf '%sCurrent State%s\n' "${COLOR_BOLD}" "${COLOR_RESET}"
+  printf '%sCurrent State%s\n' "${COLOR_BOLD}" "${COLOR_RESET}" >&2
   printf '  mode=%s%s%s  controller=%s  caddy=%s  root=%s\n' \
     "$(ui_mode_color "${mode}")" "${mode}" "${COLOR_RESET}" \
     "${controller_status}" \
     "${caddy_status}" \
-    "${root_state}"
+    "${root_state}" >&2
   if [[ -n "${LAST_DOMAIN}" || -n "${LAST_UPSTREAM}" || -n "${LAST_ZONE_TARGET}" ]]; then
-    printf '  context:'
-    [[ -n "${LAST_DOMAIN}" ]] && printf ' domain=%s' "${LAST_DOMAIN}"
-    [[ -n "${LAST_UPSTREAM}" ]] && printf ' upstream=%s' "${LAST_UPSTREAM}"
-    [[ -n "${LAST_ZONE_TARGET}" ]] && printf ' zone=%s' "${LAST_ZONE_TARGET}"
-    printf '\n'
+    printf '  context:' >&2
+    [[ -n "${LAST_DOMAIN}" ]] && printf ' domain=%s' "${LAST_DOMAIN}" >&2
+    [[ -n "${LAST_UPSTREAM}" ]] && printf ' upstream=%s' "${LAST_UPSTREAM}" >&2
+    [[ -n "${LAST_ZONE_TARGET}" ]] && printf ' zone=%s' "${LAST_ZONE_TARGET}" >&2
+    printf '\n' >&2
   fi
-  printf '\n'
+  printf '\n' >&2
 }
 
 ui_print_menu() {
-  cat <<EOF
-${COLOR_DIM}Tip: you can type a number or a command name like status, sync, help, or exit.${COLOR_RESET}
+  local selected="$1"
+  printf '%sUse Up/Down arrows and Enter to select.%s\n\n' "${COLOR_DIM}" "${COLOR_RESET}" >&2
+  printf '%sOverview%s\n' "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+  ui_print_menu_item "${selected}" 0 "Node overview" "overview"
+  printf '\n%sInspect%s\n' "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+  ui_print_menu_item "${selected}" 1 "List routes" "list"
+  ui_print_menu_item "${selected}" 2 "List certificates" "list-certs"
+  ui_print_menu_item "${selected}" 3 "List zones" "list-zones"
+  ui_print_menu_item "${selected}" 4 "Status for a domain" "status"
+  ui_print_menu_item "${selected}" 5 "Check health for a domain" "check"
+  ui_print_menu_item "${selected}" 6 "Logs for a domain" "logs"
+  ui_print_menu_item "${selected}" 7 "Get raw route row" "get"
+  printf '\n%sChange Routes%s\n' "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+  ui_print_menu_item "${selected}" 8 "Add a domain" "add"
+  ui_print_menu_item "${selected}" 9 "Set upstream target" "set-target"
+  ui_print_menu_item "${selected}" 10 "Clear upstream target" "clear-target"
+  ui_print_menu_item "${selected}" 11 "Enable domain" "enable"
+  ui_print_menu_item "${selected}" 12 "Disable domain" "disable"
+  ui_print_menu_item "${selected}" 13 "Delete route" "delete"
+  ui_print_menu_item "${selected}" 14 "Purge route and certificate" "purge"
+  printf '\n%sOperations%s\n' "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+  ui_print_menu_item "${selected}" 15 "Issue certificate now" "issue-now"
+  ui_print_menu_item "${selected}" 16 "Set Cloudflare zone token" "set-zone-token"
+  ui_print_menu_item "${selected}" 17 "Sync now" "sync-now"
+  ui_print_menu_item "${selected}" 18 "Open colored shell" "shell"
+  ui_print_menu_item "${selected}" 19 "Help" "help"
+  ui_print_menu_item "${selected}" 20 "Exit" "exit"
+}
 
-${COLOR_BOLD}Overview${COLOR_RESET}
-  20. node overview
-
-${COLOR_BOLD}Inspect${COLOR_RESET}
-  1. list routes
-  2. list certificates
-  3. list zones
-  4. status for a domain
-  5. check health for a domain
-  6. logs for a domain
-  7. get raw route row
-
-${COLOR_BOLD}Change Routes${COLOR_RESET}
-  8. add a domain
-  9. set upstream target
-  10. clear upstream target
-  11. enable domain
-  12. disable domain
-  13. delete route
-  14. purge route and certificate
-
-${COLOR_BOLD}Operations${COLOR_RESET}
-  15. issue certificate now
-  16. set Cloudflare zone token
-  17. sync now
-  18. open colored shell
-  19. help
-  0. exit
-EOF
+ui_print_menu_item() {
+  local selected="$1"
+  local index="$2"
+  local label="$3"
+  local action="$4"
+  if [[ "${selected}" -eq "${index}" ]]; then
+    printf '%s%s> %-31s%s %s[%s]%s\n' \
+      "${COLOR_WHITE}${COLOR_BOLD}${COLOR_REVERSE}" "" "${label}" "${COLOR_RESET}" \
+      "${COLOR_DIM}" "${action}" "${COLOR_RESET}" >&2
+  else
+    printf '  %-31s %s[%s]%s\n' "${label}" "${COLOR_DIM}" "${action}" "${COLOR_RESET}" >&2
+  fi
 }
 
 ui_info() {
@@ -247,6 +308,78 @@ ui_pause() {
   [[ "${UI_INTERACTIVE}" -eq 1 ]] || return 0
   printf '\n'
   read -r -p "Press Enter to continue..." _
+}
+
+ui_has_tty() {
+  [[ -t 0 && -t 1 ]]
+}
+
+ui_read_key() {
+  local key
+  IFS= read -rsn1 key || return 1
+  if [[ "${key}" == $'\x1b' ]]; then
+    local next rest
+    IFS= read -rsn1 -t 0.05 next || true
+    if [[ "${next}" == "[" ]]; then
+      IFS= read -rsn1 -t 0.05 rest || true
+      key+="${next}${rest}"
+    else
+      key+="${next}"
+    fi
+  fi
+  printf '%s' "${key}"
+}
+
+ui_menu_index_for_action() {
+  case "${1:-}" in
+    20|overview) printf '%s' "0" ;;
+    1|list|routes) printf '%s' "1" ;;
+    2|list-certs|certs) printf '%s' "2" ;;
+    3|list-zones|zones) printf '%s' "3" ;;
+    4|status) printf '%s' "4" ;;
+    5|check) printf '%s' "5" ;;
+    6|logs) printf '%s' "6" ;;
+    7|get) printf '%s' "7" ;;
+    8|add) printf '%s' "8" ;;
+    9|set-target|target) printf '%s' "9" ;;
+    10|clear-target) printf '%s' "10" ;;
+    11|enable) printf '%s' "11" ;;
+    12|disable) printf '%s' "12" ;;
+    13|delete) printf '%s' "13" ;;
+    14|purge) printf '%s' "14" ;;
+    15|issue-now|issue) printf '%s' "15" ;;
+    16|set-zone-token|zone-token|token) printf '%s' "16" ;;
+    17|sync-now|sync) printf '%s' "17" ;;
+    18|shell) printf '%s' "18" ;;
+    19|help) printf '%s' "19" ;;
+    0|q|quit|exit) printf '%s' "20" ;;
+    *) printf '%s' "0" ;;
+  esac
+}
+
+ui_menu_pick_action() {
+  local selected key mode
+  selected="$(ui_menu_index_for_action "${1:-}")"
+  while true; do
+    mode="$(get_config_mode)"
+    ui_print_header "${mode}"
+    ui_print_dashboard_summary "${mode}"
+    ui_print_menu "${selected}"
+    printf '\n' >&2
+    key="$(ui_read_key)" || return 1
+    case "${key}" in
+      $'\x1b[A'|k)
+        selected=$(( (selected - 1 + ${#DOMAIN_MENU_ACTIONS[@]}) % ${#DOMAIN_MENU_ACTIONS[@]} ))
+        ;;
+      $'\x1b[B'|j)
+        selected=$(( (selected + 1) % ${#DOMAIN_MENU_ACTIONS[@]} ))
+        ;;
+      ""|$'\n'|$'\r')
+        printf '%s' "${DOMAIN_MENU_ACTIONS[selected]}"
+        return 0
+        ;;
+    esac
+  done
 }
 
 ui_trim() {
@@ -289,9 +422,52 @@ ui_prompt_optional() {
 
 ui_confirm() {
   local prompt="$1"
+  if ui_has_tty; then
+    local selected
+    selected="$(ui_menu_pick_yes_no "${prompt}" "No" "Yes" "No")" || return 1
+    [[ "${selected}" == "Yes" ]]
+    return $?
+  fi
   local answer
   read -r -p "${prompt} [y/N]: " answer || return 1
   [[ "${answer}" == "y" || "${answer}" == "Y" ]]
+}
+
+ui_menu_pick_yes_no() {
+  local title="$1"
+  local default_label="$2"
+  local yes_label="$3"
+  local no_label="$4"
+  local selected=1 key
+  if [[ "${default_label}" == "${yes_label}" ]]; then
+    selected=0
+  fi
+  while true; do
+    ui_clear_screen
+    printf '%s[%s]%s %sssl-proxy domain manager%s\n' "$(ui_mode_color "$(get_config_mode)")" "$(shell_prompt_label "$(get_config_mode)")" "${COLOR_RESET}" "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+    printf '%s%s%s\n\n' "${COLOR_BOLD}" "${title}" "${COLOR_RESET}" >&2
+    if [[ "${selected}" -eq 0 ]]; then
+      printf '%s%s> %s%s\n' "${COLOR_WHITE}${COLOR_BOLD}${COLOR_REVERSE}" "" "${yes_label}" "${COLOR_RESET}" >&2
+      printf '  %s\n' "${no_label}" >&2
+    else
+      printf '  %s\n' "${yes_label}" >&2
+      printf '%s%s> %s%s\n' "${COLOR_WHITE}${COLOR_BOLD}${COLOR_REVERSE}" "" "${no_label}" "${COLOR_RESET}" >&2
+    fi
+    key="$(ui_read_key)" || return 1
+    case "${key}" in
+      $'\x1b[A'|$'\x1b[B'|j|k)
+        selected=$((1 - selected))
+        ;;
+      ""|$'\n'|$'\r')
+        if [[ "${selected}" -eq 0 ]]; then
+          printf '%s' "${yes_label}"
+        else
+          printf '%s' "${no_label}"
+        fi
+        return 0
+        ;;
+    esac
+  done
 }
 
 ui_confirm_exact() {
@@ -898,72 +1074,66 @@ interactive_menu() {
   UI_INTERACTIVE=1
 
   while true; do
-    mode="$(get_config_mode)"
-    ui_print_header "${mode}"
-    ui_print_dashboard_summary "${mode}"
-    ui_print_menu
-    printf '\n'
-    choice="$(ui_prompt "Choose an action [0-20]" "${DEFAULT_MENU_ACTION}")" || return 0
-    choice="${choice,,}"
+    choice="$(ui_menu_pick_action "${DEFAULT_MENU_ACTION}")" || return 0
 
     case "${choice}" in
-      20|overview)
+      overview)
         DEFAULT_MENU_ACTION="20"
         ui_run_capture_pretty ui_pretty_overview_output "" node_overview_command
         ;;
-      1|list|routes)
+      list)
         DEFAULT_MENU_ACTION="1"
         ui_run_capture_pretty ui_pretty_route_rows_output routes run_db_tool list
         ;;
-      2|list-certs|certs)
+      list-certs)
         DEFAULT_MENU_ACTION="2"
         ui_run_capture_pretty ui_pretty_route_rows_output certs run_db_tool list-certs
         ;;
-      3|list-zones|zones)
+      list-zones)
         DEFAULT_MENU_ACTION="3"
         ui_run_capture_pretty ui_pretty_route_rows_output zones run_db_tool list-zones
         ;;
-      4|status)
+      status)
         domain="$(ui_domain_input)" || { ui_warn "cancelled"; ui_pause; continue; }
         LAST_DOMAIN="${domain}"
         DEFAULT_MENU_ACTION="4"
         ui_target_banner "Status" "${domain}"
         ui_run_capture_pretty ui_pretty_status_output "" status_command "${domain}"
         ;;
-      5|check)
+      check)
         domain="$(ui_domain_input)" || { ui_warn "cancelled"; ui_pause; continue; }
         LAST_DOMAIN="${domain}"
         DEFAULT_MENU_ACTION="5"
         ui_target_banner "Check" "${domain}"
         ui_run_capture_pretty ui_pretty_check_output "" check_command "${domain}"
         ;;
-      6|logs)
+      logs)
         domain="$(ui_domain_input)" || { ui_warn "cancelled"; ui_pause; continue; }
         LAST_DOMAIN="${domain}"
         DEFAULT_MENU_ACTION="6"
         ui_target_banner "Logs" "${domain}"
         ui_run_capture_pretty ui_pretty_logs_output "${domain}" logs_command "${domain}"
         ;;
-      7|get)
+      get)
         domain="$(ui_domain_input)" || { ui_warn "cancelled"; ui_pause; continue; }
         LAST_DOMAIN="${domain}"
         DEFAULT_MENU_ACTION="7"
         ui_target_banner "Get Route" "${domain}"
         ui_run_capture run_db_tool get "${domain}"
         ;;
-      8|add) DEFAULT_MENU_ACTION=""; interactive_add_domain ;;
-      9|set-target|target) DEFAULT_MENU_ACTION=""; interactive_set_target ;;
-      10|clear-target) DEFAULT_MENU_ACTION=""; interactive_clear_target ;;
-      11|enable) DEFAULT_MENU_ACTION=""; interactive_enable_disable enable ;;
-      12|disable) DEFAULT_MENU_ACTION=""; interactive_enable_disable disable ;;
-      13|delete) DEFAULT_MENU_ACTION=""; interactive_delete_like delete ;;
-      14|purge) DEFAULT_MENU_ACTION=""; interactive_delete_like purge ;;
-      15|issue-now|issue) DEFAULT_MENU_ACTION=""; interactive_issue_now ;;
-      16|set-zone-token|zone-token|token) DEFAULT_MENU_ACTION=""; interactive_set_zone_token ;;
-      17|sync-now|sync) DEFAULT_MENU_ACTION=""; interactive_sync_now ;;
-      18|shell) shell_command ;;
-      19|help) usage ;;
-      0|q|quit|exit)
+      add) DEFAULT_MENU_ACTION=""; interactive_add_domain ;;
+      set-target) DEFAULT_MENU_ACTION=""; interactive_set_target ;;
+      clear-target) DEFAULT_MENU_ACTION=""; interactive_clear_target ;;
+      enable) DEFAULT_MENU_ACTION=""; interactive_enable_disable enable ;;
+      disable) DEFAULT_MENU_ACTION=""; interactive_enable_disable disable ;;
+      delete) DEFAULT_MENU_ACTION=""; interactive_delete_like delete ;;
+      purge) DEFAULT_MENU_ACTION=""; interactive_delete_like purge ;;
+      issue-now) DEFAULT_MENU_ACTION=""; interactive_issue_now ;;
+      set-zone-token) DEFAULT_MENU_ACTION=""; interactive_set_zone_token ;;
+      sync-now) DEFAULT_MENU_ACTION=""; interactive_sync_now ;;
+      shell) shell_command ;;
+      help) usage ;;
+      exit)
         return 0
         ;;
       *)
@@ -2211,8 +2381,12 @@ main() {
   local sync_flag=0
   local force_flag=0
   if [[ -z "${subcommand}" ]]; then
-    interactive_menu
-    return 0
+    if ui_has_tty; then
+      interactive_menu
+      return 0
+    fi
+    usage
+    return 1
   fi
   shift || true
 

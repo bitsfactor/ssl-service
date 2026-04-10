@@ -212,6 +212,38 @@ def test_help_uses_invoked_program_name(tmp_path: Path) -> None:
   assert "domain-manage.sh list" not in result.stdout
 
 
+def test_ssl_proxy_domain_help_proxies_to_domain_script(tmp_path: Path) -> None:
+  setup_script = ROOT / "scripts" / "setup.sh"
+  env = base_env(tmp_path)
+
+  result = subprocess.run(
+    ["bash", str(setup_script), "domain", "help"],
+    text=True,
+    capture_output=True,
+    env=env,
+  )
+
+  assert result.returncode == 0
+  assert result.stderr == ""
+  assert "ssl-proxy domain list" in result.stdout
+  assert "domain-manage.sh list" not in result.stdout
+  assert "issue-now <domain> [--force]" in result.stdout
+
+
+def test_no_args_without_tty_shows_usage_and_exits_nonzero(tmp_path: Path) -> None:
+  result = subprocess.run(
+    ["bash", str(SCRIPT)],
+    text=True,
+    capture_output=True,
+    env=base_env(tmp_path),
+    stdin=subprocess.DEVNULL,
+  )
+
+  assert result.returncode != 0
+  assert "Usage:" in result.stdout
+  assert f"{SCRIPT.name} list" in result.stdout
+
+
 def test_issue_now_rejects_on_readonly_node_before_dns_or_db(tmp_path: Path) -> None:
   result = run_script(["issue-now", "example.com"], env=env_with_mode(tmp_path, "readonly"))
 

@@ -71,6 +71,10 @@ main() {
   ensure_curl
   ensure_tar
 
+  if [[ $# -eq 0 && ! -t 0 ]]; then
+    fail "interactive bootstrap requires a TTY; clone the repo and run 'bash scripts/setup.sh install', or pass install flags explicitly"
+  fi
+
   TMP_DIR="$(mktemp -d)"
   trap cleanup EXIT
 
