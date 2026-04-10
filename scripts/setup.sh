@@ -209,39 +209,61 @@ ui_yes_no() {
 ui_confirm_uninstall() {
   local keep_config="$1"
   local keep_data="$2"
+  local selected=1
+  local key
 
   if ui_has_tty; then
-    ui_clear_screen
-    ui_setup_header >&2
-    printf '%s%s%s\n' "${COLOR_BOLD}${COLOR_RED}" "Uninstall ssl-proxy" "${COLOR_RESET}" >&2
-    printf '%sThis will stop services and remove managed files from this host.%s\n\n' "${COLOR_DIM}" "${COLOR_RESET}" >&2
-    printf '%sDelete:%s\n' "${COLOR_BOLD}" "${COLOR_RESET}" >&2
-    printf '  %s\n' "${INSTALL_DIR}" >&2
-    printf '  %s\n' "/usr/local/bin/ssl-proxy" >&2
-    printf '  %s\n' "/usr/local/bin/domain-manage" >&2
-    printf '  %s\n' "${SYSTEMD_DIR}/caddy.service" >&2
-    printf '  %s\n' "${SYSTEMD_DIR}/ssl-proxy-controller.service" >&2
-    printf '  %s\n' "${SYSTEMD_DIR}/${UPDATE_SERVICE_NAME}" >&2
-    printf '  %s\n' "${SYSTEMD_DIR}/${TIMER_NAME}" >&2
-    printf '  %s\n' "${SHELL_PROMPT_PROFILE}" >&2
-    if [[ "${keep_config}" -ne 1 ]]; then
-      printf '  %s\n' "${CONFIG_DIR}" >&2
-    fi
-    if [[ "${keep_data}" -ne 1 ]]; then
-      printf '  %s\n' "${STATE_DIR}" >&2
-      printf '  %s\n' "${LOG_DIR}" >&2
-    fi
-    if [[ "${keep_config}" -eq 1 || "${keep_data}" -eq 1 ]]; then
-      printf '\n%sPreserve:%s\n' "${COLOR_BOLD}" "${COLOR_RESET}" >&2
-      if [[ "${keep_config}" -eq 1 ]]; then
+    while true; do
+      ui_clear_screen
+      ui_setup_header >&2
+      printf '%s%s%s\n' "${COLOR_BOLD}${COLOR_RED}" "Uninstall ssl-proxy" "${COLOR_RESET}" >&2
+      printf '%sThis will stop services and remove managed files from this host.%s\n\n' "${COLOR_DIM}" "${COLOR_RESET}" >&2
+      printf '%sDelete:%s\n' "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+      printf '  %s\n' "${INSTALL_DIR}" >&2
+      printf '  %s\n' "/usr/local/bin/ssl-proxy" >&2
+      printf '  %s\n' "/usr/local/bin/domain-manage" >&2
+      printf '  %s\n' "${SYSTEMD_DIR}/caddy.service" >&2
+      printf '  %s\n' "${SYSTEMD_DIR}/ssl-proxy-controller.service" >&2
+      printf '  %s\n' "${SYSTEMD_DIR}/${UPDATE_SERVICE_NAME}" >&2
+      printf '  %s\n' "${SYSTEMD_DIR}/${TIMER_NAME}" >&2
+      printf '  %s\n' "${SHELL_PROMPT_PROFILE}" >&2
+      if [[ "${keep_config}" -ne 1 ]]; then
         printf '  %s\n' "${CONFIG_DIR}" >&2
       fi
-      if [[ "${keep_data}" -eq 1 ]]; then
+      if [[ "${keep_data}" -ne 1 ]]; then
         printf '  %s\n' "${STATE_DIR}" >&2
         printf '  %s\n' "${LOG_DIR}" >&2
       fi
-    fi
-    printf '\n' >&2
+      if [[ "${keep_config}" -eq 1 || "${keep_data}" -eq 1 ]]; then
+        printf '\n%sPreserve:%s\n' "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+        if [[ "${keep_config}" -eq 1 ]]; then
+          printf '  %s\n' "${CONFIG_DIR}" >&2
+        fi
+        if [[ "${keep_data}" -eq 1 ]]; then
+          printf '  %s\n' "${STATE_DIR}" >&2
+          printf '  %s\n' "${LOG_DIR}" >&2
+        fi
+      fi
+      printf '\n%sUse Up/Down arrows and Enter to confirm.%s\n\n' "${COLOR_DIM}" "${COLOR_RESET}" >&2
+      if [[ "${selected}" -eq 0 ]]; then
+        printf '%s%s> Yes%s\n' "${COLOR_REVERSE}${COLOR_WHITE}" "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+        printf '  No\n' >&2
+      else
+        printf '  Yes\n' >&2
+        printf '%s%s> No%s\n' "${COLOR_REVERSE}${COLOR_WHITE}" "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+      fi
+
+      key="$(ui_read_key)" || return 1
+      case "${key}" in
+        $'\x1b[A'|$'\x1b[B'|j|k)
+          selected=$((1 - selected))
+          ;;
+        ""|$'\n'|$'\r')
+          [[ "${selected}" -eq 0 ]]
+          return $?
+          ;;
+      esac
+    done
   fi
 
   ui_yes_no "Proceed with uninstall?" "no"
