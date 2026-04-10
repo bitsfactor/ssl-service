@@ -181,6 +181,8 @@ def test_update_stops_and_cleans_legacy_runtime() -> None:
   content = SCRIPT.read_text()
 
   update_block = content.split("update_command() {", 1)[1].split("\n}\n\nuninstall_command()", 1)[0]
+  assert 'if is_managed_setup_invocation && [[ "${SSL_SERVICE_UPDATE_STAGE:-}" != "post-self-update" ]]; then' in update_block
+  assert 'exec env SSL_SERVICE_UPDATE_STAGE=post-self-update bash "${MANAGED_SETUP_PATH}" update "$@"' in update_block
   assert "stop_legacy_runtime" in update_block
   assert "remove_legacy_runtime" in update_block
   assert 'rm -f /etc/profile.d/ssl-proxy-shell.sh' in content

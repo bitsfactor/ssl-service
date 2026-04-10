@@ -1150,6 +1150,12 @@ logs_command() {
 update_command() {
   require_root
   [[ -f "${COMPOSE_PATH}" ]] || fail "runtime is not installed"
+  if is_managed_setup_invocation && [[ "${SSL_SERVICE_UPDATE_STAGE:-}" != "post-self-update" ]]; then
+    ensure_curl
+    install_managed_scripts
+    log "setup.sh refreshed; restarting update with the latest managed script"
+    exec env SSL_SERVICE_UPDATE_STAGE=post-self-update bash "${MANAGED_SETUP_PATH}" update "$@"
+  fi
   ensure_docker
   ensure_tools_venv
   if config_exists; then
