@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 INSTALL_DIR="/opt/ssl-proxy"
 CONFIG_DIR="/etc/ssl-proxy"
 CONFIG_PATH="${CONFIG_DIR}/config.yaml"
@@ -27,6 +28,26 @@ log() {
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
   exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  setup.sh install [--mode readonly|readwrite] [--dsn <postgres_dsn>] [--acme-email <email>] [--force-reconfigure]
+  setup.sh start
+  setup.sh stop
+  setup.sh restart
+  setup.sh status
+  setup.sh logs
+  setup.sh update
+  setup.sh timer-status
+  setup.sh uninstall [--yes] [--delete-config] [--delete-all]
+
+Notes:
+  - install prompts for missing values unless --mode and --dsn are provided.
+  - --acme-email is required for non-interactive readwrite installs.
+  - --force-reconfigure overwrites an existing config without asking.
+EOF
 }
 
 require_linux() {
@@ -201,8 +222,8 @@ prompt_with_default() {
 }
 
 resolve_source_dir() {
-  if [[ -f "${SCRIPT_DIR}/pyproject.toml" ]]; then
-    printf '%s' "${SCRIPT_DIR}"
+  if [[ -f "${REPO_DIR}/pyproject.toml" ]]; then
+    printf '%s' "${REPO_DIR}"
     return 0
   fi
   if [[ -f "${SOURCE_DIR_FILE}" ]]; then
@@ -308,7 +329,7 @@ if missing:
   raise SystemExit(
     "readonly schema verification failed; missing required objects: "
     + ", ".join(missing)
-    + ". Run 'setup.sh update' on a readwrite node first."
+    + ". Run 'ssl-proxy update' on a readwrite node first."
   )
 print("readonly schema verified")
 PY
@@ -487,7 +508,7 @@ Unit=${UPDATE_SERVICE_NAME}
 [Install]
 WantedBy=timers.target
 EOF
-  install -m 0755 "${INSTALL_DIR}/setup.sh" /usr/local/bin/ssl-proxy
+  install -m 0755 "${INSTALL_DIR}/scripts/setup.sh" /usr/local/bin/ssl-proxy
   install -m 0755 "${INSTALL_DIR}/scripts/domain-manage.sh" /usr/local/bin/domain-manage
   systemctl daemon-reload
   systemctl enable "${CADDY_SERVICE_NAME}" "${SERVICE_NAME}" "${TIMER_NAME}" >/dev/null
@@ -524,25 +545,90 @@ install_command() {
   verify_certbot_cloudflare_plugin
   seed_bootstrap_caddyfile
 
-  local mode
-  local dsn
-  local acme_email
-  if config_exists_prompt; then
-    mode="$(select_mode)"
-    if [[ -n "${DEFAULT_DSN}" ]]; then
-      dsn="$(prompt_with_default "PostgreSQL DSN" "${DEFAULT_DSN}")"
-    else
-      dsn="$(prompt_required "PostgreSQL DSN")"
+  local mode=""
+  local dsn=""
+  local acme_email=""
+  local force_reconfigure=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mode)
+        shift
+        [[ $# -gt 0 ]] || fail "--mode requires a value"
+        mode="$1"
+        ;;
+      --dsn)
+        shift
+        [[ $# -gt 0 ]] || fail "--dsn requires a value"
+        dsn="$1"
+        ;;
+      --acme-email)
+        shift
+        [[ $# -gt 0 ]] || fail "--acme-email requires a value"
+        acme_email="$1"
+        ;;
+      --force-reconfigure)
+        force_reconfigure=1
+        ;;
+      *)
+        fail "unknown install flag: $1"
+        ;;
+    esac
+    shift
+  done
+
+  if [[ -n "${mode}" && "${mode}" != "readonly" && "${mode}" != "readwrite" ]]; then
+    fail "--mode must be readonly or readwrite"
+  fi
+
+  if [[ "${force_reconfigure}" -eq 1 || ! -f "${CONFIG_PATH}" ]]; then
+    if [[ -z "${mode}" ]]; then
+      mode="$(select_mode)"
+    fi
+
+    if [[ -z "${dsn}" ]]; then
+      if [[ -n "${DEFAULT_DSN}" ]]; then
+        dsn="$(prompt_with_default "PostgreSQL DSN" "${DEFAULT_DSN}")"
+      else
+        dsn="$(prompt_required "PostgreSQL DSN")"
+      fi
     fi
     while ! validate_dsn "${dsn}"; do
       log "database connection failed"
       dsn="$(prompt_required "PostgreSQL DSN")"
     done
 
-    if [[ "${mode}" == "readwrite" ]]; then
-      acme_email="$(prompt_required "ACME email")"
-    else
-      acme_email="$(prompt_with_default "ACME email" "ops@example.com")"
+    if [[ -z "${acme_email}" ]]; then
+      if [[ "${mode}" == "readwrite" ]]; then
+        acme_email="$(prompt_required "ACME email")"
+      else
+        acme_email="$(prompt_with_default "ACME email" "ops@example.com")"
+      fi
+    fi
+
+    render_config "${mode}" "${dsn}" "${acme_email}"
+  elif config_exists_prompt; then
+    if [[ -z "${mode}" ]]; then
+      mode="$(select_mode)"
+    fi
+    if [[ -z "${dsn}" ]]; then
+      if [[ -n "${DEFAULT_DSN}" ]]; then
+        dsn="$(prompt_with_default "PostgreSQL DSN" "${DEFAULT_DSN}")"
+      else
+        dsn="$(prompt_required "PostgreSQL DSN")"
+      fi
+    fi
+    while ! validate_dsn "${dsn}"; do
+      log "database connection failed"
+      dsn="$(prompt_required "PostgreSQL DSN")"
+    done
+
+    if [[ -z "${acme_email}" ]]; then
+      if [[ "${mode}" == "readwrite" ]]; then
+        acme_email="$(prompt_required "ACME email")"
+      else
+        acme_email="$(prompt_with_default "ACME email" "ops@example.com")"
+      fi
     fi
 
     render_config "${mode}" "${dsn}" "${acme_email}"
@@ -746,6 +832,9 @@ EOF
 main() {
   local command="${1:-}"
   case "${command}" in
+    -h|--help|help)
+      usage
+      ;;
     install) shift; install_command "$@" ;;
     start) shift; start_command "$@" ;;
     stop) shift; stop_command "$@" ;;

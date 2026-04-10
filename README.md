@@ -8,17 +8,23 @@ A front proxy service that:
 
 ## Install
 
-Run:
+One-command install on a fresh Linux server:
 
 ```bash
-sudo bash setup.sh install
+curl -fsSL https://raw.githubusercontent.com/leoleoaabbcc/ssl-server/main/scripts/install.sh | sudo bash
+```
+
+If you prefer to clone the repo first:
+
+```bash
+sudo bash scripts/setup.sh install
 ```
 
 The installer will ask for:
 
 - mode: `readonly` or `readwrite`
 - PostgreSQL DSN
-- ACME email
+- ACME email for `readwrite`
 
 Mode summary:
 
