@@ -8,6 +8,7 @@ import signal
 import sys
 import time
 from datetime import UTC, datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlsplit
@@ -165,6 +166,9 @@ class Controller:
       routes=routes,
       certificates=certificates,
       admin_address=normalize_admin_address(self.config.caddy.admin_url),
+      log_path=Path(self.config.logging.caddy_log_path),
+      log_roll_size_mb=self.config.logging.caddy_log_roll_size_mb,
+      log_roll_keep=self.config.logging.caddy_log_roll_keep,
     )
     prior_state = self._read_runtime_state()
     return prior_state.get("caddy_sha256") != render_result.sha256
@@ -224,10 +228,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def configure_logging(config: AppConfig) -> None:
   level = getattr(logging, config.logging.level.upper(), logging.INFO)
+  controller_log_path = Path(config.logging.controller_log_path)
+  controller_log_path.parent.mkdir(parents=True, exist_ok=True)
   logging.basicConfig(
     level=level,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    stream=sys.stdout,
+    handlers=[
+      logging.StreamHandler(sys.stdout),
+      RotatingFileHandler(
+        controller_log_path,
+        maxBytes=config.logging.controller_log_max_bytes,
+        backupCount=config.logging.controller_log_backup_count,
+        encoding="utf-8",
+      ),
+    ],
+    force=True,
   )
 
 

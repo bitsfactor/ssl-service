@@ -44,6 +44,9 @@ def test_render_caddyfile_renders_certificate_only_route_without_reverse_proxy(t
     routes=routes,
     certificates=certificates,
     admin_address="127.0.0.1:2019",
+    log_path=tmp_path / "logs" / "caddy.log",
+    log_roll_size_mb=5,
+    log_roll_keep=8,
   )
 
   content = output.read_text()
@@ -64,6 +67,9 @@ def test_render_caddyfile_redirects_http_to_https(tmp_path: Path) -> None:
     routes=routes,
     certificates=certificates,
     admin_address="127.0.0.1:2019",
+    log_path=tmp_path / "logs" / "caddy.log",
+    log_roll_size_mb=5,
+    log_roll_keep=8,
   )
 
   content = output.read_text()
@@ -95,6 +101,9 @@ def test_render_caddyfile_skips_https_block_for_missing_certificate_material(tmp
     routes=routes,
     certificates=certificates,
     admin_address="127.0.0.1:2019",
+    log_path=tmp_path / "logs" / "caddy.log",
+    log_roll_size_mb=5,
+    log_roll_keep=8,
   )
 
   content = output.read_text()
@@ -132,6 +141,9 @@ def test_render_caddyfile_only_redirects_domains_with_certificate_material(tmp_p
     routes=routes,
     certificates=certificates,
     admin_address="127.0.0.1:2019",
+    log_path=tmp_path / "logs" / "caddy.log",
+    log_roll_size_mb=5,
+    log_roll_keep=8,
   )
 
   content = output.read_text()
@@ -151,6 +163,9 @@ def test_render_caddyfile_renders_reverse_proxy_for_service_route(tmp_path: Path
     routes=routes,
     certificates=certificates,
     admin_address="127.0.0.1:2019",
+    log_path=tmp_path / "logs" / "caddy.log",
+    log_roll_size_mb=5,
+    log_roll_keep=8,
   )
 
   content = output.read_text()
@@ -168,10 +183,34 @@ def test_render_caddyfile_rewrites_loopback_upstream_to_docker_host_gateway(tmp_
     routes=routes,
     certificates=certificates,
     admin_address="127.0.0.1:2019",
+    log_path=tmp_path / "logs" / "caddy.log",
+    log_roll_size_mb=5,
+    log_roll_keep=8,
   )
 
   content = output.read_text()
   assert "reverse_proxy host.docker.internal:6111" in content
+
+
+def test_render_caddyfile_writes_rotating_file_log_config(tmp_path: Path) -> None:
+  output = tmp_path / "generated" / "Caddyfile"
+  routes = [RouteRecord(domain="example.com", upstream_target=None, enabled=True, updated_at=datetime.now(tz=UTC))]
+  certificates = {"example.com": make_certificate("example.com")}
+
+  render_caddyfile(
+    output_path=output,
+    routes=routes,
+    certificates=certificates,
+    admin_address="127.0.0.1:2019",
+    log_path=Path("/app/logs/caddy.log"),
+    log_roll_size_mb=5,
+    log_roll_keep=8,
+  )
+
+  content = output.read_text()
+  assert "output file /app/logs/caddy.log" in content
+  assert "roll_size 5MiB" in content
+  assert "roll_keep 8" in content
 
 
 def test_canonicalize_upstream_target_for_container_rewrites_localhost_aliases() -> None:

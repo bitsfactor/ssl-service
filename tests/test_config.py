@@ -53,6 +53,12 @@ logging:
   assert config.acme.dns_provider == "cloudflare"
   assert config.acme.dns_propagation_seconds == 45
   assert config.logging.level == "DEBUG"
+  assert config.logging.controller_log_path == "/app/logs/controller.log"
+  assert config.logging.controller_log_max_bytes == 5 * 1024 * 1024
+  assert config.logging.controller_log_backup_count == 8
+  assert config.logging.caddy_log_path == "/app/logs/caddy.log"
+  assert config.logging.caddy_log_roll_size_mb == 5
+  assert config.logging.caddy_log_roll_keep == 8
 
 
 def test_load_config_uses_defaults_for_sync_values(tmp_path: Path) -> None:
@@ -117,6 +123,12 @@ acme:
   assert payload["acme"]["challenge_type"] == "dns-01"
   assert payload["acme"]["dns_provider"] == "cloudflare"
   assert payload["acme"]["dns_propagation_seconds"] == 30
+  assert payload["logging"]["controller_log_path"] == "/app/logs/controller.log"
+  assert payload["logging"]["controller_log_max_bytes"] == 5 * 1024 * 1024
+  assert payload["logging"]["controller_log_backup_count"] == 8
+  assert payload["logging"]["caddy_log_path"] == "/app/logs/caddy.log"
+  assert payload["logging"]["caddy_log_roll_size_mb"] == 5
+  assert payload["logging"]["caddy_log_roll_keep"] == 8
 
 
 def test_load_config_parses_string_boolean_for_staging(tmp_path: Path) -> None:
@@ -204,6 +216,35 @@ sync:
   )
 
   with pytest.raises(ValueError, match=r"sync\.poll_interval_seconds must be an integer"):
+    load_config(config_path)
+
+
+@pytest.mark.parametrize(
+  ("logging_block", "message"),
+  [
+    ('controller_log_max_bytes: "5"', r"logging\.controller_log_max_bytes must be an integer"),
+    ("controller_log_backup_count: -1", r"logging\.controller_log_backup_count must be >= 0"),
+    ("caddy_log_roll_size_mb: 0", r"logging\.caddy_log_roll_size_mb must be >= 1"),
+    ("caddy_log_roll_keep: -1", r"logging\.caddy_log_roll_keep must be >= 0"),
+  ],
+)
+def test_load_config_rejects_invalid_logging_rotation_values(tmp_path: Path, logging_block: str, message: str) -> None:
+  config_path = tmp_path / "config.yaml"
+  config_path.write_text(
+    f"""
+mode: readwrite
+postgres:
+  dsn: postgresql://example
+caddy:
+  reload_command: ["/usr/bin/caddy", "reload"]
+acme:
+  email: ops@example.com
+logging:
+  {logging_block}
+"""
+  )
+
+  with pytest.raises(ValueError, match=message):
     load_config(config_path)
 
 

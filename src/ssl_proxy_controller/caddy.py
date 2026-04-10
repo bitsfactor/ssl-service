@@ -77,6 +77,9 @@ def render_caddyfile(
   routes: list[RouteRecord],
   certificates: dict[str, CertificateRecord],
   admin_address: str,
+  log_path: Path,
+  log_roll_size_mb: int,
+  log_roll_keep: int,
 ) -> RenderResult:
   active_route_domains = [
     route.domain
@@ -88,6 +91,13 @@ def render_caddyfile(
   lines: list[str] = [
     "{",
     f"\tadmin {admin_address}",
+    "\tlog {",
+    f"\t\toutput file {log_path} {{",
+    f"\t\t\troll_size {log_roll_size_mb}MiB",
+    f"\t\t\troll_keep {log_roll_keep}",
+    "\t\t}",
+    "\t\tformat console",
+    "\t}",
     "}",
     "",
   ]

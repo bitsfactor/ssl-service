@@ -47,6 +47,12 @@ class AcmeConfig:
 @dataclass(slots=True)
 class LoggingConfig:
   level: str = "INFO"
+  controller_log_path: str = "/app/logs/controller.log"
+  controller_log_max_bytes: int = 5 * 1024 * 1024
+  controller_log_backup_count: int = 8
+  caddy_log_path: str = "/app/logs/caddy.log"
+  caddy_log_roll_size_mb: int = 5
+  caddy_log_roll_keep: int = 8
 
 
 @dataclass(slots=True)
@@ -142,6 +148,26 @@ def load_config(path: str | Path) -> AppConfig:
     config.acme.dns_propagation_seconds,
     minimum=0,
   )
+  config.logging.controller_log_max_bytes = _require_int(
+    "logging.controller_log_max_bytes",
+    config.logging.controller_log_max_bytes,
+    minimum=1,
+  )
+  config.logging.controller_log_backup_count = _require_int(
+    "logging.controller_log_backup_count",
+    config.logging.controller_log_backup_count,
+    minimum=0,
+  )
+  config.logging.caddy_log_roll_size_mb = _require_int(
+    "logging.caddy_log_roll_size_mb",
+    config.logging.caddy_log_roll_size_mb,
+    minimum=1,
+  )
+  config.logging.caddy_log_roll_keep = _require_int(
+    "logging.caddy_log_roll_keep",
+    config.logging.caddy_log_roll_keep,
+    minimum=0,
+  )
   if not config.caddy.reload_command:
     raise ValueError("caddy.reload_command must not be empty")
   if config.mode == "readwrite" and not config.acme.email.strip():
@@ -177,5 +203,13 @@ def as_dict(config: AppConfig) -> dict[str, Any]:
       "dns_propagation_seconds": config.acme.dns_propagation_seconds,
       "certbot_args": config.acme.certbot_args,
     },
-    "logging": {"level": config.logging.level},
+    "logging": {
+      "level": config.logging.level,
+      "controller_log_path": config.logging.controller_log_path,
+      "controller_log_max_bytes": config.logging.controller_log_max_bytes,
+      "controller_log_backup_count": config.logging.controller_log_backup_count,
+      "caddy_log_path": config.logging.caddy_log_path,
+      "caddy_log_roll_size_mb": config.logging.caddy_log_roll_size_mb,
+      "caddy_log_roll_keep": config.logging.caddy_log_roll_keep,
+    },
   }

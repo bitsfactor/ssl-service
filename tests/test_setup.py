@@ -251,6 +251,22 @@ def test_compose_maps_host_docker_internal_for_host_backends() -> None:
   render_compose_block = content.split("render_compose() {", 1)[1].split("\n}\n\nwrite_install_meta()", 1)[0]
   assert 'extra_hosts:' in render_compose_block
   assert '"host.docker.internal:host-gateway"' in render_compose_block
+  assert 'logging:' in render_compose_block
+  assert 'driver: json-file' in render_compose_block
+  assert 'max-size: "5m"' in render_compose_block
+  assert 'max-file: "2"' in render_compose_block
+
+
+def test_render_config_sets_default_app_log_rotation_limits() -> None:
+  content = SCRIPT.read_text()
+
+  render_config_block = content.split("render_config() {", 1)[1].split("\n}\n\nrender_compose()", 1)[0]
+  assert "controller_log_path: /app/logs/controller.log" in render_config_block
+  assert "controller_log_max_bytes: 5242880" in render_config_block
+  assert "controller_log_backup_count: 8" in render_config_block
+  assert "caddy_log_path: /app/logs/caddy.log" in render_config_block
+  assert "caddy_log_roll_size_mb: 5" in render_config_block
+  assert "caddy_log_roll_keep: 8" in render_config_block
 
 
 def test_uninstall_requires_tty_or_yes_without_prompting_on_dev_tty() -> None:

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ssl_proxy_controller.config import AcmeConfig, AppConfig, CaddyConfig, LoggingConfig, PathsConfig, PostgresConfig, SyncConfig
-from ssl_proxy_controller.controller import Controller, main, normalize_admin_address, parse_args
+from ssl_proxy_controller.controller import Controller, configure_logging, main, normalize_admin_address, parse_args
 from ssl_proxy_controller.db import CertificateRecord, RouteRecord
 
 
@@ -227,6 +228,28 @@ def test_sync_local_certificates_ignores_empty_material(tmp_path: Path) -> None:
 
   assert changed is False
   assert not (controller.certs_dir / "error.example.com").exists()
+
+
+def test_configure_logging_adds_rotating_file_handler(tmp_path: Path) -> None:
+  config = make_config(tmp_path)
+  config.logging = LoggingConfig(
+    level="INFO",
+    controller_log_path=str(tmp_path / "logs" / "controller.log"),
+    controller_log_max_bytes=5 * 1024 * 1024,
+    controller_log_backup_count=8,
+    caddy_log_path="/app/logs/caddy.log",
+    caddy_log_roll_size_mb=5,
+    caddy_log_roll_keep=8,
+  )
+
+  configure_logging(config)
+
+  root_logger = logging.getLogger()
+  file_handlers = [handler for handler in root_logger.handlers if isinstance(handler, logging.handlers.RotatingFileHandler)]
+  assert len(file_handlers) == 1
+  assert Path(file_handlers[0].baseFilename) == tmp_path / "logs" / "controller.log"
+  assert file_handlers[0].maxBytes == 5 * 1024 * 1024
+  assert file_handlers[0].backupCount == 8
 
 
 def test_sync_local_certificates_removes_stale_dir_when_record_has_no_material(tmp_path: Path) -> None:

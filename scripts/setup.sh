@@ -689,6 +689,12 @@ acme:
 
 logging:
   level: INFO
+  controller_log_path: /app/logs/controller.log
+  controller_log_max_bytes: 5242880
+  controller_log_backup_count: 8
+  caddy_log_path: /app/logs/caddy.log
+  caddy_log_roll_size_mb: 5
+  caddy_log_roll_keep: 8
 EOF
   chmod 0600 "${CONFIG_PATH}"
 }
@@ -711,6 +717,11 @@ services:
       - ${STATE_DIR}:/app/state
       - ${LOG_DIR}:/app/logs
       - ${ACME_DIR}:/etc/letsencrypt
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
 EOF
 }
 
