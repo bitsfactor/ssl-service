@@ -19,8 +19,8 @@ def parse_args() -> argparse.Namespace:
   )
   parser.add_argument(
     "--config",
-    default="/etc/ssl-proxy/config.yaml",
-    help="path to ssl-proxy YAML config",
+    default="/root/.ssl-service/config/config.yaml",
+    help="path to ssl-service YAML config",
   )
   parser.add_argument(
     "--enable",
@@ -39,7 +39,7 @@ def main() -> int:
   args = parse_args()
   dsn = load_dsn(Path(args.config))
 
-  with psycopg.connect(dsn, sslmode="require") as conn:
+  with psycopg.connect(dsn) as conn:
     with conn.cursor() as cur:
       cur.execute(
         """

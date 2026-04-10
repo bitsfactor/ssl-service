@@ -140,6 +140,22 @@ def test_record_certificate_error_commits(monkeypatch) -> None:
   assert params == ("a.example.com", retry_after, "boom")
 
 
+def test_record_certificate_error_does_not_overwrite_existing_certificate_material(monkeypatch) -> None:
+  cursor = FakeCursor()
+  connection = FakeConnection(cursor)
+  monkeypatch.setattr("ssl_proxy_controller.db.psycopg.connect", lambda dsn, row_factory=None: connection)
+
+  Database("postgresql://example").record_certificate_error(
+    "a.example.com",
+    "boom",
+    datetime.now(tz=UTC) + timedelta(hours=1),
+  )
+
+  query, _ = cursor.executed[0]
+  assert "fullchain_pem = EXCLUDED.fullchain_pem" not in query
+  assert "private_key_pem = EXCLUDED.private_key_pem" not in query
+
+
 def test_clear_certificate_retry_after_returns_true_when_row_exists(monkeypatch) -> None:
   cursor = FakeCursor(row={"domain": "a.example.com"})
   connection = FakeConnection(cursor)

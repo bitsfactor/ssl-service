@@ -35,7 +35,7 @@ def ensure_dns_cloudflare_plugin(certbot_binary: str) -> None:
   plugin_output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
   if "dns-cloudflare" not in plugin_output:
     raise RuntimeError(
-      "certbot dns-cloudflare plugin is not available; run ssl-proxy update to install the managed ACME runtime"
+      "certbot dns-cloudflare plugin is not available; rebuild or update the ssl-service container image"
     )
 
 

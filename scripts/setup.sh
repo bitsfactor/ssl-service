@@ -1,41 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+PROGRAM_NAME="${SSL_SERVICE_PROGRAM_NAME:-$(basename "${BASH_SOURCE[0]}")}"
+SCRIPT_PATH="$0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-INSTALL_DIR="/opt/ssl-proxy"
-CONFIG_DIR="/etc/ssl-proxy"
+INSTALL_ROOT="${SSL_SERVICE_INSTALL_ROOT:-/root/.ssl-service}"
+CONFIG_DIR="${INSTALL_ROOT}/config"
 CONFIG_PATH="${CONFIG_DIR}/config.yaml"
-STATE_DIR="/var/lib/ssl-proxy"
-LOG_DIR="/var/log/ssl-proxy"
-VENV_DIR="${INSTALL_DIR}/.venv"
-ACME_VENV_DIR="${INSTALL_DIR}/.acme-venv"
-TOOLS_VENV_DIR="${INSTALL_DIR}/.tools-venv"
-SYSTEMD_DIR="/etc/systemd/system"
-TIMER_NAME="ssl-proxy-update.timer"
-SERVICE_NAME="ssl-proxy-controller.service"
-CADDY_SERVICE_NAME="caddy.service"
-UPDATE_SERVICE_NAME="ssl-proxy-update.service"
-UPDATE_SCHEDULE="*-*-* 04:00:00"
-UPDATE_LOG="${STATE_DIR}/update.log"
-DEFAULT_DSN=""
-SOURCE_DIR_FILE="${INSTALL_DIR}/.source_dir"
-SHELL_PROMPT_PROFILE="/etc/profile.d/ssl-proxy-shell.sh"
-SHELL_PROMPT_BEGIN_MARKER="# >>> ssl-proxy prompt >>>"
-SHELL_PROMPT_END_MARKER="# <<< ssl-proxy prompt <<<"
+STATE_DIR="${INSTALL_ROOT}/state"
+LOG_DIR="${INSTALL_ROOT}/logs"
+ACME_DIR="${INSTALL_ROOT}/acme"
+ENV_DIR="${INSTALL_ROOT}/env"
+BIN_DIR="${INSTALL_ROOT}/bin"
+META_DIR="${INSTALL_ROOT}/meta"
+COMPOSE_PATH="${INSTALL_ROOT}/compose.yaml"
+ENTRYPOINT_PATH="${BIN_DIR}/ssl-service"
+MANAGED_SETUP_PATH="${BIN_DIR}/setup.sh"
+MANAGED_DOMAIN_PATH="${BIN_DIR}/domain-manage.sh"
+TOOLS_VENV_DIR="${INSTALL_ROOT}/.tools-venv"
+BASHRC_PATH="${SSL_SERVICE_BASHRC_PATH:-/root/.bashrc}"
+ALIAS_MARKER_BEGIN="# >>> ssl-service alias >>>"
+ALIAS_MARKER_END="# <<< ssl-service alias <<<"
 DEFAULT_ACME_EMAIL="domain@bitsfactor.com"
-SETUP_MENU_ACTIONS=(install domain start stop restart status logs update timer-status uninstall exit)
-SETUP_MENU_LABELS=(
-  "Install or reconfigure this node"
-  "Open domain manager"
-  "Start services"
-  "Stop services"
-  "Restart services"
+DEFAULT_IMAGE="${SSL_SERVICE_IMAGE:-ghcr.io/leoleoaabbcc/ssl-service:latest}"
+GITHUB_CONTENT_BASE_URL="${SSL_SERVICE_GITHUB_CONTENT_BASE_URL:-https://github.com/leoleoaabbcc/ssl-service/raw/${SSL_SERVICE_INSTALL_REF:-main}}"
+STATE_MENU_ACTIONS=(install reconfigure status logs restart update uninstall exit)
+STATE_MENU_LABELS=(
+  "Install or overwrite runtime"
+  "Change database or mode"
   "Show service status"
   "Tail service logs"
-  "Update code and restart"
-  "Show update timer status"
-  "Uninstall this node"
+  "Restart container"
+  "Pull latest image and recreate"
+  "Uninstall runtime"
   "Exit"
 )
 
@@ -79,24 +77,25 @@ fail() {
 }
 
 usage() {
-  cat <<'EOF'
+  cat <<EOF
 Usage:
-  setup.sh install [--mode readonly|readwrite] [--dsn <postgres_dsn>] [--acme-email <email>] [--force-reconfigure]
-  setup.sh domain <domain-command> [args...]
-  setup.sh start
-  setup.sh stop
-  setup.sh restart
-  setup.sh status
-  setup.sh logs
-  setup.sh update
-  setup.sh timer-status
-  setup.sh uninstall [--yes] [--keep-config] [--keep-data]
+  ${PROGRAM_NAME}                         # interactive menu
+  ${PROGRAM_NAME} install [--mode readonly|readwrite] [--dsn <postgres_dsn>] [--acme-email <email>] [--force-reconfigure]
+  ${PROGRAM_NAME} reconfigure
+  ${PROGRAM_NAME} status
+  ${PROGRAM_NAME} logs
+  ${PROGRAM_NAME} start
+  ${PROGRAM_NAME} stop
+  ${PROGRAM_NAME} restart
+  ${PROGRAM_NAME} update
+  ${PROGRAM_NAME} uninstall [--yes]
+  ${PROGRAM_NAME} domain <domain-command> [args...]
 
 Notes:
-  - install prompts for missing values unless --mode and --dsn are provided.
-  - --acme-email is required for non-interactive readwrite installs.
-  - --force-reconfigure overwrites an existing config without asking.
-  - uninstall removes managed config, state, and logs by default.
+  - production runtime is installed under ${INSTALL_ROOT}
+  - Docker is installed automatically if it is missing
+  - the global shortcut is provided via /root/.bashrc as 'ssl-service'
+  - readonly uses the default ACME email ${DEFAULT_ACME_EMAIL}
 EOF
 }
 
@@ -198,75 +197,12 @@ ui_yes_no() {
     read -r -p "${prompt} [Y/n]: " answer || return 1
     answer="$(ui_trim "${answer}")"
     [[ -z "${answer}" || "${answer}" == "y" || "${answer}" == "Y" ]]
-    return 0
+    return $?
   fi
 
   read -r -p "${prompt} [y/N]: " answer || return 1
   answer="$(ui_trim "${answer}")"
   [[ "${answer}" == "y" || "${answer}" == "Y" ]]
-}
-
-ui_confirm_uninstall() {
-  local keep_config="$1"
-  local keep_data="$2"
-  local selected=1
-  local key
-
-  if ui_has_tty; then
-    while true; do
-      ui_clear_screen
-      ui_setup_header >&2
-      printf '%s%s%s\n' "${COLOR_BOLD}${COLOR_RED}" "Uninstall ssl-proxy" "${COLOR_RESET}" >&2
-      printf '%sThis will stop services and remove managed files from this host.%s\n\n' "${COLOR_DIM}" "${COLOR_RESET}" >&2
-      printf '%sDelete:%s\n' "${COLOR_BOLD}" "${COLOR_RESET}" >&2
-      printf '  %s\n' "${INSTALL_DIR}" >&2
-      printf '  %s\n' "/usr/local/bin/ssl-proxy" >&2
-      printf '  %s\n' "/usr/local/bin/domain-manage" >&2
-      printf '  %s\n' "${SYSTEMD_DIR}/caddy.service" >&2
-      printf '  %s\n' "${SYSTEMD_DIR}/ssl-proxy-controller.service" >&2
-      printf '  %s\n' "${SYSTEMD_DIR}/${UPDATE_SERVICE_NAME}" >&2
-      printf '  %s\n' "${SYSTEMD_DIR}/${TIMER_NAME}" >&2
-      printf '  %s\n' "${SHELL_PROMPT_PROFILE}" >&2
-      if [[ "${keep_config}" -ne 1 ]]; then
-        printf '  %s\n' "${CONFIG_DIR}" >&2
-      fi
-      if [[ "${keep_data}" -ne 1 ]]; then
-        printf '  %s\n' "${STATE_DIR}" >&2
-        printf '  %s\n' "${LOG_DIR}" >&2
-      fi
-      if [[ "${keep_config}" -eq 1 || "${keep_data}" -eq 1 ]]; then
-        printf '\n%sPreserve:%s\n' "${COLOR_BOLD}" "${COLOR_RESET}" >&2
-        if [[ "${keep_config}" -eq 1 ]]; then
-          printf '  %s\n' "${CONFIG_DIR}" >&2
-        fi
-        if [[ "${keep_data}" -eq 1 ]]; then
-          printf '  %s\n' "${STATE_DIR}" >&2
-          printf '  %s\n' "${LOG_DIR}" >&2
-        fi
-      fi
-      printf '\n%sUse Up/Down arrows and Enter to confirm.%s\n\n' "${COLOR_DIM}" "${COLOR_RESET}" >&2
-      if [[ "${selected}" -eq 0 ]]; then
-        printf '%s%s> Yes%s\n' "${COLOR_REVERSE}${COLOR_WHITE}" "${COLOR_BOLD}" "${COLOR_RESET}" >&2
-        printf '  No\n' >&2
-      else
-        printf '  Yes\n' >&2
-        printf '%s%s> No%s\n' "${COLOR_REVERSE}${COLOR_WHITE}" "${COLOR_BOLD}" "${COLOR_RESET}" >&2
-      fi
-
-      key="$(ui_read_key)" || return 1
-      case "${key}" in
-        $'\x1b[A'|$'\x1b[B'|j|k)
-          selected=$((1 - selected))
-          ;;
-        ""|$'\n'|$'\r')
-          [[ "${selected}" -eq 0 ]]
-          return $?
-          ;;
-      esac
-    done
-  fi
-
-  ui_yes_no "Proceed with uninstall?" "no"
 }
 
 ui_pause() {
@@ -276,221 +212,17 @@ ui_pause() {
   read -r _
 }
 
-ui_setup_header() {
-  local mode="unconfigured"
-  if [[ -f "${CONFIG_PATH}" ]]; then
-    mode="$(awk '$1 == "mode:" { print $2; exit }' "${CONFIG_PATH}" 2>/dev/null || printf '%s' "unknown")"
-  fi
-  printf '%s%s%s\n' "${COLOR_BOLD}${COLOR_BLUE}" "ssl-proxy control" "${COLOR_RESET}"
-  printf '%shost:%s %s  %smode:%s %s  %sconfig:%s %s\n\n' \
-    "${COLOR_DIM}" "${COLOR_RESET}" "${HOSTNAME%%.*}" \
-    "${COLOR_DIM}" "${COLOR_RESET}" "${mode}" \
-    "${COLOR_DIM}" "${COLOR_RESET}" "${CONFIG_PATH}"
-}
-
-domain_script_path() {
-  if [[ -x "${REPO_DIR}/scripts/domain-manage.sh" ]]; then
-    printf '%s' "${REPO_DIR}/scripts/domain-manage.sh"
-    return 0
-  fi
-  if [[ -x "${INSTALL_DIR}/scripts/domain-manage.sh" ]]; then
-    printf '%s' "${INSTALL_DIR}/scripts/domain-manage.sh"
-    return 0
-  fi
-  fail "domain management script not found"
-}
-
-domain_command() {
-  local script_path
-  script_path="$(domain_script_path)"
-  SSL_PROXY_DOMAIN_PROGRAM_NAME="ssl-proxy domain" bash "${script_path}" "$@"
-}
-
-require_linux() {
-  [[ "$(uname -s)" == "Linux" ]] || fail "Linux is required"
-}
-
-require_root() {
-  [[ "${EUID}" -eq 0 ]] || fail "run this script as root"
-}
-
-require_systemd() {
-  command -v systemctl >/dev/null 2>&1 || fail "systemctl is required"
-  systemctl --version >/dev/null 2>&1 || fail "systemctl is not usable on this host"
-}
-
-ensure_packages() {
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y curl python3 python3-venv python3-pip rsync caddy
-}
-
-ensure_layout() {
-  mkdir -p "${INSTALL_DIR}" "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}"
-  mkdir -p "${STATE_DIR}/generated" "${STATE_DIR}/state" "${STATE_DIR}/certs"
-  touch "${UPDATE_LOG}"
-}
-
-install_shell_prompt() {
-  cat > "${SHELL_PROMPT_PROFILE}" <<'EOF'
-# shellcheck shell=bash
-
-case $- in
-  *i*) ;;
-  *) return 0 2>/dev/null || exit 0 ;;
-esac
-
-ssl_proxy_prompt_mode() {
-  local config_path="/etc/ssl-proxy/config.yaml"
-  local mode="unknown"
-  if [[ -r "${config_path}" ]]; then
-    mode="$(awk '$1 == "mode:" { print $2; exit }' "${config_path}" 2>/dev/null)"
-  fi
-  printf '%s' "${mode:-unknown}"
-}
-
-ssl_proxy_apply_prompt() {
-  local mode color label reset host_color path_color
-  mode="$(ssl_proxy_prompt_mode)"
-  reset='\[\033[0m\]'
-  host_color='\[\033[1;37m\]'
-  path_color='\[\033[1;33m\]'
-
-  case "${mode}" in
-    readwrite)
-      color='\[\033[1;31m\]'
-      label='RW'
-      ;;
-    readonly)
-      color='\[\033[1;34m\]'
-      label='RO'
-      ;;
-    *)
-      color='\[\033[1;35m\]'
-      label='??'
-      ;;
-  esac
-
-  PS1="${color}[${label}]${reset} ${host_color}\u@\h${reset}:${path_color}\w${reset}\\$ "
-}
-
-ssl_proxy_apply_prompt
-unset -f ssl_proxy_apply_prompt
-unset -f ssl_proxy_prompt_mode
-EOF
-  chmod 0644 "${SHELL_PROMPT_PROFILE}"
-
-  if [[ -f /etc/bash.bashrc ]]; then
-    if grep -Fq "${SHELL_PROMPT_BEGIN_MARKER}" /etc/bash.bashrc; then
+prompt_required() {
+  local prompt="$1"
+  local value
+  while true; do
+    read -r -p "${prompt}: " value || fail "input cancelled for: ${prompt}"
+    value="$(ui_trim "${value}")"
+    if [[ -n "${value}" ]]; then
+      printf '%s' "${value}"
       return 0
     fi
-    cat >> /etc/bash.bashrc <<EOF
-
-${SHELL_PROMPT_BEGIN_MARKER}
-# Load ssl-proxy prompt customizations for interactive bash shells.
-if [ -r "${SHELL_PROMPT_PROFILE}" ]; then
-  . "${SHELL_PROMPT_PROFILE}"
-fi
-${SHELL_PROMPT_END_MARKER}
-EOF
-  fi
-}
-
-remove_shell_prompt() {
-  rm -f "${SHELL_PROMPT_PROFILE}"
-
-  if [[ -f /etc/bash.bashrc ]] && grep -Fq "${SHELL_PROMPT_BEGIN_MARKER}" /etc/bash.bashrc; then
-    awk -v begin="${SHELL_PROMPT_BEGIN_MARKER}" -v end="${SHELL_PROMPT_END_MARKER}" '
-      $0 == begin { skip = 1; next }
-      $0 == end { skip = 0; next }
-      !skip { print }
-    ' /etc/bash.bashrc > /etc/bash.bashrc.ssl-proxy.tmp
-    mv /etc/bash.bashrc.ssl-proxy.tmp /etc/bash.bashrc
-  fi
-}
-
-sync_repo() {
-  local source_dir
-  source_dir="$(resolve_source_dir)"
-  rsync -a --delete \
-    --exclude '.git' \
-    --exclude '.codex' \
-    --exclude '__pycache__' \
-    --exclude '.venv' \
-    --exclude '.acme-venv' \
-    "${source_dir}/" "${INSTALL_DIR}/"
-}
-
-ensure_venv() {
-  local source_dir
-  source_dir="$(resolve_source_dir)"
-  if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
-    python3 -m venv "${VENV_DIR}"
-  fi
-  "${VENV_DIR}/bin/pip" install --upgrade pip >/dev/null
-  "${VENV_DIR}/bin/pip" install "${source_dir}" >/dev/null
-}
-
-ensure_tools_venv() {
-  local source_dir
-  source_dir="$(resolve_source_dir)"
-  if [[ ! -x "${TOOLS_VENV_DIR}/bin/python" ]]; then
-    python3 -m venv "${TOOLS_VENV_DIR}"
-  fi
-  "${TOOLS_VENV_DIR}/bin/pip" install --upgrade pip >/dev/null
-  "${TOOLS_VENV_DIR}/bin/pip" install "${source_dir}[test]" >/dev/null
-}
-
-ensure_acme_venv() {
-  if [[ ! -x "${ACME_VENV_DIR}/bin/python" ]]; then
-    python3 -m venv "${ACME_VENV_DIR}"
-  fi
-  "${ACME_VENV_DIR}/bin/pip" install --upgrade pip >/dev/null
-  "${ACME_VENV_DIR}/bin/pip" install --upgrade "certbot>=2.11,<3.0" "certbot-dns-cloudflare>=2.11,<3.0" >/dev/null
-}
-
-certbot_binary_path() {
-  printf '%s' "${ACME_VENV_DIR}/bin/certbot"
-}
-
-verify_certbot_cloudflare_plugin() {
-  local certbot_bin
-  certbot_bin="$(certbot_binary_path)"
-  [[ -x "${certbot_bin}" ]] || fail "certbot binary not found at ${certbot_bin}"
-
-  local plugin_output
-  if ! plugin_output="$("${certbot_bin}" plugins 2>&1)"; then
-    printf '%s\n' "${plugin_output}" >&2
-    fail "failed to inspect certbot plugins"
-  fi
-  if ! printf '%s\n' "${plugin_output}" | grep -Fq 'dns-cloudflare'; then
-    printf '%s\n' "${plugin_output}" >&2
-    fail "certbot dns-cloudflare plugin is not available"
-  fi
-}
-
-seed_bootstrap_caddyfile() {
-  if [[ ! -f "${STATE_DIR}/generated/Caddyfile" ]]; then
-    cat > "${STATE_DIR}/generated/Caddyfile" <<'EOF'
-{
-  admin 127.0.0.1:2019
-}
-EOF
-  fi
-}
-
-port_in_use() {
-  local port="$1"
-  ss -ltn "( sport = :${port} )" | tail -n +2 | grep -q .
-}
-
-check_bind_ports() {
-  local caddy_active
-  caddy_active="$(systemctl is-active "${CADDY_SERVICE_NAME}" 2>/dev/null || true)"
-  for port in 80 443; do
-    if port_in_use "${port}" && [[ "${caddy_active}" != "active" ]]; then
-      fail "port ${port} is already in use"
-    fi
+    log "value is required"
   done
 }
 
@@ -499,49 +231,11 @@ prompt_with_default() {
   local default_value="$2"
   local value
   read -r -p "${prompt} [${default_value}]: " value || fail "input cancelled for: ${prompt}"
+  value="$(ui_trim "${value}")"
   if [[ -z "${value}" ]]; then
     value="${default_value}"
   fi
   printf '%s' "${value}"
-}
-
-resolve_source_dir() {
-  if [[ -f "${REPO_DIR}/pyproject.toml" ]]; then
-    printf '%s' "${REPO_DIR}"
-    return 0
-  fi
-  if [[ -f "${SOURCE_DIR_FILE}" ]]; then
-    local recorded_source_dir
-    recorded_source_dir="$(cat "${SOURCE_DIR_FILE}")"
-    if [[ -f "${recorded_source_dir}/pyproject.toml" ]]; then
-      printf '%s' "${recorded_source_dir}"
-      return 0
-    fi
-  fi
-  if [[ -f "${INSTALL_DIR}/pyproject.toml" ]]; then
-    printf '%s' "${INSTALL_DIR}"
-    return 0
-  fi
-  fail "could not determine source directory"
-}
-
-record_source_dir() {
-  local source_dir
-  source_dir="$(resolve_source_dir)"
-  printf '%s\n' "${source_dir}" > "${SOURCE_DIR_FILE}"
-}
-
-prompt_required() {
-  local prompt="$1"
-  local value
-  while true; do
-    read -r -p "${prompt}: " value || fail "input cancelled for: ${prompt}"
-    if [[ -n "${value}" ]]; then
-      printf '%s' "${value}"
-      return 0
-    fi
-    log "value is required"
-  done
 }
 
 select_mode() {
@@ -561,42 +255,322 @@ select_mode() {
   local value
   while true; do
     read -r -p "Select mode (readonly/readwrite) [readonly]: " value || fail "input cancelled for mode selection"
-    value="${value:-readonly}"
+    value="$(ui_trim "${value:-readonly}")"
     case "${value}" in
       readonly|readwrite)
         printf '%s' "${value}"
         return 0
         ;;
-      *)
-        log "mode must be readonly or readwrite"
-        ;;
     esac
+    log "mode must be readonly or readwrite"
   done
+}
+
+require_root() {
+  [[ "${EUID}" -eq 0 ]] || fail "run this script as root"
+}
+
+require_linux() {
+  [[ "$(uname -s)" == "Linux" ]] || fail "Linux is required"
+}
+
+require_systemd() {
+  command -v systemctl >/dev/null 2>&1 || fail "systemd is required"
+  systemctl --version >/dev/null 2>&1 || fail "systemd is not usable on this host"
+}
+
+apt_install() {
+  command -v apt-get >/dev/null 2>&1 || fail "apt-get is required on this host"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y "$@"
+}
+
+ensure_curl() {
+  command -v curl >/dev/null 2>&1 || apt_install curl ca-certificates
+}
+
+ensure_python() {
+  if command -v python3 >/dev/null 2>&1 && python3 -m venv --help >/dev/null 2>&1; then
+    if python3 - <<'PY' >/dev/null 2>&1
+import yaml
+PY
+    then
+      return 0
+    fi
+  fi
+  apt_install python3 python3-venv python3-pip python3-yaml
+}
+
+ensure_docker() {
+  require_systemd
+  if command -v docker >/dev/null 2>&1; then
+    systemctl enable --now docker >/dev/null 2>&1 || true
+  else
+    ensure_curl
+    local installer
+    installer="$(mktemp)"
+    curl -fsSL https://get.docker.com -o "${installer}"
+    sh "${installer}"
+    rm -f "${installer}"
+    systemctl enable --now docker >/dev/null 2>&1 || true
+  fi
+
+  docker version >/dev/null 2>&1 || fail "docker is installed but not usable"
+
+  if ! docker compose version >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      apt_install docker-compose-plugin
+    fi
+  fi
+  docker compose version >/dev/null 2>&1 || fail "docker compose is required"
+}
+
+docker_compose() {
+  docker compose -f "${COMPOSE_PATH}" "$@"
+}
+
+ensure_layout() {
+  mkdir -p "${INSTALL_ROOT}" "${CONFIG_DIR}" "${STATE_DIR}" "${STATE_DIR}/generated" "${STATE_DIR}/state" "${STATE_DIR}/certs" \
+    "${LOG_DIR}" "${ACME_DIR}" "${ENV_DIR}" "${BIN_DIR}" "${META_DIR}"
+}
+
+ensure_tools_venv() {
+  ensure_python
+  if [[ ! -x "${TOOLS_VENV_DIR}/bin/python" ]]; then
+    python3 -m venv "${TOOLS_VENV_DIR}"
+  fi
+  "${TOOLS_VENV_DIR}/bin/pip" install --upgrade pip >/dev/null
+  "${TOOLS_VENV_DIR}/bin/pip" install "PyYAML>=6.0.1,<7.0.0" "psycopg[binary]>=3.1.18,<4.0.0" >/dev/null
+}
+
+copy_or_download() {
+  local target="$1"
+  local local_source="$2"
+  local remote_suffix="$3"
+  if [[ -r "${local_source}" ]]; then
+    install -m 0755 "${local_source}" "${target}"
+    return 0
+  fi
+  ensure_curl
+  curl -fsSL "${GITHUB_CONTENT_BASE_URL}/${remote_suffix}" -o "${target}"
+  chmod 0755 "${target}"
+}
+
+install_managed_scripts() {
+  local self_source="${SCRIPT_PATH}"
+  if [[ -r "${self_source}" && "$(realpath "${self_source}" 2>/dev/null || printf '%s' "${self_source}")" != "$(realpath "${MANAGED_SETUP_PATH}" 2>/dev/null || printf '%s' "${MANAGED_SETUP_PATH}")" ]]; then
+    install -m 0755 "${self_source}" "${MANAGED_SETUP_PATH}"
+  else
+    copy_or_download "${MANAGED_SETUP_PATH}" "/nonexistent" "scripts/setup.sh"
+  fi
+
+  local domain_local="${REPO_DIR}/scripts/domain-manage.sh"
+  if [[ ! -f "${domain_local}" ]] && [[ -f "${SCRIPT_DIR}/domain-manage.sh" ]]; then
+    domain_local="${SCRIPT_DIR}/domain-manage.sh"
+  fi
+  if [[ -r "${domain_local}" && "$(realpath "${domain_local}" 2>/dev/null || printf '%s' "${domain_local}")" == "$(realpath "${MANAGED_DOMAIN_PATH}" 2>/dev/null || printf '%s' "${MANAGED_DOMAIN_PATH}")" ]]; then
+    :
+  else
+    copy_or_download "${MANAGED_DOMAIN_PATH}" "${domain_local}" "scripts/domain-manage.sh"
+  fi
+
+  cat > "${ENTRYPOINT_PATH}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec bash "${MANAGED_SETUP_PATH}" "\$@"
+EOF
+  chmod 0755 "${ENTRYPOINT_PATH}"
+}
+
+install_shell_alias() {
+  if grep -Fq "${ALIAS_MARKER_BEGIN}" "${BASHRC_PATH}" 2>/dev/null; then
+    return 0
+  fi
+  cat >> "${BASHRC_PATH}" <<EOF
+
+${ALIAS_MARKER_BEGIN}
+alias ssl-service='bash ${ENTRYPOINT_PATH}'
+${ALIAS_MARKER_END}
+EOF
+}
+
+remove_shell_alias() {
+  if [[ -f "${BASHRC_PATH}" ]] && grep -Fq "${ALIAS_MARKER_BEGIN}" "${BASHRC_PATH}"; then
+    awk -v begin="${ALIAS_MARKER_BEGIN}" -v end="${ALIAS_MARKER_END}" '
+      $0 == begin { skip = 1; next }
+      $0 == end { skip = 0; next }
+      !skip { print }
+    ' "${BASHRC_PATH}" > "${BASHRC_PATH}.ssl-service.tmp"
+    mv "${BASHRC_PATH}.ssl-service.tmp" "${BASHRC_PATH}"
+  fi
+}
+
+yaml_single_quote() {
+  local value="$1"
+  value="${value//\'/\'\'}"
+  printf "'%s'" "${value}"
+}
+
+schema_sql() {
+  cat <<'EOF'
+CREATE TABLE IF NOT EXISTS routes (
+  domain TEXT PRIMARY KEY,
+  upstream_port INTEGER CHECK (upstream_port > 0 AND upstream_port < 65536),
+  upstream_target TEXT,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE routes
+ALTER COLUMN upstream_port DROP NOT NULL;
+
+ALTER TABLE routes
+ADD COLUMN IF NOT EXISTS upstream_target TEXT;
+
+UPDATE routes
+SET upstream_target = '127.0.0.1:' || upstream_port::text
+WHERE upstream_target IS NULL
+  AND upstream_port IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS certificates (
+  domain TEXT PRIMARY KEY,
+  fullchain_pem TEXT NOT NULL,
+  private_key_pem TEXT NOT NULL,
+  not_before TIMESTAMPTZ NOT NULL,
+  not_after TIMESTAMPTZ NOT NULL,
+  version BIGINT NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'active',
+  source TEXT NOT NULL DEFAULT 'manual',
+  retry_after TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS dns_zone_tokens (
+  zone_name TEXT PRIMARY KEY,
+  provider TEXT NOT NULL DEFAULT 'cloudflare',
+  zone_id TEXT NOT NULL,
+  api_token TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE certificates
+ADD COLUMN IF NOT EXISTS retry_after TIMESTAMPTZ;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'certificates_domain_fkey'
+      AND conrelid = 'certificates'::regclass
+  ) THEN
+    ALTER TABLE certificates
+    ADD CONSTRAINT certificates_domain_fkey
+    FOREIGN KEY (domain)
+    REFERENCES routes (domain)
+    ON DELETE RESTRICT;
+  END IF;
+END;
+$$;
+
+CREATE INDEX IF NOT EXISTS idx_routes_enabled ON routes (enabled);
+CREATE INDEX IF NOT EXISTS idx_certificates_not_after ON certificates (not_after);
+CREATE INDEX IF NOT EXISTS idx_dns_zone_tokens_provider ON dns_zone_tokens (provider);
+
+CREATE OR REPLACE FUNCTION touch_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS routes_touch_updated_at ON routes;
+CREATE TRIGGER routes_touch_updated_at
+BEFORE UPDATE ON routes
+FOR EACH ROW
+EXECUTE FUNCTION touch_updated_at();
+
+DROP TRIGGER IF EXISTS certificates_touch_updated_at ON certificates;
+CREATE TRIGGER certificates_touch_updated_at
+BEFORE UPDATE ON certificates
+FOR EACH ROW
+EXECUTE FUNCTION touch_updated_at();
+
+DROP TRIGGER IF EXISTS dns_zone_tokens_touch_updated_at ON dns_zone_tokens;
+CREATE TRIGGER dns_zone_tokens_touch_updated_at
+BEFORE UPDATE ON dns_zone_tokens
+FOR EACH ROW
+EXECUTE FUNCTION touch_updated_at();
+EOF
+}
+
+mask_dsn() {
+  local dsn="$1"
+  MASK_DSN_VALUE="${dsn}" python3 - <<'PY'
+import os
+from urllib.parse import urlsplit, urlunsplit
+
+dsn = os.environ["MASK_DSN_VALUE"]
+parsed = urlsplit(dsn)
+hostname = parsed.hostname or ""
+if parsed.port:
+  hostname = f"{hostname}:{parsed.port}"
+username = parsed.username or ""
+netloc = hostname
+if username:
+  netloc = f"{username}:***@{hostname}"
+print(urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)))
+PY
+}
+
+get_config_value() {
+  local key="$1"
+  [[ -f "${CONFIG_PATH}" ]] || return 1
+  SSL_SERVICE_CONFIG_PATH="${CONFIG_PATH}" SSL_SERVICE_CONFIG_KEY="${key}" python3 - <<'PY'
+from pathlib import Path
+import os
+
+import yaml
+
+path = Path(os.environ["SSL_SERVICE_CONFIG_PATH"])
+key = os.environ["SSL_SERVICE_CONFIG_KEY"]
+data = yaml.safe_load(path.read_text()) or {}
+value = data
+for part in key.split("."):
+  value = value[part]
+print(value)
+PY
 }
 
 validate_dsn() {
   local dsn="$1"
-  SSL_PROXY_TEST_DSN="${dsn}" "${VENV_DIR}/bin/python" - <<'PY'
+  ensure_tools_venv
+  SSL_PROXY_TEST_DSN="${dsn}" "${TOOLS_VENV_DIR}/bin/python" - <<'PY'
 import os
+import sys
 import psycopg
 
 dsn = os.environ["SSL_PROXY_TEST_DSN"]
-with psycopg.connect(dsn, connect_timeout=10, sslmode="require") as conn:
+with psycopg.connect(dsn, connect_timeout=10) as conn:
   with conn.cursor() as cur:
     cur.execute("SELECT current_database(), current_user")
     row = cur.fetchone()
-print(f"database={row[0]} user={row[1]}")
+print(f"database={row[0]} user={row[1]}", file=sys.stderr)
 PY
 }
 
 validate_readonly_schema() {
   local dsn="$1"
-  SSL_PROXY_TEST_DSN="${dsn}" "${VENV_DIR}/bin/python" - <<'PY'
+  ensure_tools_venv
+  SSL_PROXY_TEST_DSN="${dsn}" "${TOOLS_VENV_DIR}/bin/python" - <<'PY'
 import os
 import psycopg
 
 dsn = os.environ["SSL_PROXY_TEST_DSN"]
-with psycopg.connect(dsn, connect_timeout=10, sslmode="require") as conn:
+with psycopg.connect(dsn, connect_timeout=10) as conn:
   with conn.cursor() as cur:
     cur.execute(
       """
@@ -626,23 +600,24 @@ if missing:
   raise SystemExit(
     "readonly schema verification failed; missing required objects: "
     + ", ".join(missing)
-    + ". Run 'ssl-proxy update' on a readwrite node first."
+    + ". Run install in readwrite mode once first."
   )
 print("readonly schema verified")
 PY
 }
 
 run_schema() {
-  SSL_PROXY_SCHEMA_PATH="${INSTALL_DIR}/sql/schema.sql" \
-  SSL_PROXY_TEST_DSN="$1" \
-  "${VENV_DIR}/bin/python" - <<'PY'
-from pathlib import Path
+  local dsn="$1"
+  ensure_tools_venv
+  local schema
+  schema="$(schema_sql)"
+  SSL_PROXY_TEST_DSN="${dsn}" SSL_PROXY_SCHEMA_SQL="${schema}" "${TOOLS_VENV_DIR}/bin/python" - <<'PY'
 import os
 import psycopg
 
-schema = Path(os.environ["SSL_PROXY_SCHEMA_PATH"]).read_text()
+schema = os.environ["SSL_PROXY_SCHEMA_SQL"]
 dsn = os.environ["SSL_PROXY_TEST_DSN"]
-with psycopg.connect(dsn, sslmode="require") as conn:
+with psycopg.connect(dsn, connect_timeout=10) as conn:
   with conn.cursor() as cur:
     cur.execute(schema)
   conn.commit()
@@ -654,166 +629,191 @@ render_config() {
   local mode="$1"
   local dsn="$2"
   local acme_email="$3"
-  SSL_PROXY_MODE="${mode}" \
-  SSL_PROXY_DSN="${dsn}" \
-  SSL_PROXY_ACME_EMAIL="${acme_email}" \
-  SSL_PROXY_CONFIG_PATH="${CONFIG_PATH}" \
-  SSL_PROXY_STATE_DIR="${STATE_DIR}" \
-  SSL_PROXY_LOG_DIR="${LOG_DIR}" \
-  SSL_PROXY_CERTBOT_BINARY="$(certbot_binary_path)" \
-  "${VENV_DIR}/bin/python" - <<'PY'
-import os
+  cat > "${CONFIG_PATH}" <<EOF
+mode: ${mode}
+
+postgres:
+  dsn: $(yaml_single_quote "${dsn}")
+
+sync:
+  poll_interval_seconds: 30
+  renew_before_days: 30
+  retry_backoff_seconds: 3600
+  loop_error_backoff_seconds: 10
+
+paths:
+  state_dir: /app/state
+  log_dir: /app/logs
+  caddy_binary: /usr/bin/caddy
+  certbot_binary: /usr/local/bin/certbot
+
+caddy:
+  admin_url: http://127.0.0.1:2019
+  reload_command:
+    - /usr/bin/caddy
+    - reload
+    - --config
+    - /app/state/generated/Caddyfile
+    - --adapter
+    - caddyfile
+
+acme:
+  email: $(yaml_single_quote "${acme_email}")
+  staging: false
+  challenge_type: dns-01
+  dns_provider: cloudflare
+  dns_propagation_seconds: 30
+  certbot_args: []
+
+logging:
+  level: INFO
+EOF
+  chmod 0600 "${CONFIG_PATH}"
+}
+
+render_compose() {
+  local image="$1"
+  cat > "${COMPOSE_PATH}" <<EOF
+services:
+  ssl-service:
+    image: ${image}
+    container_name: ssl-service
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ${CONFIG_DIR}:/app/config
+      - ${STATE_DIR}:/app/state
+      - ${LOG_DIR}:/app/logs
+      - ${ACME_DIR}:/etc/letsencrypt
+EOF
+}
+
+write_install_meta() {
+  local image="$1"
+  cat > "${META_DIR}/install.json" <<EOF
+{
+  "image": "${image}",
+  "config_path": "${CONFIG_PATH}",
+  "installed_at": "$(date -Is)"
+}
+EOF
+}
+
+installed_image() {
+  local image="${DEFAULT_IMAGE}"
+  if [[ -f "${META_DIR}/install.json" ]]; then
+    image="$(python3 - <<PY
 from pathlib import Path
-
-import yaml
-
-config = {
-  "mode": os.environ["SSL_PROXY_MODE"],
-  "postgres": {
-    "dsn": os.environ["SSL_PROXY_DSN"],
-  },
-  "sync": {
-    "poll_interval_seconds": 30,
-    "renew_before_days": 30,
-    "retry_backoff_seconds": 3600,
-    "loop_error_backoff_seconds": 10,
-  },
-  "paths": {
-    "state_dir": os.environ["SSL_PROXY_STATE_DIR"],
-    "log_dir": os.environ["SSL_PROXY_LOG_DIR"],
-    "caddy_binary": "/usr/bin/caddy",
-    "certbot_binary": os.environ["SSL_PROXY_CERTBOT_BINARY"],
-  },
-  "caddy": {
-    "admin_url": "http://127.0.0.1:2019",
-    "reload_command": [
-      "/usr/bin/caddy",
-      "reload",
-      "--config",
-      f"{os.environ['SSL_PROXY_STATE_DIR']}/generated/Caddyfile",
-      "--adapter",
-      "caddyfile",
-    ],
-  },
-  "acme": {
-    "email": os.environ["SSL_PROXY_ACME_EMAIL"],
-    "staging": False,
-    "challenge_type": "dns-01",
-    "dns_provider": "cloudflare",
-    "dns_propagation_seconds": 30,
-    "certbot_args": [],
-  },
-  "logging": {
-    "level": "INFO",
-  },
-}
-
-config_path = Path(os.environ["SSL_PROXY_CONFIG_PATH"])
-config_path.write_text(yaml.safe_dump(config, sort_keys=False))
-config_path.chmod(0o600)
+import json
+path = Path("${META_DIR}/install.json")
+print(json.loads(path.read_text()).get("image", "${DEFAULT_IMAGE}"))
 PY
-}
-
-get_config_value() {
-  local path_expr="$1"
-  SSL_PROXY_CONFIG_PATH="${CONFIG_PATH}" \
-  SSL_PROXY_CONFIG_EXPR="${path_expr}" \
-  "${VENV_DIR}/bin/python" - <<'PY'
-import os
-from pathlib import Path
-
-import yaml
-
-config = yaml.safe_load(Path(os.environ["SSL_PROXY_CONFIG_PATH"]).read_text()) or {}
-value = config
-for part in os.environ["SSL_PROXY_CONFIG_EXPR"].split("."):
-  value = value[part]
-print(value)
-PY
-}
-
-normalize_config_certbot_binary() {
-  [[ -f "${CONFIG_PATH}" ]] || return 0
-  SSL_PROXY_CONFIG_PATH="${CONFIG_PATH}" \
-  SSL_PROXY_CERTBOT_BINARY="$(certbot_binary_path)" \
-  "${VENV_DIR}/bin/python" - <<'PY'
-import os
-from pathlib import Path
-
-import yaml
-
-config_path = Path(os.environ["SSL_PROXY_CONFIG_PATH"])
-config = yaml.safe_load(config_path.read_text()) or {}
-paths = dict(config.get("paths", {}))
-paths["certbot_binary"] = os.environ["SSL_PROXY_CERTBOT_BINARY"]
-config["paths"] = paths
-config_path.write_text(yaml.safe_dump(config, sort_keys=False))
-config_path.chmod(0o600)
-PY
-}
-
-mask_dsn() {
-  local dsn="$1"
-  MASK_DSN_VALUE="${dsn}" "${VENV_DIR}/bin/python" - <<'PY'
-import os
-from urllib.parse import urlsplit, urlunsplit
-
-dsn = os.environ["MASK_DSN_VALUE"]
-parsed = urlsplit(dsn)
-hostname = parsed.hostname or ""
-if parsed.port:
-  hostname = f"{hostname}:{parsed.port}"
-username = parsed.username or ""
-netloc = hostname
-if username:
-  netloc = f"{username}:***@{hostname}"
-print(urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)))
-PY
-}
-
-config_exists_prompt() {
-  if [[ -f "${CONFIG_PATH}" ]]; then
-    ui_yes_no "Config already exists at ${CONFIG_PATH}. Reconfigure it?" "no" || return 1
+)"
   fi
-  return 0
+  printf '%s' "${image}"
 }
 
-install_units() {
-  cp "${INSTALL_DIR}/systemd/caddy.service" "${SYSTEMD_DIR}/caddy.service"
-  cp "${INSTALL_DIR}/systemd/ssl-proxy-controller.service" "${SYSTEMD_DIR}/ssl-proxy-controller.service"
-  cat > "${SYSTEMD_DIR}/${UPDATE_SERVICE_NAME}" <<EOF
-[Unit]
-Description=SSL Proxy Update Runner
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/ssl-proxy update
-EOF
-  cat > "${SYSTEMD_DIR}/${TIMER_NAME}" <<EOF
-[Unit]
-Description=Daily SSL Proxy Update
-
-[Timer]
-OnCalendar=${UPDATE_SCHEDULE}
-Persistent=true
-Unit=${UPDATE_SERVICE_NAME}
-
-[Install]
-WantedBy=timers.target
-EOF
-  install -m 0755 "${INSTALL_DIR}/scripts/setup.sh" /usr/local/bin/ssl-proxy
-  rm -f /usr/local/bin/domain-manage
-  systemctl daemon-reload
-  systemctl enable "${CADDY_SERVICE_NAME}" "${SERVICE_NAME}" "${TIMER_NAME}" >/dev/null
+config_exists() {
+  [[ -f "${CONFIG_PATH}" ]]
 }
 
-wait_for_controller() {
-  local retries=30
+runtime_exists() {
+  [[ -d "${INSTALL_ROOT}" || -f "${COMPOSE_PATH}" || -f "${CONFIG_PATH}" ]]
+}
+
+compose_service_running() {
+  command -v docker >/dev/null 2>&1 || return 1
+  docker compose version >/dev/null 2>&1 || return 1
+  [[ -f "${COMPOSE_PATH}" ]] || return 1
+  docker_compose ps --status running --services 2>/dev/null | grep -Fxq "ssl-service"
+}
+
+compose_service_exists() {
+  command -v docker >/dev/null 2>&1 || return 1
+  docker compose version >/dev/null 2>&1 || return 1
+  [[ -f "${COMPOSE_PATH}" ]] || return 1
+  docker_compose ps --services 2>/dev/null | grep -Fxq "ssl-service"
+}
+
+container_admin_ready() {
+  compose_service_running || return 1
+  docker_compose exec -T ssl-service python -c \
+    "import urllib.request; urllib.request.urlopen('http://127.0.0.1:2019/config/', timeout=2).read(1)" \
+    >/dev/null 2>&1
+}
+
+status_summary() {
+  local installed="no"
+  local docker_state="missing"
+  local container_state="not-installed"
+  local mode="unconfigured"
+  local dsn="unconfigured"
+
+  if runtime_exists; then
+    installed="yes"
+  fi
+  if command -v docker >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active docker >/dev/null 2>&1; then
+      docker_state="active"
+    else
+      docker_state="inactive"
+    fi
+  fi
+  if compose_service_running; then
+    container_state="running"
+  elif compose_service_exists; then
+    container_state="stopped"
+  fi
+  if config_exists; then
+    mode="$(get_config_value "mode" 2>/dev/null || printf '%s' "invalid")"
+    dsn="$(mask_dsn "$(get_config_value "postgres.dsn" 2>/dev/null || printf '%s' "")")"
+  fi
+  printf 'installed=%s docker=%s container=%s mode=%s dsn=%s\n' \
+    "${installed}" "${docker_state}" "${container_state}" "${mode}" "${dsn}"
+}
+
+ui_status_header() {
+  local summary installed docker_state container_state mode dsn image
+  summary="$(status_summary)"
+  installed="$(printf '%s' "${summary}" | awk '{for (i=1;i<=NF;i++) if ($i ~ /^installed=/) {sub(/^installed=/,"",$i); print $i}}')"
+  docker_state="$(printf '%s' "${summary}" | awk '{for (i=1;i<=NF;i++) if ($i ~ /^docker=/) {sub(/^docker=/,"",$i); print $i}}')"
+  container_state="$(printf '%s' "${summary}" | awk '{for (i=1;i<=NF;i++) if ($i ~ /^container=/) {sub(/^container=/,"",$i); print $i}}')"
+  mode="$(printf '%s' "${summary}" | awk '{for (i=1;i<=NF;i++) if ($i ~ /^mode=/) {sub(/^mode=/,"",$i); print $i}}')"
+  dsn="$(printf '%s' "${summary}" | sed -n 's/.* dsn=//p')"
+  image="$(installed_image)"
+  printf '%s%s%s\n' "${COLOR_BOLD}${COLOR_BLUE}" "ssl-service control" "${COLOR_RESET}" >&2
+  printf '%sinstall_root:%s %s\n' "${COLOR_DIM}" "${COLOR_RESET}" "${INSTALL_ROOT}" >&2
+  printf '%sinstalled:%s %s  %sdocker:%s %s  %scontainer:%s %s\n' \
+    "${COLOR_DIM}" "${COLOR_RESET}" "${installed}" \
+    "${COLOR_DIM}" "${COLOR_RESET}" "${docker_state}" \
+    "${COLOR_DIM}" "${COLOR_RESET}" "${container_state}" >&2
+  printf '%smode:%s %s  %simage:%s %s\n' \
+    "${COLOR_DIM}" "${COLOR_RESET}" "${mode}" \
+    "${COLOR_DIM}" "${COLOR_RESET}" "${image}" >&2
+  if [[ "${dsn}" != "unconfigured" ]]; then
+    printf '%sdsn:%s %s\n' "${COLOR_DIM}" "${COLOR_RESET}" "${dsn}" >&2
+  fi
+  printf '\n' >&2
+}
+
+pull_image() {
+  local image="$1"
+  docker pull "${image}"
+}
+
+wait_for_container() {
+  local retries=60
+  local stable_ready_checks=0
   while (( retries > 0 )); do
-    if systemctl is-active --quiet "${SERVICE_NAME}" && systemctl is-active --quiet "${CADDY_SERVICE_NAME}"; then
-      return 0
+    if container_admin_ready; then
+      stable_ready_checks=$((stable_ready_checks + 1))
+      if (( stable_ready_checks >= 2 )); then
+        return 0
+      fi
+    else
+      stable_ready_checks=0
     fi
     sleep 1
     retries=$((retries - 1))
@@ -821,22 +821,125 @@ wait_for_controller() {
   return 1
 }
 
-append_update_log() {
-  local status="$1"
-  printf '%s %s\n' "$(date -Is)" "${status}" >> "${UPDATE_LOG}"
+prompt_install_values() {
+  local initial_mode="${1:-}"
+  local initial_dsn="${2:-}"
+  local initial_acme="${3:-}"
+  local mode="${initial_mode}"
+  local dsn="${initial_dsn}"
+  local acme_email="${initial_acme}"
+
+  if [[ -z "${mode}" ]]; then
+    mode="$(select_mode)"
+  fi
+  if [[ -z "${dsn}" ]]; then
+    dsn="$(prompt_required "PostgreSQL DSN")"
+  fi
+  while ! validate_dsn "${dsn}"; do
+    log "database connection failed"
+    dsn="$(prompt_required "PostgreSQL DSN")"
+  done
+  if [[ -z "${acme_email}" ]]; then
+    if [[ "${mode}" == "readwrite" ]]; then
+      acme_email="$(prompt_required "ACME email")"
+    else
+      acme_email="${DEFAULT_ACME_EMAIL}"
+    fi
+  fi
+  printf '%s\n%s\n%s\n' "${mode}" "${dsn}" "${acme_email}"
+}
+
+stop_runtime() {
+  require_root
+  if compose_service_exists || [[ -f "${COMPOSE_PATH}" ]]; then
+    docker_compose stop || true
+  fi
+}
+
+start_runtime() {
+  require_root
+  [[ -f "${COMPOSE_PATH}" ]] || fail "runtime is not installed"
+  stop_legacy_runtime
+  docker_compose up -d --remove-orphans
+  wait_for_container || fail "container did not become healthy in time"
+}
+
+restart_runtime() {
+  require_root
+  [[ -f "${COMPOSE_PATH}" ]] || fail "runtime is not installed"
+  stop_legacy_runtime
+  docker_compose restart ssl-service
+  wait_for_container || fail "container did not become healthy in time"
+}
+
+remove_legacy_runtime() {
+  rm -rf /opt/ssl-proxy /etc/ssl-proxy /var/lib/ssl-proxy /var/log/ssl-proxy
+  rm -f /usr/local/bin/ssl-proxy /usr/local/bin/domain-manage
+  if [[ -f /etc/systemd/system/caddy.service ]] && grep -Fq "/var/lib/ssl-proxy/generated/Caddyfile" /etc/systemd/system/caddy.service; then
+    rm -f /etc/systemd/system/caddy.service
+  fi
+  if [[ -f /etc/systemd/system/ssl-proxy-controller.service ]] && grep -Fq "/etc/ssl-proxy/config.yaml" /etc/systemd/system/ssl-proxy-controller.service; then
+    rm -f /etc/systemd/system/ssl-proxy-controller.service
+  fi
+  if [[ -f /etc/systemd/system/ssl-proxy-update.service ]] && grep -Fq "ssl-proxy update" /etc/systemd/system/ssl-proxy-update.service; then
+    rm -f /etc/systemd/system/ssl-proxy-update.service
+  fi
+  if [[ -f /etc/systemd/system/ssl-proxy-update.timer ]] && grep -Fq "ssl-proxy-update.service" /etc/systemd/system/ssl-proxy-update.timer; then
+    rm -f /etc/systemd/system/ssl-proxy-update.timer
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed caddy.service ssl-proxy-controller.service ssl-proxy-update.service ssl-proxy-update.timer >/dev/null 2>&1 || true
+}
+
+stop_legacy_runtime() {
+  systemctl disable --now caddy.service ssl-proxy-controller.service ssl-proxy-update.timer >/dev/null 2>&1 || true
+}
+
+perform_install() {
+  local mode="$1"
+  local dsn="$2"
+  local acme_email="$3"
+  local image="$4"
+
+  require_linux
+  require_root
+  ensure_curl
+  ensure_python
+  ensure_docker
+  ensure_layout
+  ensure_tools_venv
+  install_managed_scripts
+  render_config "${mode}" "${dsn}" "${acme_email}"
+  render_compose "${image}"
+  write_install_meta "${image}"
+
+  if [[ "${mode}" == "readwrite" ]]; then
+    run_schema "${dsn}"
+  else
+    validate_readonly_schema "${dsn}"
+  fi
+
+  pull_image "${image}"
+  stop_legacy_runtime
+  docker_compose up -d --remove-orphans
+  wait_for_container || fail "container did not become healthy in time"
+  install_shell_alias
+  remove_legacy_runtime
+  log "installed successfully"
+  log "install_root: ${INSTALL_ROOT}"
+  log "config: ${CONFIG_PATH}"
+  log "image: ${image}"
+  log "refresh shell: source ${BASHRC_PATH}"
 }
 
 install_command() {
+  require_root
   local mode=""
   local dsn=""
   local acme_email=""
   local force_reconfigure=0
-  local interactive_input=0
-  local config_missing=1
-
-  if ui_has_tty; then
-    interactive_input=1
-  fi
+  local overwrite_runtime=1
+  local overwrite_config=1
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -869,188 +972,97 @@ install_command() {
     fail "--mode must be readonly or readwrite"
   fi
 
-  [[ -f "${CONFIG_PATH}" ]] && config_missing=0
-
-  if [[ "${interactive_input}" -ne 1 && ( "${force_reconfigure}" -eq 1 || "${config_missing}" -eq 1 ) ]]; then
-    [[ -n "${mode}" ]] || fail "--mode is required when install runs without a TTY"
-    [[ -n "${dsn}" ]] || fail "--dsn is required when install runs without a TTY"
-    if [[ "${mode}" == "readwrite" && -z "${acme_email}" ]]; then
-      fail "--acme-email is required for readwrite install without a TTY"
+  if runtime_exists && [[ "${force_reconfigure}" -ne 1 ]]; then
+    if ui_has_tty; then
+      ui_yes_no "Existing installation detected. Overwrite runtime files?" "no" || return 0
+      overwrite_runtime=1
+      if config_exists; then
+        if ui_yes_no "Overwrite mode / database connection?" "no"; then
+          overwrite_config=1
+        else
+          overwrite_config=0
+        fi
+      fi
+    else
+      fail "existing installation detected; use --force-reconfigure for non-interactive install"
     fi
   fi
 
-  if [[ "${interactive_input}" -ne 1 && "${config_missing}" -eq 0 && "${force_reconfigure}" -ne 1 ]]; then
-    if [[ -n "${mode}" || -n "${dsn}" || -n "${acme_email}" ]]; then
-      fail "existing config detected; use --force-reconfigure to apply new install parameters without a TTY"
-    fi
-  fi
-
-  require_linux
-  require_root
-  require_systemd
-  ensure_packages
-  ensure_layout
-  check_bind_ports
-  sync_repo
-  record_source_dir
-  ensure_venv
-  ensure_tools_venv
-  ensure_acme_venv
-  verify_certbot_cloudflare_plugin
-  seed_bootstrap_caddyfile
-
-  if [[ "${force_reconfigure}" -eq 1 || ! -f "${CONFIG_PATH}" ]]; then
-    if [[ -z "${mode}" ]]; then
-      mode="$(select_mode)"
-    fi
-
-    if [[ -z "${dsn}" ]]; then
-      if [[ -n "${DEFAULT_DSN}" ]]; then
-        dsn="$(prompt_with_default "PostgreSQL DSN" "${DEFAULT_DSN}")"
-      else
-        dsn="$(prompt_required "PostgreSQL DSN")"
-      fi
-    fi
-    while ! validate_dsn "${dsn}"; do
-      [[ "${interactive_input}" -eq 1 ]] || fail "database connection failed for supplied --dsn"
-      log "database connection failed"
-      dsn="$(prompt_required "PostgreSQL DSN")"
-    done
-
-    if [[ -z "${acme_email}" ]]; then
-      if [[ "${mode}" == "readwrite" ]]; then
-        acme_email="$(prompt_required "ACME email")"
-      else
-        acme_email="${DEFAULT_ACME_EMAIL}"
-      fi
-    fi
-
-    render_config "${mode}" "${dsn}" "${acme_email}"
-  elif config_exists_prompt; then
-    if [[ "${interactive_input}" -ne 1 ]]; then
-      [[ -n "${mode}" ]] || fail "--mode is required when reconfiguring without a TTY"
-      [[ -n "${dsn}" ]] || fail "--dsn is required when reconfiguring without a TTY"
-      if [[ "${mode}" == "readwrite" && -z "${acme_email}" ]]; then
-        fail "--acme-email is required for readwrite reconfigure without a TTY"
-      fi
-    fi
-    if [[ -z "${mode}" ]]; then
-      mode="$(select_mode)"
-    fi
-    if [[ -z "${dsn}" ]]; then
-      if [[ -n "${DEFAULT_DSN}" ]]; then
-        dsn="$(prompt_with_default "PostgreSQL DSN" "${DEFAULT_DSN}")"
-      else
-        dsn="$(prompt_required "PostgreSQL DSN")"
-      fi
-    fi
-    while ! validate_dsn "${dsn}"; do
-      [[ "${interactive_input}" -eq 1 ]] || fail "database connection failed for supplied --dsn"
-      log "database connection failed"
-      dsn="$(prompt_required "PostgreSQL DSN")"
-    done
-
-    if [[ -z "${acme_email}" ]]; then
-      if [[ "${mode}" == "readwrite" ]]; then
-        acme_email="$(prompt_required "ACME email")"
-      else
-        acme_email="${DEFAULT_ACME_EMAIL}"
-      fi
-    fi
-
-    render_config "${mode}" "${dsn}" "${acme_email}"
-  else
-    log "preserving existing config at ${CONFIG_PATH}"
+  if [[ "${overwrite_config}" -eq 0 ]]; then
+    [[ -f "${CONFIG_PATH}" ]] || fail "cannot preserve config because ${CONFIG_PATH} is missing"
     mode="$(get_config_value "mode")"
     dsn="$(get_config_value "postgres.dsn")"
+    acme_email="$(get_config_value "acme.email")"
     validate_dsn "${dsn}"
+  else
+    if ui_has_tty; then
+      readarray -t values < <(prompt_install_values "${mode}" "${dsn}" "${acme_email}")
+      mode="${values[0]}"
+      dsn="${values[1]}"
+      acme_email="${values[2]}"
+    else
+      [[ -n "${mode}" ]] || fail "--mode is required when install runs without a TTY"
+      [[ -n "${dsn}" ]] || fail "--dsn is required when install runs without a TTY"
+      if [[ "${mode}" == "readwrite" ]]; then
+        [[ -n "${acme_email}" ]] || fail "--acme-email is required for readwrite install without a TTY"
+      else
+        acme_email="${DEFAULT_ACME_EMAIL}"
+      fi
+      validate_dsn "${dsn}"
+    fi
   fi
-  normalize_config_certbot_binary
-  chmod 600 "${CONFIG_PATH}"
+
+  perform_install "${mode}" "${dsn}" "${acme_email}" "${DEFAULT_IMAGE}"
+}
+
+reconfigure_command() {
+  require_root
+  config_exists || fail "runtime config not found: ${CONFIG_PATH}"
+  local mode="" dsn="" acme_email=""
+  if ui_has_tty; then
+    readarray -t values < <(prompt_install_values "$(get_config_value "mode")" "$(get_config_value "postgres.dsn")" "")
+    mode="${values[0]}"
+    dsn="${values[1]}"
+    acme_email="${values[2]}"
+  else
+    fail "reconfigure requires a TTY"
+  fi
+  render_config "${mode}" "${dsn}" "${acme_email}"
   if [[ "${mode}" == "readwrite" ]]; then
     run_schema "${dsn}"
   else
     validate_readonly_schema "${dsn}"
   fi
-  install_shell_prompt
-  install_units
-  systemctl restart "${CADDY_SERVICE_NAME}"
-  systemctl restart "${SERVICE_NAME}"
-  systemctl restart "${TIMER_NAME}"
-
-  wait_for_controller || fail "services did not become healthy in time"
-  append_update_log "install ok"
-  log "installed successfully"
-  log "config: ${CONFIG_PATH}"
-  log "mode: ${mode}"
-}
-
-start_command() {
-  require_root
-  systemctl start "${CADDY_SERVICE_NAME}" "${SERVICE_NAME}"
-  wait_for_controller || fail "services did not become healthy in time"
-}
-
-stop_command() {
-  require_root
-  systemctl stop "${SERVICE_NAME}" "${CADDY_SERVICE_NAME}"
-}
-
-restart_command() {
-  require_root
-  systemctl restart "${CADDY_SERVICE_NAME}" "${SERVICE_NAME}"
-  wait_for_controller || fail "services did not become healthy in time"
+  restart_runtime
+  log "database configuration updated"
 }
 
 status_command() {
-  local public_ip
-  local caddy_status
-  local controller_status
-  public_ip="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
-  caddy_status="$(systemctl is-active "${CADDY_SERVICE_NAME}" 2>/dev/null || echo unavailable)"
-  controller_status="$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || echo unavailable)"
-  log "caddy: ${caddy_status}"
-  log "controller: ${controller_status}"
-  if [[ -f "${CONFIG_PATH}" ]]; then
-    log "config: ${CONFIG_PATH}"
-    log "mode: $(get_config_value "mode")"
-    log "dsn: $(mask_dsn "$(get_config_value "postgres.dsn")")"
+  require_root
+  local docker_version="unavailable"
+  if command -v docker >/dev/null 2>&1; then
+    docker_version="$(docker --version 2>/dev/null || printf '%s' "unavailable")"
   fi
-  log "listening ports:"
-  local port_output
-  if ! port_output="$(ss -ltn '( sport = :80 or sport = :443 )' 2>/dev/null)"; then
-    log "unavailable"
-  elif [[ "$(printf '%s\n' "${port_output}" | wc -l)" -le 1 ]]; then
-    log "none"
-  else
-    printf '%s\n' "${port_output}"
-  fi
-  log "recent update log:"
-  tail -n 10 "${UPDATE_LOG}" 2>/dev/null || true
-  if [[ -n "${public_ip}" ]]; then
-    log "public_ip: ${public_ip}"
-  else
-    log "public_ip: unavailable"
+  log "$(status_summary)"
+  log "docker_version: ${docker_version}"
+  if [[ -f "${COMPOSE_PATH}" ]]; then
+    docker_compose ps || true
   fi
 }
 
 logs_command() {
-  journalctl -u "${CADDY_SERVICE_NAME}" -u "${SERVICE_NAME}" -n 100 -f
+  require_root
+  [[ -f "${COMPOSE_PATH}" ]] || fail "runtime is not installed"
+  docker_compose logs -f ssl-service
 }
 
 update_command() {
   require_root
-  sync_repo
-  record_source_dir
-  ensure_venv
+  [[ -f "${COMPOSE_PATH}" ]] || fail "runtime is not installed"
+  ensure_docker
   ensure_tools_venv
-  ensure_acme_venv
-  verify_certbot_cloudflare_plugin
-  if [[ -f "${CONFIG_PATH}" ]]; then
-    normalize_config_certbot_binary
-    chmod 600 "${CONFIG_PATH}"
-    local mode
-    local dsn
+  if config_exists; then
+    local mode dsn
     mode="$(get_config_value "mode")"
     dsn="$(get_config_value "postgres.dsn")"
     validate_dsn "${dsn}"
@@ -1060,104 +1072,71 @@ update_command() {
       validate_readonly_schema "${dsn}"
     fi
   fi
-  install_shell_prompt
-  install_units
-  systemctl restart "${CADDY_SERVICE_NAME}" "${SERVICE_NAME}"
-  if wait_for_controller; then
-    append_update_log "update ok"
-  else
-    append_update_log "update failed"
-    fail "services did not become healthy after update"
-  fi
-}
-
-timer_status_command() {
-  systemctl is-enabled "${TIMER_NAME}" || true
-  systemctl is-active "${TIMER_NAME}" || true
-  systemctl status "${TIMER_NAME}" --no-pager || true
-  journalctl -u "${UPDATE_SERVICE_NAME}" -n 20 --no-pager || true
+  local image
+  image="$(installed_image)"
+  pull_image "${image}"
+  install_managed_scripts
+  install_shell_alias
+  render_compose "${image}"
+  write_install_meta "${image}"
+  stop_legacy_runtime
+  docker_compose up -d --remove-orphans
+  wait_for_container || fail "container did not become healthy in time"
+  remove_legacy_runtime
+  log "updated successfully"
 }
 
 uninstall_command() {
   require_root
-  local keep_config=0
-  local keep_data=0
   local yes=0
-
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --yes) yes=1 ;;
-      --keep-config) keep_config=1 ;;
-      --keep-data) keep_data=1 ;;
-      --delete-config) keep_config=0 ;;
-      --delete-all)
-        keep_config=0
-        keep_data=0
-        ;;
       *) fail "unknown uninstall flag: $1" ;;
     esac
     shift
   done
 
   if [[ "${yes}" -ne 1 ]]; then
-    ui_confirm_uninstall "${keep_config}" "${keep_data}" || exit 0
+    ui_yes_no "Proceed with uninstall?" "no" || return 0
   fi
 
-  systemctl disable --now "${TIMER_NAME}" "${SERVICE_NAME}" "${CADDY_SERVICE_NAME}" >/dev/null 2>&1 || true
-  rm -f \
-    "${SYSTEMD_DIR}/caddy.service" \
-    "${SYSTEMD_DIR}/ssl-proxy-controller.service" \
-    "${SYSTEMD_DIR}/${UPDATE_SERVICE_NAME}" \
-    "${SYSTEMD_DIR}/${TIMER_NAME}" \
-    /usr/local/bin/ssl-proxy \
-    /usr/local/bin/domain-manage
-  systemctl daemon-reload
-  systemctl reset-failed "${CADDY_SERVICE_NAME}" "${SERVICE_NAME}" "${UPDATE_SERVICE_NAME}" "${TIMER_NAME}" >/dev/null 2>&1 || true
-
-  rm -rf "${INSTALL_DIR}"
-  remove_shell_prompt
-
-  if [[ "${keep_config}" -ne 1 ]]; then
-    rm -rf "${CONFIG_DIR}"
+  if compose_service_exists || [[ -f "${COMPOSE_PATH}" ]]; then
+    docker_compose down --remove-orphans || true
   fi
-  if [[ "${keep_data}" -ne 1 ]]; then
-    rm -rf "${STATE_DIR}" "${LOG_DIR}"
-  fi
-
+  rm -rf "${INSTALL_ROOT}"
+  remove_shell_alias
+  remove_legacy_runtime
   log "uninstall complete"
-  if [[ "${keep_config}" -eq 1 && "${keep_data}" -eq 1 ]]; then
-    log "preserved: ${CONFIG_DIR}, ${STATE_DIR}, ${LOG_DIR}"
-  elif [[ "${keep_config}" -eq 1 ]]; then
-    log "preserved: ${CONFIG_DIR}"
-    log "deleted: ${STATE_DIR}, ${LOG_DIR}"
-  elif [[ "${keep_data}" -eq 1 ]]; then
-    log "deleted: ${CONFIG_DIR}"
-    log "preserved: ${STATE_DIR}, ${LOG_DIR}"
-  else
-    log "deleted: ${CONFIG_DIR}, ${STATE_DIR}, ${LOG_DIR}"
+}
+
+domain_command() {
+  require_root
+  local domain_script="${MANAGED_DOMAIN_PATH}"
+  if [[ ! -x "${domain_script}" && -x "${REPO_DIR}/scripts/domain-manage.sh" ]]; then
+    domain_script="${REPO_DIR}/scripts/domain-manage.sh"
   fi
+  [[ -x "${domain_script}" ]] || fail "domain manager not installed"
+  SSL_PROXY_CONFIG="${CONFIG_PATH}" \
+  SSL_PROXY_DOMAIN_PROGRAM_NAME="ssl-service domain" \
+  bash "${domain_script}" "$@"
 }
 
 interactive_menu() {
   local selection action default_index=0
   while true; do
-    if ui_has_tty; then
-      ui_clear_screen
-      ui_setup_header
-    fi
-    selection="$(ui_menu_select "ssl-proxy control" "${default_index}" "${SETUP_MENU_LABELS[@]}")" || return 0
-    action="${SETUP_MENU_ACTIONS[selection]}"
+    ui_clear_screen
+    ui_status_header
+    selection="$(ui_menu_select "ssl-service control" "${default_index}" "${STATE_MENU_LABELS[@]}")" || return 0
+    action="${STATE_MENU_ACTIONS[selection]}"
     default_index="${selection}"
     case "${action}" in
       install) install_command ;;
-      domain) domain_command ;;
-      start) start_command ;;
-      stop) stop_command ;;
-      restart) restart_command ;;
+      reconfigure) reconfigure_command ;;
       status) status_command ;;
       logs) logs_command ;;
+      restart) restart_runtime ;;
       update) update_command ;;
-      timer-status) timer_status_command ;;
       uninstall) uninstall_command ;;
       exit) return 0 ;;
       *) fail "invalid choice" ;;
@@ -1172,16 +1151,46 @@ main() {
     -h|--help|help)
       usage
       ;;
-    domain) shift; domain_command "$@" ;;
-    install) shift; install_command "$@" ;;
-    start) shift; start_command "$@" ;;
-    stop) shift; stop_command "$@" ;;
-    restart) shift; restart_command "$@" ;;
-    status) shift; status_command "$@" ;;
-    logs) shift; logs_command "$@" ;;
-    update) shift; update_command "$@" ;;
-    timer-status) shift; timer_status_command "$@" ;;
-    uninstall) shift; uninstall_command "$@" ;;
+    install)
+      shift
+      install_command "$@"
+      ;;
+    reconfigure)
+      shift
+      reconfigure_command "$@"
+      ;;
+    status)
+      shift
+      status_command "$@"
+      ;;
+    logs)
+      shift
+      logs_command "$@"
+      ;;
+    start)
+      shift
+      start_runtime "$@"
+      ;;
+    stop)
+      shift
+      stop_runtime "$@"
+      ;;
+    restart)
+      shift
+      restart_runtime "$@"
+      ;;
+    update)
+      shift
+      update_command "$@"
+      ;;
+    uninstall)
+      shift
+      uninstall_command "$@"
+      ;;
+    domain)
+      shift
+      domain_command "$@"
+      ;;
     "")
       if ui_has_tty; then
         interactive_menu
@@ -1190,7 +1199,9 @@ main() {
         exit 1
       fi
       ;;
-    *) fail "unknown command: ${command}" ;;
+    *)
+      fail "unknown command: ${command}"
+      ;;
   esac
 }
 

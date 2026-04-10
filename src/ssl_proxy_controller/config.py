@@ -114,10 +114,10 @@ def load_config(path: str | Path) -> AppConfig:
     postgres=PostgresConfig(**data["postgres"]),
     sync=SyncConfig(**data.get("sync", {})),
     paths=PathsConfig(
-      state_dir=Path(paths.get("state_dir", "/var/lib/ssl-proxy")),
-      log_dir=Path(paths.get("log_dir", "/var/log/ssl-proxy")),
+      state_dir=Path(paths.get("state_dir", "/app/state")),
+      log_dir=Path(paths.get("log_dir", "/app/logs")),
       caddy_binary=paths.get("caddy_binary", "/usr/bin/caddy"),
-      certbot_binary=paths.get("certbot_binary", "/usr/bin/certbot"),
+      certbot_binary=paths.get("certbot_binary", "/usr/local/bin/certbot"),
     ),
     caddy=CaddyConfig(
       admin_url=caddy.get("admin_url", "http://127.0.0.1:2019"),

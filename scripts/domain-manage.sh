@@ -3,11 +3,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-DEPLOY_DIR="/opt/ssl-proxy"
+DEPLOY_DIR="/root/.ssl-service"
+LEGACY_DEPLOY_DIR="/opt/ssl-proxy"
 PROGRAM_NAME="${SSL_PROXY_DOMAIN_PROGRAM_NAME:-$(basename "${BASH_SOURCE[0]}")}"
 CONFIG_CANDIDATES=(
+  "/root/.ssl-service/config/config.yaml"
   "/etc/ssl-proxy/config.yaml"
 )
+COMPOSE_PATH="${DEPLOY_DIR}/compose.yaml"
 UI_INTERACTIVE=0
 LAST_DOMAIN=""
 LAST_UPSTREAM=""
@@ -128,7 +131,7 @@ Usage:
   ${PROGRAM_NAME} disable <domain>
   ${PROGRAM_NAME} delete <domain>
   ${PROGRAM_NAME} purge <domain>
-  ${PROGRAM_NAME} issue-now <domain> [--force]
+  ${PROGRAM_NAME} issue-now <domain>
   ${PROGRAM_NAME} set-zone-token <domain_or_zone>
   ${PROGRAM_NAME} sync-now
 
@@ -138,7 +141,7 @@ Notes:
   - certificate issuance uses DNS-01 with Cloudflare only.
   - upstream_target can be omitted on add, which creates a certificate-only domain.
   - upstream_target accepts '6111', '127.0.0.1:6111', '10.0.0.25:6111', 'backend.internal:6111', or '[2001:db8::10]:6111'.
-  - the script reads PostgreSQL DSN from /etc/ssl-proxy/config.yaml by default.
+  - the script reads PostgreSQL DSN from /root/.ssl-service/config/config.yaml by default.
   - override config with: SSL_PROXY_CONFIG=/path/to/config.yaml
   - mutating commands accept --sync-now to force an immediate local refresh
   - automatic retry backoff defaults to 3600 seconds after ACME failure
@@ -200,7 +203,7 @@ ui_print_header() {
   local mode_color
   mode_color="$(ui_mode_color "${mode}")"
   ui_clear_screen
-  printf '%s[%s]%s %sssl-proxy domain manager%s\n' "${mode_color}" "$(shell_prompt_label "${mode}")" "${COLOR_RESET}" "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+  printf '%s[%s]%s %sssl-service domain manager%s\n' "${mode_color}" "$(shell_prompt_label "${mode}")" "${COLOR_RESET}" "${COLOR_BOLD}" "${COLOR_RESET}" >&2
   printf '%shost:%s %s  %smode:%s %s  %sconfig:%s %s\n' \
     "${COLOR_DIM}" "${COLOR_RESET}" "${HOSTNAME%%.*}" \
     "${COLOR_DIM}" "${COLOR_RESET}" "${mode}" \
@@ -210,17 +213,17 @@ ui_print_header() {
 
 ui_print_dashboard_summary() {
   local mode="$1"
-  local controller_status caddy_status root_state
-  controller_status="$(service_state_summary ssl-proxy-controller.service)"
-  caddy_status="$(service_state_summary caddy.service)"
+  local runtime_status proxy_status root_state
+  runtime_status="$(service_state_summary ssl-service)"
+  proxy_status="${runtime_status}"
   root_state="no"
   [[ "${EUID}" -eq 0 ]] && root_state="yes"
 
   printf '%sCurrent State%s\n' "${COLOR_BOLD}" "${COLOR_RESET}" >&2
-  printf '  mode=%s%s%s  controller=%s  caddy=%s  root=%s\n' \
+  printf '  mode=%s%s%s  container=%s  proxy=%s  root=%s\n' \
     "$(ui_mode_color "${mode}")" "${mode}" "${COLOR_RESET}" \
-    "${controller_status}" \
-    "${caddy_status}" \
+    "${runtime_status}" \
+    "${proxy_status}" \
     "${root_state}" >&2
   if [[ -n "${LAST_DOMAIN}" || -n "${LAST_UPSTREAM}" || -n "${LAST_ZONE_TARGET}" ]]; then
     printf '  context:' >&2
@@ -444,7 +447,7 @@ ui_menu_pick_yes_no() {
   fi
   while true; do
     ui_clear_screen
-    printf '%s[%s]%s %sssl-proxy domain manager%s\n' "$(ui_mode_color "$(get_config_mode)")" "$(shell_prompt_label "$(get_config_mode)")" "${COLOR_RESET}" "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+    printf '%s[%s]%s %sssl-service domain manager%s\n' "$(ui_mode_color "$(get_config_mode)")" "$(shell_prompt_label "$(get_config_mode)")" "${COLOR_RESET}" "${COLOR_BOLD}" "${COLOR_RESET}" >&2
     printf '%s%s%s\n\n' "${COLOR_BOLD}" "${title}" "${COLOR_RESET}" >&2
     if [[ "${selected}" -eq 0 ]]; then
       printf '%s%s> %s%s\n' "${COLOR_WHITE}${COLOR_BOLD}${COLOR_REVERSE}" "" "${yes_label}" "${COLOR_RESET}" >&2
@@ -676,11 +679,11 @@ bold = "\033[1m"
 reset = "\033[0m"
 
 def colorize_service(value: str) -> str:
-  if value == "active":
+  if value in {"active", "running"}:
     return f"{green}{value}{reset}"
-  if value in {"inactive", "failed", "activating", "deactivating"}:
+  if value in {"inactive", "failed", "activating", "deactivating", "stopped"}:
     return f"{yellow}{value}{reset}"
-  if value in {"bus-denied", "no-systemctl"}:
+  if value in {"bus-denied", "no-systemctl", "no-service-manager", "not-installed"}:
     return f"{red}{value}{reset}"
   return value or f"{red}(empty){reset}"
 
@@ -689,8 +692,8 @@ mode_color = red if mode == "readwrite" else blue if mode == "readonly" else yel
 print(f"{bold}Node Overview{reset}")
 print(f"  mode: {mode_color}{mode or '(unknown)'}{reset}")
 print(f"  config_path: {rows.get('config_path', '') or '(missing)'}")
-print(f"  controller_status: {colorize_service(rows.get('controller_status', ''))}")
-print(f"  caddy_status: {colorize_service(rows.get('caddy_status', ''))}")
+print(f"  container_status: {colorize_service(rows.get('container_status', ''))}")
+print(f"  proxy_runtime: {colorize_service(rows.get('proxy_runtime', ''))}")
 print(f"  is_root: {green if rows.get('is_root') == 'yes' else yellow}{rows.get('is_root', '(unknown)')}{reset}")
 print(f"  last_domain: {rows.get('last_domain', '') or '-'}")
 print(f"  last_upstream: {rows.get('last_upstream', '') or '-'}")
@@ -870,14 +873,34 @@ ui_run_capture_pretty() {
 }
 
 service_state_summary() {
-  local service="$1"
+  local _service="${1:-ssl-service}"
   local output status
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 && [[ -f "${COMPOSE_PATH}" ]]; then
+    set +e
+    output="$(docker compose -f "${COMPOSE_PATH}" ps --status running --services 2>/dev/null)"
+    status=$?
+    set -e
+    if [[ "${status}" -eq 0 ]] && printf '%s\n' "${output}" | grep -Fxq "ssl-service"; then
+      printf '%s' "running"
+      return 0
+    fi
+    set +e
+    output="$(docker compose -f "${COMPOSE_PATH}" ps --services 2>/dev/null)"
+    status=$?
+    set -e
+    if [[ "${status}" -eq 0 ]] && printf '%s\n' "${output}" | grep -Fxq "ssl-service"; then
+      printf '%s' "stopped"
+      return 0
+    fi
+    printf '%s' "not-installed"
+    return 0
+  fi
   if ! command -v systemctl >/dev/null 2>&1; then
-    printf '%s' "no-systemctl"
+    printf '%s' "no-service-manager"
     return 0
   fi
   set +e
-  output="$(systemctl is-active "${service}" 2>&1)"
+  output="$(systemctl is-active "${_service}" 2>&1)"
   status=$?
   set -e
   output="$(ui_trim "${output}")"
@@ -1039,19 +1062,19 @@ interactive_sync_now() {
 }
 
 node_overview_command() {
-  local mode config_path controller_status caddy_status python_bin
+  local mode config_path runtime_status proxy_status python_bin
   mode="$(get_config_mode)"
   config_path="$(resolve_config_path)"
   python_bin="$(resolve_python)"
-  controller_status="$(service_state_summary ssl-proxy-controller.service)"
-  caddy_status="$(service_state_summary caddy.service)"
+  runtime_status="$(service_state_summary ssl-service)"
+  proxy_status="$(service_state_summary ssl-service)"
   "${python_bin}" - <<PY
 from __future__ import annotations
 
 mode = ${mode@Q}
 config_path = ${config_path@Q}
-controller_status = ${controller_status@Q}
-caddy_status = ${caddy_status@Q}
+runtime_status = ${runtime_status@Q}
+proxy_status = ${proxy_status@Q}
 last_domain = ${LAST_DOMAIN@Q}
 last_upstream = ${LAST_UPSTREAM@Q}
 last_zone_target = ${LAST_ZONE_TARGET@Q}
@@ -1059,8 +1082,8 @@ is_root = ${EUID}
 
 print(f"mode: {mode}")
 print(f"config_path: {config_path}")
-print(f"controller_status: {controller_status}")
-print(f"caddy_status: {caddy_status}")
+print(f"container_status: {runtime_status}")
+print(f"proxy_runtime: {proxy_status}")
 print(f"is_root: {'yes' if is_root == 0 else 'no'}")
 print(f"last_domain: {last_domain}")
 print(f"last_upstream: {last_upstream}")
@@ -1173,12 +1196,28 @@ resolve_config_path() {
 }
 
 resolve_python() {
+  if [[ -x "${DEPLOY_DIR}/.tools-venv/bin/python" ]]; then
+    printf '%s' "${DEPLOY_DIR}/.tools-venv/bin/python"
+    return 0
+  fi
   if [[ -x "${DEPLOY_DIR}/.venv/bin/python" ]]; then
     printf '%s' "${DEPLOY_DIR}/.venv/bin/python"
     return 0
   fi
+  if [[ -x "${REPO_DIR}/.tools-venv/bin/python" ]]; then
+    printf '%s' "${REPO_DIR}/.tools-venv/bin/python"
+    return 0
+  fi
   if [[ -x "${REPO_DIR}/.venv/bin/python" ]]; then
     printf '%s' "${REPO_DIR}/.venv/bin/python"
+    return 0
+  fi
+  if [[ -x "${LEGACY_DEPLOY_DIR}/.tools-venv/bin/python" ]]; then
+    printf '%s' "${LEGACY_DEPLOY_DIR}/.tools-venv/bin/python"
+    return 0
+  fi
+  if [[ -x "${LEGACY_DEPLOY_DIR}/.venv/bin/python" ]]; then
+    printf '%s' "${LEGACY_DEPLOY_DIR}/.venv/bin/python"
     return 0
   fi
   command -v python3 >/dev/null 2>&1 || fail "python3 is required"
@@ -1406,7 +1445,7 @@ def main(argv: list[str]) -> int:
   dsn = load_dsn(os.environ["SSL_PROXY_CONFIG"])
 
   try:
-    with psycopg.connect(dsn, row_factory=dict_row, sslmode="require") as conn:
+    with psycopg.connect(dsn, row_factory=dict_row) as conn:
       with conn.cursor() as cur:
         cur.execute(
           """
@@ -1493,7 +1532,7 @@ def main(argv: list[str]) -> int:
   dsn = load_dsn(os.environ["SSL_PROXY_CONFIG"])
 
   try:
-    with psycopg.connect(dsn, row_factory=dict_row, sslmode="require") as conn:
+    with psycopg.connect(dsn, row_factory=dict_row) as conn:
       with conn.cursor() as cur:
         cur.execute(
           """
@@ -1569,7 +1608,7 @@ def main(argv: list[str]) -> int:
     print(json.dumps({"present": False, "zone_name": "", "provider": "", "error": ""}))
     return 0
   try:
-    with psycopg.connect(dsn, row_factory=dict_row, sslmode="require") as conn:
+    with psycopg.connect(dsn, row_factory=dict_row) as conn:
       with conn.cursor() as cur:
         cur.execute(
           """
@@ -1865,8 +1904,9 @@ logs_command() {
   [[ $# -ge 1 ]] || fail "domain is required"
   local domain
   domain="$(normalize_domain "$1")"
-  command -v journalctl >/dev/null 2>&1 || fail "journalctl is required"
-  journalctl -u ssl-proxy-controller.service -u caddy.service -n 300 --no-pager | grep -F "${domain}" || true
+  command -v docker >/dev/null 2>&1 || fail "docker is required"
+  [[ -f "${COMPOSE_PATH}" ]] || fail "compose file not found: ${COMPOSE_PATH}"
+  docker compose -f "${COMPOSE_PATH}" logs --tail 300 ssl-service | grep -F "${domain}" || true
 }
 
 run_db_tool() {
@@ -2073,7 +2113,7 @@ def main(argv: list[str]) -> int:
   dsn = load_dsn(config_path=os.environ["SSL_PROXY_CONFIG"])
 
   try:
-    with psycopg.connect(dsn, row_factory=dict_row, sslmode="require") as conn:
+    with psycopg.connect(dsn, row_factory=dict_row) as conn:
       with conn.cursor() as cur:
         if subcommand == "list":
           cur.execute(
@@ -2365,21 +2405,22 @@ PY
 }
 
 sync_now() {
-  command -v systemctl >/dev/null 2>&1 || fail "systemctl is required for sync-now"
+  command -v docker >/dev/null 2>&1 || fail "docker is required for sync-now"
   [[ "${EUID}" -eq 0 ]] || fail "sync-now requires root"
-  systemctl restart ssl-proxy-controller.service
-  log "controller restarted"
+  [[ -f "${COMPOSE_PATH}" ]] || fail "compose file not found: ${COMPOSE_PATH}"
+  docker compose -f "${COMPOSE_PATH}" restart ssl-service >/dev/null
+  log "container restarted"
 }
 
 preflight_sync_now() {
-  command -v systemctl >/dev/null 2>&1 || fail "systemctl is required for sync-now"
+  command -v docker >/dev/null 2>&1 || fail "docker is required for sync-now"
   [[ "${EUID}" -eq 0 ]] || fail "sync-now requires root"
+  [[ -f "${COMPOSE_PATH}" ]] || fail "compose file not found: ${COMPOSE_PATH}"
 }
 
 main() {
   local subcommand="${1:-}"
   local sync_flag=0
-  local force_flag=0
   if [[ -z "${subcommand}" ]]; then
     if ui_has_tty; then
       interactive_menu
@@ -2395,14 +2436,6 @@ main() {
       --sync-now)
         sync_flag=1
         set -- "${@:1:$(($#-1))}"
-        ;;
-      --force)
-        if [[ "${subcommand}" == "issue-now" ]]; then
-          force_flag=1
-          set -- "${@:1:$(($#-1))}"
-        else
-          break
-        fi
         ;;
       *)
         break
@@ -2476,18 +2509,6 @@ main() {
         preflight_sync_now
       fi
       run_db_tool set-target "${normalized_domain}" "$2"
-      if [[ "${sync_flag}" -eq 1 ]]; then
-        sync_now
-      fi
-      ;;
-    clear-target|clear-port)
-      [[ $# -ge 1 ]] || fail "domain is required"
-      local normalized_domain
-      normalized_domain="$(normalize_domain "$1")"
-      if [[ "${sync_flag}" -eq 1 ]]; then
-        preflight_sync_now
-      fi
-      run_db_tool clear-target "${normalized_domain}"
       if [[ "${sync_flag}" -eq 1 ]]; then
         sync_now
       fi

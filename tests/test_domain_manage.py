@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 
 
-ROOT = Path("/root/ssl-server")
+ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "domain-manage.sh"
 
 
@@ -189,7 +189,7 @@ def test_help_succeeds(tmp_path: Path) -> None:
   assert result.stderr == ""
   assert f"{SCRIPT.name} list" in result.stdout
   assert "list-zones" in result.stdout
-  assert "issue-now <domain> [--force]" in result.stdout
+  assert "issue-now <domain>" in result.stdout
   assert "check <domain>" in result.stdout
   assert "set-target <domain> <upstream_target>" in result.stdout
 
@@ -212,7 +212,7 @@ def test_help_uses_invoked_program_name(tmp_path: Path) -> None:
   assert "domain-manage.sh list" not in result.stdout
 
 
-def test_ssl_proxy_domain_help_proxies_to_domain_script(tmp_path: Path) -> None:
+def test_ssl_service_domain_help_proxies_to_domain_script(tmp_path: Path) -> None:
   setup_script = ROOT / "scripts" / "setup.sh"
   env = base_env(tmp_path)
 
@@ -225,9 +225,9 @@ def test_ssl_proxy_domain_help_proxies_to_domain_script(tmp_path: Path) -> None:
 
   assert result.returncode == 0
   assert result.stderr == ""
-  assert "ssl-proxy domain list" in result.stdout
+  assert "ssl-service domain list" in result.stdout
   assert "domain-manage.sh list" not in result.stdout
-  assert "issue-now <domain> [--force]" in result.stdout
+  assert "issue-now <domain>" in result.stdout
 
 
 def test_no_args_without_tty_shows_usage_and_exits_nonzero(tmp_path: Path) -> None:

@@ -259,6 +259,38 @@ def test_sync_local_certificates_removes_stale_dir_when_record_has_no_material(t
   assert not stale_dir.exists()
 
 
+def test_sync_local_certificates_keeps_existing_material_when_status_is_error(tmp_path: Path) -> None:
+  controller = Controller(make_config(tmp_path))
+  controller.ensure_directories()
+  domain_dir = controller.certs_dir / "error.example.com"
+  domain_dir.mkdir(parents=True)
+  (domain_dir / "fullchain.pem").write_text("old-fullchain")
+  (domain_dir / "privkey.pem").write_text("old-privkey")
+  now = datetime.now(tz=UTC)
+
+  changed = controller._sync_local_certificates(
+    {
+      "error.example.com": CertificateRecord(
+        domain="error.example.com",
+        fullchain_pem="old-fullchain",
+        private_key_pem="old-privkey",
+        not_before=now,
+        not_after=now,
+        version=3,
+        status="error",
+        source="certbot",
+        retry_after=now,
+        updated_at=now,
+        last_error="boom",
+      )
+    }
+  )
+
+  assert changed is False
+  assert (domain_dir / "fullchain.pem").read_text() == "old-fullchain"
+  assert (domain_dir / "privkey.pem").read_text() == "old-privkey"
+
+
 def test_write_caddyfile_detects_unchanged_hash(tmp_path: Path) -> None:
   controller = Controller(make_config(tmp_path))
   controller.ensure_directories()

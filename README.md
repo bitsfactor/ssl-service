@@ -1,132 +1,103 @@
-# ssl-server
+# ssl-service
 
-A front proxy service that:
+A Dockerized front proxy service that:
 
 - listens on `80/443`
 - routes traffic by domain
 - manages HTTPS certificates automatically
 
-## Install
+## Production Install
 
-One-command install on a fresh Linux server:
+Run the standalone installer as `root` after downloading `setup.sh` to the current directory:
 
 ```bash
-git clone git@github.com:leoleoaabbcc/ssl-server.git && cd ssl-server && bash scripts/setup.sh install
+bash ./setup.sh
 ```
 
-If you prefer to clone the repo first:
+Or download only the installer:
 
 ```bash
-bash scripts/setup.sh install
+curl -fsSL -o setup.sh https://github.com/leoleoaabbcc/ssl-service/raw/main/scripts/setup.sh && bash setup.sh
 ```
 
-The installer will ask for:
+Production behavior:
 
-- mode: `readonly` or `readwrite`
-- PostgreSQL DSN
-- ACME email for `readwrite`
+- installs runtime files under `/root/.ssl-service`
+- installs Docker automatically if missing
+- runs the service with `docker compose`
+- adds one shell shortcut in `/root/.bashrc`: `ssl-service`
+- does not require cloning the repository on the target server
 
-If you are already logged in as `root`, do not prepend `sudo`.
-Interactive menus use Up/Down arrows and Enter.
+The first screen detects current state and lets you choose:
 
-For `readonly`, the installer does not prompt for ACME email and uses `domain@bitsfactor.com`.
+- install or overwrite runtime
+- change database or mode
+- show status
+- view logs
+- restart
+- update
+- uninstall
 
-Mode summary:
+`readonly` does not ask for ACME email and uses `domain@bitsfactor.com`.
 
-- `readonly`: reads routes and certificates from PostgreSQL, does not issue certificates
-- `readwrite`: issues and renews certificates, then writes them back to PostgreSQL
+## Production Runtime Layout
 
-After install, these commands are available:
+Main files after install:
 
-- `ssl-proxy`
+- `/root/.ssl-service/config/config.yaml`
+- `/root/.ssl-service/compose.yaml`
+- `/root/.ssl-service/acme/`
+- `/root/.ssl-service/state/`
+- `/root/.ssl-service/state/certs/`
+- `/root/.ssl-service/state/generated/Caddyfile`
+- `/root/.ssl-service/logs/`
+- `/root/.ssl-service/bin/setup.sh`
+- `/root/.ssl-service/bin/domain-manage.sh`
 
-## Add Your First Domain
+## Production Commands
 
-First, update DNS:
-
-- make sure the domain is hosted in Cloudflare DNS
-- create or confirm a Cloudflare API token for the parent zone
-- the domain does not need to point to this node before certificate issuance
-
-Example: route `api.example.com` to local port `6111`
+After opening a new shell or running `source /root/.bashrc`:
 
 ```bash
-sudo ssl-proxy domain add api.example.com 6111 --sync-now
-sudo ssl-proxy domain issue-now api.example.com
+ssl-service
+ssl-service start
+ssl-service stop
+ssl-service reconfigure
+ssl-service status
+ssl-service logs
+ssl-service restart
+ssl-service update
+ssl-service uninstall --yes
 ```
 
-Route to another server:
+Domain management stays under the single global entrypoint:
 
 ```bash
-sudo ssl-proxy domain add api.example.com 10.0.0.25:8080 --sync-now
-sudo ssl-proxy domain issue-now api.example.com
+ssl-service domain list
+ssl-service domain status api.example.com
+ssl-service domain add api.example.com 6111 --sync-now
+ssl-service domain issue-now api.example.com
 ```
 
-Certificate only, no backend yet:
+## Development Mode
+
+Development is separate from production install. Use `setup-dev.sh` only inside the source tree:
 
 ```bash
-sudo ssl-proxy domain add api.example.com --sync-now
-sudo ssl-proxy domain issue-now api.example.com
-```
-
-Optional pre-check:
-
-```bash
-ssl-proxy domain check api.example.com
-ssl-proxy domain status api.example.com
-```
-
-## Check The Result
-
-Check domain status:
-
-```bash
-ssl-proxy domain status api.example.com
-```
-
-Check service status:
-
-```bash
-sudo ssl-proxy status
-```
-
-Test HTTPS:
-
-```bash
-curl -I https://api.example.com
-```
-
-## Common Commands
-
-Service management:
-
-```bash
-sudo ssl-proxy start
-sudo ssl-proxy stop
-sudo ssl-proxy restart
-sudo ssl-proxy status
-sudo ssl-proxy logs
-sudo ssl-proxy update
-sudo ssl-proxy uninstall
-```
-
-Domain management:
-
-```bash
-ssl-proxy domain list
-ssl-proxy domain get <domain>
-ssl-proxy domain status <domain>
-ssl-proxy domain check <domain>
-ssl-proxy domain logs <domain>
-sudo ssl-proxy domain add <domain> [target] --sync-now
-sudo ssl-proxy domain set-target <domain> <target> --sync-now
-sudo ssl-proxy domain clear-target <domain> --sync-now
-sudo ssl-proxy domain issue-now <domain>
-sudo ssl-proxy domain sync-now
+bash scripts/setup-dev.sh bootstrap
+bash scripts/setup-dev.sh test
+bash scripts/setup-dev.sh run-once --config config.yaml
 ```
 
 ## Notes
 
 - wildcard certificates such as `*.example.com` are not supported
 - supported upstream formats: `6111`, `127.0.0.1:6111`, `10.0.0.25:6111`, `backend.internal:6111`, `[2001:db8::10]:6111`
-- config file: `/etc/ssl-proxy/config.yaml`
+- production config file: `/root/.ssl-service/config/config.yaml`
+- in `readwrite` mode, `install`, `reconfigure`, and `update` will create or migrate the service schema objects in the target PostgreSQL schema
+- `ssl-service domain delete <domain>` deletes that domain from `routes`
+- `ssl-service domain purge <domain>` deletes that domain from both `routes` and `certificates`
+- local certificate cache is stored under `/root/.ssl-service/state/certs/`
+- Certbot ACME state is stored under `/root/.ssl-service/acme/`
+- if the database becomes temporarily unavailable after startup, existing locally cached certificates and the last generated Caddy config can usually keep current HTTPS traffic running
+- if the database is unavailable, new route sync, certificate renewal, and first-time bootstrap will be affected
