@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "setup.sh"
 INSTALL_SCRIPT = ROOT / "scripts" / "install.sh"
 DEV_SCRIPT = ROOT / "scripts" / "setup-dev.sh"
+PYPROJECT = ROOT / "pyproject.toml"
 
 
 def base_env(tmp_path: Path) -> dict[str, str]:
@@ -93,6 +94,19 @@ def test_install_requires_acme_email_for_readwrite_without_tty(tmp_path: Path) -
   assert "--acme-email is required for readwrite install without a TTY" in result.stderr
 
 
+def test_uninstall_requires_tty_or_yes_without_tty(tmp_path: Path) -> None:
+  result = subprocess.run(
+    ["bash", str(SCRIPT), "uninstall"],
+    text=True,
+    capture_output=True,
+    stdin=subprocess.DEVNULL,
+    env=base_env(tmp_path),
+  )
+
+  assert result.returncode != 0
+  assert "uninstall requires a TTY or --yes" in result.stderr
+
+
 def test_setup_dev_help_mentions_bootstrap(tmp_path: Path) -> None:
   result = subprocess.run(
     ["bash", str(DEV_SCRIPT), "help"],
@@ -107,12 +121,27 @@ def test_setup_dev_help_mentions_bootstrap(tmp_path: Path) -> None:
   assert "source tree" in result.stdout
 
 
+def test_setup_dev_bootstrap_installs_test_extras() -> None:
+  content = DEV_SCRIPT.read_text()
+
+  assert 'install -e "${REPO_DIR}[test]"' in content
+
+
+def test_project_metadata_uses_ssl_service_name() -> None:
+  content = PYPROJECT.read_text()
+
+  assert 'name = "ssl-service"' in content
+
+
 def test_update_stops_and_cleans_legacy_runtime() -> None:
   content = SCRIPT.read_text()
 
   update_block = content.split("update_command() {", 1)[1].split("\n}\n\nuninstall_command()", 1)[0]
   assert "stop_legacy_runtime" in update_block
   assert "remove_legacy_runtime" in update_block
+  assert 'rm -f /etc/profile.d/ssl-proxy-shell.sh' in content
+  assert 'for legacy_unit in caddy.service ssl-proxy-controller.service ssl-proxy-update.timer; do' in content
+  assert 'for legacy_unit in caddy.service ssl-proxy-controller.service ssl-proxy-update.service ssl-proxy-update.timer; do' in content
 
 
 def test_runtime_control_commands_require_root() -> None:
@@ -136,3 +165,19 @@ def test_external_setup_without_source_tree_can_auto_update_existing_runtime() -
 
   assert 'should_auto_update_from_external_setup' in content
   assert 'Existing installation detected. Updating runtime from this setup.sh.' in content
+
+
+def test_interactive_input_uses_dev_tty_and_safe_clear() -> None:
+  content = SCRIPT.read_text()
+
+  assert "[[ -t 2 ]] || return 1" in content
+  assert "[[ -t 2 && -r /dev/tty ]]" in content
+  assert "read -rsn1 key < /dev/tty" in content
+  assert "printf '\\033[H\\033[2J' > /dev/tty" in content
+
+
+def test_uninstall_requires_tty_or_yes_without_prompting_on_dev_tty() -> None:
+  content = SCRIPT.read_text()
+
+  uninstall_block = content.split("uninstall_command() {", 1)[1].split("\n}\n\ndomain_command()", 1)[0]
+  assert 'ui_has_tty || fail "uninstall requires a TTY or --yes"' in uninstall_block

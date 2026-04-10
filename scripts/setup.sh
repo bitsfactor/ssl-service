@@ -38,7 +38,7 @@ STATE_MENU_LABELS=(
 )
 
 ui_supports_color() {
-  [[ -t 1 ]] || return 1
+  [[ -t 2 ]] || return 1
   [[ "${TERM:-}" != "dumb" ]] || return 1
   return 0
 }
@@ -100,12 +100,12 @@ EOF
 }
 
 ui_has_tty() {
-  [[ -t 0 && -t 1 ]]
+  [[ -t 2 && -r /dev/tty ]]
 }
 
 ui_clear_screen() {
-  if [[ -t 1 ]]; then
-    printf '\033c' >&2
+  if ui_has_tty; then
+    printf '\033[H\033[2J' > /dev/tty
   fi
 }
 
@@ -118,12 +118,12 @@ ui_trim() {
 
 ui_read_key() {
   local key
-  IFS= read -rsn1 key || return 1
+  IFS= read -rsn1 key < /dev/tty || return 1
   if [[ "${key}" == $'\x1b' ]]; then
     local next rest
-    IFS= read -rsn1 -t 0.05 next || true
+    IFS= read -rsn1 -t 0.05 next < /dev/tty || true
     if [[ "${next}" == "[" ]]; then
-      IFS= read -rsn1 -t 0.05 rest || true
+      IFS= read -rsn1 -t 0.05 rest < /dev/tty || true
       key+="${next}${rest}"
     else
       key+="${next}"
@@ -194,13 +194,13 @@ ui_yes_no() {
 
   local answer
   if [[ "${default_answer}" == "yes" ]]; then
-    read -r -p "${prompt} [Y/n]: " answer || return 1
+    read -r -p "${prompt} [Y/n]: " answer < /dev/tty || return 1
     answer="$(ui_trim "${answer}")"
     [[ -z "${answer}" || "${answer}" == "y" || "${answer}" == "Y" ]]
     return $?
   fi
 
-  read -r -p "${prompt} [y/N]: " answer || return 1
+  read -r -p "${prompt} [y/N]: " answer < /dev/tty || return 1
   answer="$(ui_trim "${answer}")"
   [[ "${answer}" == "y" || "${answer}" == "Y" ]]
 }
@@ -209,7 +209,7 @@ ui_pause() {
   ui_has_tty || return 0
   printf '\n%sPress Enter to return to the menu...%s' "${COLOR_DIM}" "${COLOR_RESET}"
   local _
-  read -r _
+  read -r _ < /dev/tty
 }
 
 is_managed_setup_invocation() {
@@ -235,7 +235,7 @@ prompt_required() {
   local prompt="$1"
   local value
   while true; do
-    read -r -p "${prompt}: " value || fail "input cancelled for: ${prompt}"
+    read -r -p "${prompt}: " value < /dev/tty || fail "input cancelled for: ${prompt}"
     value="$(ui_trim "${value}")"
     if [[ -n "${value}" ]]; then
       printf '%s' "${value}"
@@ -249,7 +249,7 @@ prompt_with_default() {
   local prompt="$1"
   local default_value="$2"
   local value
-  read -r -p "${prompt} [${default_value}]: " value || fail "input cancelled for: ${prompt}"
+  read -r -p "${prompt} [${default_value}]: " value < /dev/tty || fail "input cancelled for: ${prompt}"
   value="$(ui_trim "${value}")"
   if [[ -z "${value}" ]]; then
     value="${default_value}"
@@ -273,7 +273,7 @@ select_mode() {
 
   local value
   while true; do
-    read -r -p "Select mode (readonly/readwrite) [readonly]: " value || fail "input cancelled for mode selection"
+    read -r -p "Select mode (readonly/readwrite) [readonly]: " value < /dev/tty || fail "input cancelled for mode selection"
     value="$(ui_trim "${value:-readonly}")"
     case "${value}" in
       readonly|readwrite)
@@ -894,6 +894,7 @@ restart_runtime() {
 remove_legacy_runtime() {
   rm -rf /opt/ssl-proxy /etc/ssl-proxy /var/lib/ssl-proxy /var/log/ssl-proxy
   rm -f /usr/local/bin/ssl-proxy /usr/local/bin/domain-manage
+  rm -f /etc/profile.d/ssl-proxy-shell.sh
   if [[ -f /etc/systemd/system/caddy.service ]] && grep -Fq "/var/lib/ssl-proxy/generated/Caddyfile" /etc/systemd/system/caddy.service; then
     rm -f /etc/systemd/system/caddy.service
   fi
@@ -907,11 +908,17 @@ remove_legacy_runtime() {
     rm -f /etc/systemd/system/ssl-proxy-update.timer
   fi
   systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl reset-failed caddy.service ssl-proxy-controller.service ssl-proxy-update.service ssl-proxy-update.timer >/dev/null 2>&1 || true
+  local legacy_unit
+  for legacy_unit in caddy.service ssl-proxy-controller.service ssl-proxy-update.service ssl-proxy-update.timer; do
+    systemctl reset-failed "${legacy_unit}" >/dev/null 2>&1 || true
+  done
 }
 
 stop_legacy_runtime() {
-  systemctl disable --now caddy.service ssl-proxy-controller.service ssl-proxy-update.timer >/dev/null 2>&1 || true
+  local legacy_unit
+  for legacy_unit in caddy.service ssl-proxy-controller.service ssl-proxy-update.timer; do
+    systemctl disable --now "${legacy_unit}" >/dev/null 2>&1 || true
+  done
 }
 
 perform_install() {
@@ -1117,6 +1124,7 @@ uninstall_command() {
   done
 
   if [[ "${yes}" -ne 1 ]]; then
+    ui_has_tty || fail "uninstall requires a TTY or --yes"
     ui_yes_no "Proceed with uninstall?" "no" || return 0
   fi
 

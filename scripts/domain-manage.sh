@@ -65,7 +65,7 @@ DOMAIN_MENU_LABELS=(
 )
 
 ui_supports_color() {
-  [[ -t 1 ]] || return 1
+  [[ -t 2 ]] || return 1
   [[ "${TERM:-}" != "dumb" ]] || return 1
   return 0
 }
@@ -193,8 +193,8 @@ ui_mode_color() {
 }
 
 ui_clear_screen() {
-  if [[ -t 1 ]]; then
-    printf '\033c' >&2
+  if ui_has_tty; then
+    printf '\033[H\033[2J' > /dev/tty
   fi
 }
 
@@ -310,21 +310,21 @@ ui_target_banner() {
 ui_pause() {
   [[ "${UI_INTERACTIVE}" -eq 1 ]] || return 0
   printf '\n'
-  read -r -p "Press Enter to continue..." _
+  read -r -p "Press Enter to continue..." _ < /dev/tty
 }
 
 ui_has_tty() {
-  [[ -t 0 && -t 1 ]]
+  [[ -t 2 && -r /dev/tty ]]
 }
 
 ui_read_key() {
   local key
-  IFS= read -rsn1 key || return 1
+  IFS= read -rsn1 key < /dev/tty || return 1
   if [[ "${key}" == $'\x1b' ]]; then
     local next rest
-    IFS= read -rsn1 -t 0.05 next || true
+    IFS= read -rsn1 -t 0.05 next < /dev/tty || true
     if [[ "${next}" == "[" ]]; then
-      IFS= read -rsn1 -t 0.05 rest || true
+      IFS= read -rsn1 -t 0.05 rest < /dev/tty || true
       key+="${next}${rest}"
     else
       key+="${next}"
@@ -397,12 +397,12 @@ ui_prompt() {
   local default_value="${2:-}"
   local value
   if [[ -n "${default_value}" ]]; then
-    read -r -p "${prompt} [${default_value}]: " value || return 1
+    read -r -p "${prompt} [${default_value}]: " value < /dev/tty || return 1
     if [[ -z "${value}" ]]; then
       value="${default_value}"
     fi
   else
-    read -r -p "${prompt}: " value || return 1
+    read -r -p "${prompt}: " value < /dev/tty || return 1
   fi
   ui_trim "${value}"
 }
@@ -412,13 +412,13 @@ ui_prompt_optional() {
   local default_value="${2:-}"
   local value
   if [[ -n "${default_value}" ]]; then
-    read -r -p "${prompt} [${default_value}] (blank to clear): " value || return 1
+    read -r -p "${prompt} [${default_value}] (blank to clear): " value < /dev/tty || return 1
     if [[ -z "${value}" ]]; then
       printf '%s' ""
       return 0
     fi
   else
-    read -r -p "${prompt} (blank to leave empty): " value || return 1
+    read -r -p "${prompt} (blank to leave empty): " value < /dev/tty || return 1
   fi
   ui_trim "${value}"
 }
@@ -432,7 +432,7 @@ ui_confirm() {
     return $?
   fi
   local answer
-  read -r -p "${prompt} [y/N]: " answer || return 1
+  read -r -p "${prompt} [y/N]: " answer < /dev/tty || return 1
   [[ "${answer}" == "y" || "${answer}" == "Y" ]]
 }
 
@@ -477,7 +477,7 @@ ui_confirm_exact() {
   local prompt="$1"
   local expected="$2"
   local answer
-  read -r -p "${prompt} [type '${expected}']: " answer || return 1
+  read -r -p "${prompt} [type '${expected}']: " answer < /dev/tty || return 1
   [[ "$(ui_trim "${answer}")" == "${expected}" ]]
 }
 
@@ -1265,7 +1265,7 @@ ensure_zone_token_for_domain() {
   fi
 
   while true; do
-    if ! read -r -s -p "Cloudflare API token for zone managing ${domain}: " token; then
+    if ! read -r -s -p "Cloudflare API token for zone managing ${domain}: " token < /dev/tty; then
       printf '\n'
       ui_warn "token entry cancelled"
       return 1

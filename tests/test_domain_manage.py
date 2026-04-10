@@ -259,6 +259,15 @@ def test_issue_now_accepts_mixed_case_readwrite_mode(tmp_path: Path) -> None:
   assert "invalid domain label" in result.stderr
 
 
+def test_interactive_paths_use_dev_tty_and_safe_clear() -> None:
+  content = SCRIPT.read_text()
+
+  assert "[[ -t 2 ]] || return 1" in content
+  assert "[[ -t 2 && -r /dev/tty ]]" in content
+  assert "printf '\\033[H\\033[2J' > /dev/tty" in content
+  assert 'read -r -s -p "Cloudflare API token for zone managing ${domain}: " token < /dev/tty' in content
+
+
 def test_get_reports_clean_database_error_without_traceback(tmp_path: Path) -> None:
   result = run_script(["get", "example.com"], env=env_with_dsn(tmp_path, "postgresql://invalid.invalid/postgres"))
 
