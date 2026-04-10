@@ -16,6 +16,7 @@ def base_env(tmp_path: Path) -> dict[str, str]:
   env = os.environ.copy()
   env["SSL_SERVICE_INSTALL_ROOT"] = str(tmp_path / ".ssl-service")
   env["SSL_SERVICE_BASHRC_PATH"] = str(tmp_path / ".bashrc")
+  env["SSL_SERVICE_GLOBAL_COMMAND_PATH"] = str(tmp_path / "ssl-service")
   if TEST_VENV_BIN.exists():
     env["PATH"] = f"{TEST_VENV_BIN}:{env['PATH']}"
   return env
@@ -122,8 +123,9 @@ def test_setup_menu_renders_and_exit_can_be_selected_in_tty(tmp_path: Path) -> N
   try:
     child.expect("ssl-service control")
     child.expect("Install or overwrite runtime")
+    child.expect("Manage domains and routes")
     child.expect("Exit")
-    for _ in range(8):
+    for _ in range(9):
       child.send("\x1b[B")
     child.send("\r")
     child.expect(pexpect.EOF)
@@ -168,7 +170,7 @@ def test_setup_uninstall_confirmation_can_cancel_and_return_to_menu(tmp_path: Pa
   try:
     child.expect("ssl-service control")
     child.expect("Uninstall runtime")
-    for _ in range(7):
+    for _ in range(8):
       child.send("\x1b[B")
     child.send("\r")
     child.expect("Proceed with uninstall\\?")
@@ -179,6 +181,33 @@ def test_setup_uninstall_confirmation_can_cancel_and_return_to_menu(tmp_path: Pa
     child.send("\r")
     child.expect("ssl-service control")
     child.send("\r")
+    child.expect(pexpect.EOF)
+  finally:
+    child.close()
+  assert child.exitstatus == 0
+
+
+def test_setup_domain_entry_opens_domain_manager_and_can_exit(tmp_path: Path) -> None:
+  child = pexpect.spawn(
+    "/bin/bash",
+    [str(SETUP_SCRIPT)],
+    env=setup_domain_env(tmp_path),
+    encoding="utf-8",
+    timeout=10,
+  )
+  try:
+    child.expect("ssl-service control")
+    child.expect("Manage domains and routes")
+    for _ in range(3):
+      child.send("\x1b[B")
+    child.send("\r")
+    child.expect("ssl-service domain manager")
+    child.expect("Node overview")
+    move_to_exit(child, count=20)
+    child.expect("Press Enter to return to the menu")
+    child.send("\r")
+    child.expect("ssl-service control")
+    move_to_exit(child, count=9)
     child.expect(pexpect.EOF)
   finally:
     child.close()

@@ -57,7 +57,7 @@ class Database:
           """
           SELECT
             domain,
-            COALESCE(upstream_target, CASE WHEN upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || upstream_port::text END) AS upstream_target,
+            COALESCE(upstream_target, CASE WHEN upstream_port IS NULL THEN NULL ELSE 'host.docker.internal:' || upstream_port::text END) AS upstream_target,
             enabled,
             updated_at
           FROM routes

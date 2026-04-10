@@ -27,7 +27,7 @@ Production behavior:
 - installs runtime files under `/root/.ssl-service`
 - installs Docker automatically if missing
 - runs the service with `docker compose`
-- adds one shell shortcut in `/root/.bashrc`: `ssl-service`
+- installs one global command: `/usr/local/bin/ssl-service`
 - does not require cloning the repository on the target server
 
 The first screen detects current state and lets you choose:
@@ -35,6 +35,7 @@ The first screen detects current state and lets you choose:
 - install or overwrite runtime
 - change database or mode
 - show status
+- manage domains and routes
 - view logs
 - restart
 - update
@@ -58,7 +59,7 @@ Main files after install:
 
 ## Production Commands
 
-After opening a new shell or running `source /root/.bashrc`:
+After install:
 
 ```bash
 ssl-service

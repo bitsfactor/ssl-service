@@ -10,6 +10,8 @@ from pathlib import Path
 
 from .db import CertificateRecord, RouteRecord
 
+DOCKER_HOST_GATEWAY_NAME = "host.docker.internal"
+
 
 @dataclass(slots=True)
 class RenderResult:
@@ -57,6 +59,17 @@ def validate_upstream_target(upstream_target: str) -> str:
   if port < 1 or port > 65535:
     raise ValueError("upstream_target port must be between 1 and 65535")
   return f"{host}:{port}"
+
+
+def canonicalize_upstream_target_for_container(upstream_target: str) -> str:
+  normalized = validate_upstream_target(upstream_target)
+  if normalized.startswith("[::1]:"):
+    return f"{DOCKER_HOST_GATEWAY_NAME}:{normalized.split(':', 1)[1]}"
+
+  host, port_text = normalized.rsplit(":", 1)
+  if host in {"127.0.0.1", "localhost"}:
+    return f"{DOCKER_HOST_GATEWAY_NAME}:{port_text}"
+  return normalized
 
 
 def render_caddyfile(
@@ -108,7 +121,7 @@ def render_caddyfile(
     else:
       block.extend(
         [
-          f"\treverse_proxy {validate_upstream_target(route.upstream_target)}",
+          f"\treverse_proxy {canonicalize_upstream_target_for_container(route.upstream_target)}",
         ]
       )
     block.extend(

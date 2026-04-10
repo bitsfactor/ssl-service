@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from ssl_proxy_controller.caddy import reload_caddy, render_caddyfile, state_payload, validate_upstream_target
+from ssl_proxy_controller.caddy import (
+  canonicalize_upstream_target_for_container,
+  reload_caddy,
+  render_caddyfile,
+  state_payload,
+  validate_upstream_target,
+)
 from ssl_proxy_controller.db import CertificateRecord, RouteRecord
 
 
@@ -150,6 +156,28 @@ def test_render_caddyfile_renders_reverse_proxy_for_service_route(tmp_path: Path
   content = output.read_text()
   assert "https://example.com" in content
   assert "reverse_proxy 10.0.0.25:6111" in content
+
+
+def test_render_caddyfile_rewrites_loopback_upstream_to_docker_host_gateway(tmp_path: Path) -> None:
+  output = tmp_path / "generated" / "Caddyfile"
+  routes = [RouteRecord(domain="example.com", upstream_target="127.0.0.1:6111", enabled=True, updated_at=datetime.now(tz=UTC))]
+  certificates = {"example.com": make_certificate("example.com")}
+
+  render_caddyfile(
+    output_path=output,
+    routes=routes,
+    certificates=certificates,
+    admin_address="127.0.0.1:2019",
+  )
+
+  content = output.read_text()
+  assert "reverse_proxy host.docker.internal:6111" in content
+
+
+def test_canonicalize_upstream_target_for_container_rewrites_localhost_aliases() -> None:
+  assert canonicalize_upstream_target_for_container("127.0.0.1:6111") == "host.docker.internal:6111"
+  assert canonicalize_upstream_target_for_container("localhost:6111") == "host.docker.internal:6111"
+  assert canonicalize_upstream_target_for_container("[::1]:6111") == "host.docker.internal:6111"
 
 
 def test_render_caddyfile_renders_ipv6_upstream_target(tmp_path: Path) -> None:

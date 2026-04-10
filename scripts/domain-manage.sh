@@ -140,7 +140,8 @@ Notes:
   - 'overview' shows local node mode and service state.
   - certificate issuance uses DNS-01 with Cloudflare only.
   - upstream_target can be omitted on add, which creates a certificate-only domain.
-  - upstream_target accepts '6111', '127.0.0.1:6111', '10.0.0.25:6111', 'backend.internal:6111', or '[2001:db8::10]:6111'.
+  - upstream_target accepts '6111', '127.0.0.1:6111', 'localhost:6111', '10.0.0.25:6111', 'backend.internal:6111', or '[2001:db8::10]:6111'.
+  - plain ports and localhost-style upstreams are treated as services on the Docker host.
   - the script reads PostgreSQL DSN from /root/.ssl-service/config/config.yaml by default.
   - override config with: SSL_PROXY_CONFIG=/path/to/config.yaml
   - mutating commands accept --sync-now to force an immediate local refresh
@@ -1451,7 +1452,7 @@ def main(argv: list[str]) -> int:
           """
           SELECT
             r.domain,
-            COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || r.upstream_port::text END) AS upstream_target,
+            COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE 'host.docker.internal:' || r.upstream_port::text END) AS upstream_target,
             r.enabled,
             r.updated_at,
             c.status AS certificate_status,
@@ -1538,7 +1539,7 @@ def main(argv: list[str]) -> int:
           """
           SELECT
             r.domain,
-            COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || r.upstream_port::text END) AS upstream_target,
+            COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE 'host.docker.internal:' || r.upstream_port::text END) AS upstream_target,
             r.enabled,
             r.updated_at,
             c.status AS certificate_status,
@@ -2030,7 +2031,7 @@ def normalize_upstream_target(value: str) -> str:
     port = int(candidate)
     if port < 1 or port > 65535:
       raise SystemExit("upstream_target port must be between 1 and 65535")
-    return f"127.0.0.1:{port}"
+    return f"host.docker.internal:{port}"
 
   if candidate.startswith("["):
     if "]:" not in candidate:
@@ -2066,6 +2067,8 @@ def normalize_upstream_target(value: str) -> str:
   port = int(port_text)
   if port < 1 or port > 65535:
     raise SystemExit("upstream_target port must be between 1 and 65535")
+  if host in {"127.0.0.1", "localhost", "[::1]"}:
+    host = "host.docker.internal"
   return f"{host}:{port}"
 
 
@@ -2120,7 +2123,7 @@ def main(argv: list[str]) -> int:
             """
             SELECT
               r.domain,
-              COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || r.upstream_port::text END) AS upstream_target,
+              COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE 'host.docker.internal:' || r.upstream_port::text END) AS upstream_target,
               r.enabled,
               r.updated_at,
               c.status AS certificate_status,
@@ -2230,7 +2233,7 @@ def main(argv: list[str]) -> int:
             """
             SELECT
               r.domain,
-              COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || r.upstream_port::text END) AS upstream_target,
+              COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE 'host.docker.internal:' || r.upstream_port::text END) AS upstream_target,
               r.enabled,
               r.updated_at,
               c.status AS certificate_status,
@@ -2317,7 +2320,7 @@ def main(argv: list[str]) -> int:
             SET enabled = TRUE
             WHERE domain = %s
             RETURNING domain,
-                      COALESCE(upstream_target, CASE WHEN upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || upstream_port::text END) AS upstream_target,
+                      COALESCE(upstream_target, CASE WHEN upstream_port IS NULL THEN NULL ELSE 'host.docker.internal:' || upstream_port::text END) AS upstream_target,
                       enabled,
                       updated_at,
                       NULL::text AS certificate_status,
@@ -2339,7 +2342,7 @@ def main(argv: list[str]) -> int:
             SET enabled = FALSE
             WHERE domain = %s
             RETURNING domain,
-                      COALESCE(upstream_target, CASE WHEN upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || upstream_port::text END) AS upstream_target,
+                      COALESCE(upstream_target, CASE WHEN upstream_port IS NULL THEN NULL ELSE 'host.docker.internal:' || upstream_port::text END) AS upstream_target,
                       enabled,
                       updated_at,
                       NULL::text AS certificate_status,

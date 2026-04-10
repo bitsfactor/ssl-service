@@ -318,3 +318,25 @@ def test_set_target_accepts_remote_ip_upstream(tmp_path: Path) -> None:
   assert result.stderr == ""
   assert "domain=api.example.com" in result.stdout
   assert "upstream_target=154.17.0.51:50101" in result.stdout
+
+
+def test_set_target_rewrites_plain_port_to_docker_host_gateway(tmp_path: Path) -> None:
+  fake_site = install_fake_psycopg(tmp_path)
+  env = base_env(tmp_path)
+  env["PYTHONPATH"] = f"{fake_site}:{env.get('PYTHONPATH', '')}".rstrip(":")
+
+  result = run_script(["set-target", "api.example.com", "50101"], env=env)
+
+  assert result.returncode == 0
+  assert "upstream_target=host.docker.internal:50101" in result.stdout
+
+
+def test_set_target_rewrites_localhost_to_docker_host_gateway(tmp_path: Path) -> None:
+  fake_site = install_fake_psycopg(tmp_path)
+  env = base_env(tmp_path)
+  env["PYTHONPATH"] = f"{fake_site}:{env.get('PYTHONPATH', '')}".rstrip(":")
+
+  result = run_script(["set-target", "api.example.com", "localhost:50101"], env=env)
+
+  assert result.returncode == 0
+  assert "upstream_target=host.docker.internal:50101" in result.stdout

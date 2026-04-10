@@ -8,6 +8,7 @@ on:
       - "v*"
     paths:
       - "Dockerfile"
+      - ".dockerignore"
       - "pyproject.toml"
       - "src/**"
       - "scripts/container-entrypoint.sh"

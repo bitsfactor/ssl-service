@@ -17,6 +17,7 @@ def base_env(tmp_path: Path) -> dict[str, str]:
   env = os.environ.copy()
   env["SSL_SERVICE_INSTALL_ROOT"] = str(tmp_path / ".ssl-service")
   env["SSL_SERVICE_BASHRC_PATH"] = str(tmp_path / ".bashrc")
+  env["SSL_SERVICE_GLOBAL_COMMAND_PATH"] = str(tmp_path / "ssl-service")
   return env
 
 
@@ -47,6 +48,7 @@ def test_help_lists_domain_and_reconfigure_subcommands(tmp_path: Path) -> None:
   assert "setup.sh reconfigure" in result.stdout
   assert "setup.sh build-status" in result.stdout
   assert "setup.sh domain <domain-command> [args...]" in result.stdout
+  assert str(tmp_path / "ssl-service") in result.stdout
   assert ".ssl-service" in result.stdout
 
 
@@ -133,6 +135,7 @@ def test_project_metadata_uses_ssl_service_name() -> None:
   content = PYPROJECT.read_text()
 
   assert 'name = "ssl-service"' in content
+  assert 'cryptography>=42.0.0,<47.0.0' in content
 
 
 def test_build_status_command_reads_latest_workflow_run_from_api(tmp_path: Path) -> None:
@@ -199,7 +202,18 @@ def test_interactive_menu_resets_default_selection_to_exit_after_actions() -> No
   menu_block = content.split("interactive_menu() {", 1)[1].split("\n}\n\nmain()", 1)[0]
   assert 'default_index="${exit_index}"' in menu_block
   assert 'Press Enter to return to the menu' in content
+  assert '"Manage domains and routes"' in content
   assert '"Show image build status"' in content
+
+
+def test_install_writes_global_ssl_service_wrapper_and_cleans_old_aliases() -> None:
+  content = SCRIPT.read_text()
+
+  assert 'GLOBAL_COMMAND_PATH="${SSL_SERVICE_GLOBAL_COMMAND_PATH:-/usr/local/bin/ssl-service}"' in content
+  assert 'cat > "${GLOBAL_COMMAND_PATH}" <<EOF' in content
+  assert 'exec bash "${ENTRYPOINT_PATH}" "\\$@"' in content
+  assert 'remove_shell_alias' in content
+  assert 'log "command: ${GLOBAL_COMMAND_PATH}"' in content
 
 
 def test_external_setup_without_source_tree_can_auto_update_existing_runtime() -> None:
@@ -216,6 +230,25 @@ def test_interactive_input_uses_dev_tty_and_safe_clear() -> None:
   assert "[[ -t 2 && -r /dev/tty ]]" in content
   assert "read -rsn1 key < /dev/tty" in content
   assert "printf '\\033[H\\033[2J' > /dev/tty" in content
+
+
+def test_publish_workflow_only_triggers_for_image_inputs() -> None:
+  content = (ROOT / ".github" / "workflows" / "publish-image.yml").read_text()
+
+  assert '"Dockerfile"' in content
+  assert '".dockerignore"' in content
+  assert '"pyproject.toml"' in content
+  assert '"src/**"' in content
+  assert '"scripts/container-entrypoint.sh"' in content
+  assert '"scripts/domain-manage.sh"' in content
+
+
+def test_compose_maps_host_docker_internal_for_host_backends() -> None:
+  content = SCRIPT.read_text()
+
+  render_compose_block = content.split("render_compose() {", 1)[1].split("\n}\n\nwrite_install_meta()", 1)[0]
+  assert 'extra_hosts:' in render_compose_block
+  assert '"host.docker.internal:host-gateway"' in render_compose_block
 
 
 def test_uninstall_requires_tty_or_yes_without_prompting_on_dev_tty() -> None:

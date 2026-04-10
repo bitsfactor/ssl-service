@@ -19,6 +19,7 @@ ENTRYPOINT_PATH="${BIN_DIR}/ssl-service"
 MANAGED_SETUP_PATH="${BIN_DIR}/setup.sh"
 MANAGED_DOMAIN_PATH="${BIN_DIR}/domain-manage.sh"
 TOOLS_VENV_DIR="${INSTALL_ROOT}/.tools-venv"
+GLOBAL_COMMAND_PATH="${SSL_SERVICE_GLOBAL_COMMAND_PATH:-/usr/local/bin/ssl-service}"
 BASHRC_PATH="${SSL_SERVICE_BASHRC_PATH:-/root/.bashrc}"
 ALIAS_MARKER_BEGIN="# >>> ssl-service alias >>>"
 ALIAS_MARKER_END="# <<< ssl-service alias <<<"
@@ -29,11 +30,12 @@ GITHUB_API_BASE_URL="${SSL_SERVICE_GITHUB_API_BASE_URL:-https://api.github.com}"
 GITHUB_REPOSITORY="${SSL_SERVICE_GITHUB_REPOSITORY:-bitsfactor/ssl-service}"
 GITHUB_WORKFLOW_FILE="${SSL_SERVICE_GITHUB_WORKFLOW_FILE:-publish-image.yml}"
 GITHUB_WORKFLOW_RUNS_URL="${SSL_SERVICE_GITHUB_WORKFLOW_RUNS_URL:-}"
-STATE_MENU_ACTIONS=(install reconfigure status build-status logs restart update uninstall exit)
+STATE_MENU_ACTIONS=(install reconfigure status domain build-status logs restart update uninstall exit)
 STATE_MENU_LABELS=(
   "Install or overwrite runtime"
   "Change database or mode"
   "Show service status"
+  "Manage domains and routes"
   "Show image build status"
   "Tail service logs"
   "Restart container"
@@ -100,7 +102,7 @@ Usage:
 Notes:
   - production runtime is installed under ${INSTALL_ROOT}
   - Docker is installed automatically if it is missing
-  - the global shortcut is provided via /root/.bashrc as 'ssl-service'
+  - the global command is installed at ${GLOBAL_COMMAND_PATH}
   - readonly uses the default ACME email ${DEFAULT_ACME_EMAIL}
 EOF
 }
@@ -406,18 +408,13 @@ set -euo pipefail
 exec bash "${MANAGED_SETUP_PATH}" "\$@"
 EOF
   chmod 0755 "${ENTRYPOINT_PATH}"
-}
 
-install_shell_alias() {
-  if grep -Fq "${ALIAS_MARKER_BEGIN}" "${BASHRC_PATH}" 2>/dev/null; then
-    return 0
-  fi
-  cat >> "${BASHRC_PATH}" <<EOF
-
-${ALIAS_MARKER_BEGIN}
-alias ssl-service='bash ${ENTRYPOINT_PATH}'
-${ALIAS_MARKER_END}
+  cat > "${GLOBAL_COMMAND_PATH}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec bash "${ENTRYPOINT_PATH}" "\$@"
 EOF
+  chmod 0755 "${GLOBAL_COMMAND_PATH}"
 }
 
 remove_shell_alias() {
@@ -704,6 +701,8 @@ services:
     image: ${image}
     container_name: ssl-service
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "80:80"
       - "443:443"
@@ -955,13 +954,13 @@ perform_install() {
   stop_legacy_runtime
   docker_compose up -d --remove-orphans
   wait_for_container || fail "container did not become healthy in time"
-  install_shell_alias
+  remove_shell_alias
   remove_legacy_runtime
   log "installed successfully"
   log "install_root: ${INSTALL_ROOT}"
   log "config: ${CONFIG_PATH}"
   log "image: ${image}"
-  log "refresh shell: source ${BASHRC_PATH}"
+  log "command: ${GLOBAL_COMMAND_PATH}"
 }
 
 install_command() {
@@ -1168,7 +1167,7 @@ update_command() {
   image="$(installed_image)"
   pull_image "${image}"
   install_managed_scripts
-  install_shell_alias
+  remove_shell_alias
   render_compose "${image}"
   write_install_meta "${image}"
   stop_legacy_runtime
@@ -1198,6 +1197,7 @@ uninstall_command() {
     docker_compose down --remove-orphans || true
   fi
   rm -rf "${INSTALL_ROOT}"
+  rm -f "${GLOBAL_COMMAND_PATH}"
   remove_shell_alias
   remove_legacy_runtime
   log "uninstall complete"
@@ -1227,6 +1227,7 @@ interactive_menu() {
       install) install_command ;;
       reconfigure) reconfigure_command ;;
       status) status_command ;;
+      domain) domain_command ;;
       build-status) build_status_command ;;
       logs) logs_command ;;
       restart) restart_runtime ;;
