@@ -42,6 +42,23 @@ CREATE TABLE IF NOT EXISTS dns_zone_tokens (
 ALTER TABLE certificates
 ADD COLUMN IF NOT EXISTS retry_after TIMESTAMPTZ;
 
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'certificates_domain_fkey'
+      AND conrelid = 'certificates'::regclass
+  ) THEN
+    ALTER TABLE certificates
+    ADD CONSTRAINT certificates_domain_fkey
+    FOREIGN KEY (domain)
+    REFERENCES routes (domain)
+    ON DELETE RESTRICT;
+  END IF;
+END;
+$$;
+
 CREATE INDEX IF NOT EXISTS idx_routes_enabled ON routes (enabled);
 CREATE INDEX IF NOT EXISTS idx_certificates_not_after ON certificates (not_after);
 CREATE INDEX IF NOT EXISTS idx_dns_zone_tokens_provider ON dns_zone_tokens (provider);

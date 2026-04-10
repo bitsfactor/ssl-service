@@ -2324,10 +2324,10 @@ def main(argv: list[str]) -> int:
           return 0
 
         if subcommand == "purge":
-          cur.execute("DELETE FROM routes WHERE domain = %s RETURNING domain", (domain,))
-          route_row = cur.fetchone()
           cur.execute("DELETE FROM certificates WHERE domain = %s RETURNING domain", (domain,))
           certificate_row = cur.fetchone()
+          cur.execute("DELETE FROM routes WHERE domain = %s RETURNING domain", (domain,))
+          route_row = cur.fetchone()
           if route_row is None and certificate_row is None:
             raise SystemExit("domain not found")
           conn.commit()
