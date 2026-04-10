@@ -23,8 +23,8 @@ BASHRC_PATH="${SSL_SERVICE_BASHRC_PATH:-/root/.bashrc}"
 ALIAS_MARKER_BEGIN="# >>> ssl-service alias >>>"
 ALIAS_MARKER_END="# <<< ssl-service alias <<<"
 DEFAULT_ACME_EMAIL="domain@bitsfactor.com"
-DEFAULT_IMAGE="${SSL_SERVICE_IMAGE:-ghcr.io/leoleoaabbcc/ssl-service:latest}"
-GITHUB_CONTENT_BASE_URL="${SSL_SERVICE_GITHUB_CONTENT_BASE_URL:-https://github.com/leoleoaabbcc/ssl-service/raw/${SSL_SERVICE_INSTALL_REF:-main}}"
+DEFAULT_IMAGE="${SSL_SERVICE_IMAGE:-ghcr.io/bitsfactor/ssl-service:latest}"
+GITHUB_CONTENT_BASE_URL="${SSL_SERVICE_GITHUB_CONTENT_BASE_URL:-https://github.com/bitsfactor/ssl-service/raw/${SSL_SERVICE_INSTALL_REF:-main}}"
 STATE_MENU_ACTIONS=(install reconfigure status logs restart update uninstall exit)
 STATE_MENU_LABELS=(
   "Install or overwrite runtime"

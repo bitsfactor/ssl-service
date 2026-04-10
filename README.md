@@ -17,7 +17,7 @@ bash ./setup.sh
 Or download only the installer:
 
 ```bash
-curl -fsSL -o setup.sh https://github.com/leoleoaabbcc/ssl-service/raw/main/scripts/setup.sh && bash setup.sh
+curl -fsSL -o setup.sh https://github.com/bitsfactor/ssl-service/raw/main/scripts/setup.sh && bash setup.sh
 ```
 
 Production behavior:

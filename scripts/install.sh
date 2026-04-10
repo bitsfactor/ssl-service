@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-GITHUB_CONTENT_BASE_URL="${SSL_SERVICE_GITHUB_CONTENT_BASE_URL:-https://github.com/leoleoaabbcc/ssl-service/raw/${SSL_SERVICE_INSTALL_REF:-main}}"
+GITHUB_CONTENT_BASE_URL="${SSL_SERVICE_GITHUB_CONTENT_BASE_URL:-https://github.com/bitsfactor/ssl-service/raw/${SSL_SERVICE_INSTALL_REF:-main}}"
 TMP_DIR=""
 
 log() {

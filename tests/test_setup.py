@@ -63,7 +63,7 @@ def test_install_sh_requires_tty_when_no_flags(tmp_path: Path) -> None:
 def test_install_sh_uses_github_download_url() -> None:
   content = INSTALL_SCRIPT.read_text()
 
-  assert "https://github.com/leoleoaabbcc/ssl-service/raw/" in content
+  assert "https://github.com/bitsfactor/ssl-service/raw/" in content
   assert "raw.githubusercontent.com" not in content
 
 
