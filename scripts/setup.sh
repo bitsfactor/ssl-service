@@ -21,6 +21,8 @@ UPDATE_LOG="${STATE_DIR}/update.log"
 DEFAULT_DSN=""
 SOURCE_DIR_FILE="${INSTALL_DIR}/.source_dir"
 SHELL_PROMPT_PROFILE="/etc/profile.d/ssl-proxy-shell.sh"
+SHELL_PROMPT_BEGIN_MARKER="# >>> ssl-proxy prompt >>>"
+SHELL_PROMPT_END_MARKER="# <<< ssl-proxy prompt <<<"
 DEFAULT_ACME_EMAIL="domain@bitsfactor.com"
 SETUP_MENU_ACTIONS=(install domain start stop restart status logs update timer-status uninstall exit)
 SETUP_MENU_LABELS=(
@@ -88,12 +90,13 @@ Usage:
   setup.sh logs
   setup.sh update
   setup.sh timer-status
-  setup.sh uninstall [--yes] [--delete-config] [--delete-all]
+  setup.sh uninstall [--yes] [--keep-config] [--keep-data]
 
 Notes:
   - install prompts for missing values unless --mode and --dsn are provided.
   - --acme-email is required for non-interactive readwrite installs.
   - --force-reconfigure overwrites an existing config without asking.
+  - uninstall removes managed config, state, and logs by default.
 EOF
 }
 
@@ -314,14 +317,32 @@ unset -f ssl_proxy_prompt_mode
 EOF
   chmod 0644 "${SHELL_PROMPT_PROFILE}"
 
-  if [[ -f /etc/bash.bashrc ]] && ! grep -Fq "${SHELL_PROMPT_PROFILE}" /etc/bash.bashrc; then
+  if [[ -f /etc/bash.bashrc ]]; then
+    if grep -Fq "${SHELL_PROMPT_BEGIN_MARKER}" /etc/bash.bashrc; then
+      return 0
+    fi
     cat >> /etc/bash.bashrc <<EOF
 
+${SHELL_PROMPT_BEGIN_MARKER}
 # Load ssl-proxy prompt customizations for interactive bash shells.
 if [ -r "${SHELL_PROMPT_PROFILE}" ]; then
   . "${SHELL_PROMPT_PROFILE}"
 fi
+${SHELL_PROMPT_END_MARKER}
 EOF
+  fi
+}
+
+remove_shell_prompt() {
+  rm -f "${SHELL_PROMPT_PROFILE}"
+
+  if [[ -f /etc/bash.bashrc ]] && grep -Fq "${SHELL_PROMPT_BEGIN_MARKER}" /etc/bash.bashrc; then
+    awk -v begin="${SHELL_PROMPT_BEGIN_MARKER}" -v end="${SHELL_PROMPT_END_MARKER}" '
+      $0 == begin { skip = 1; next }
+      $0 == end { skip = 0; next }
+      !skip { print }
+    ' /etc/bash.bashrc > /etc/bash.bashrc.ssl-proxy.tmp
+    mv /etc/bash.bashrc.ssl-proxy.tmp /etc/bash.bashrc
   fi
 }
 
@@ -996,15 +1017,20 @@ timer_status_command() {
 
 uninstall_command() {
   require_root
-  local delete_config=0
-  local delete_all=0
+  local keep_config=0
+  local keep_data=0
   local yes=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --yes) yes=1 ;;
-      --delete-config) delete_config=1 ;;
-      --delete-all) delete_all=1 ;;
+      --keep-config) keep_config=1 ;;
+      --keep-data) keep_data=1 ;;
+      --delete-config) keep_config=0 ;;
+      --delete-all)
+        keep_config=0
+        keep_data=0
+        ;;
       *) fail "unknown uninstall flag: $1" ;;
     esac
     shift
@@ -1023,24 +1049,29 @@ uninstall_command() {
     /usr/local/bin/ssl-proxy \
     /usr/local/bin/domain-manage
   systemctl daemon-reload
+  systemctl reset-failed "${CADDY_SERVICE_NAME}" "${SERVICE_NAME}" "${UPDATE_SERVICE_NAME}" "${TIMER_NAME}" >/dev/null 2>&1 || true
 
   rm -rf "${INSTALL_DIR}"
+  remove_shell_prompt
 
-  if [[ "${delete_config}" -eq 1 || "${delete_all}" -eq 1 ]]; then
+  if [[ "${keep_config}" -ne 1 ]]; then
     rm -rf "${CONFIG_DIR}"
   fi
-  if [[ "${delete_all}" -eq 1 ]]; then
+  if [[ "${keep_data}" -ne 1 ]]; then
     rm -rf "${STATE_DIR}" "${LOG_DIR}"
   fi
 
   log "uninstall complete"
-  if [[ "${delete_all}" -eq 1 ]]; then
-    log "deleted: ${CONFIG_DIR}, ${STATE_DIR}, ${LOG_DIR}"
-  elif [[ "${delete_config}" -eq 1 ]]; then
+  if [[ "${keep_config}" -eq 1 && "${keep_data}" -eq 1 ]]; then
+    log "preserved: ${CONFIG_DIR}, ${STATE_DIR}, ${LOG_DIR}"
+  elif [[ "${keep_config}" -eq 1 ]]; then
+    log "preserved: ${CONFIG_DIR}"
+    log "deleted: ${STATE_DIR}, ${LOG_DIR}"
+  elif [[ "${keep_data}" -eq 1 ]]; then
     log "deleted: ${CONFIG_DIR}"
     log "preserved: ${STATE_DIR}, ${LOG_DIR}"
   else
-    log "preserved: ${CONFIG_DIR}, ${STATE_DIR}, ${LOG_DIR}"
+    log "deleted: ${CONFIG_DIR}, ${STATE_DIR}, ${LOG_DIR}"
   fi
 }
 
