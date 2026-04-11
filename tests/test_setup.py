@@ -234,6 +234,14 @@ def test_interactive_input_uses_dev_tty_and_safe_clear() -> None:
   assert "printf '\\033[H\\033[2J' > /dev/tty" in content
 
 
+def test_apt_install_writes_package_manager_output_to_stderr() -> None:
+  content = SCRIPT.read_text()
+
+  apt_block = content.split("apt_install() {", 1)[1].split("\n}\n\nensure_curl()", 1)[0]
+  assert "apt-get update >&2" in apt_block
+  assert 'apt-get install -y "$@" >&2' in apt_block
+
+
 def test_publish_workflow_only_triggers_for_image_inputs() -> None:
   content = (ROOT / ".github" / "workflows" / "publish-image.yml").read_text()
 

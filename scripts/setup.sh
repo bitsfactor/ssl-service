@@ -309,8 +309,8 @@ require_systemd() {
 apt_install() {
   command -v apt-get >/dev/null 2>&1 || fail "apt-get is required on this host"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y "$@"
+  apt-get update >&2
+  apt-get install -y "$@" >&2
 }
 
 ensure_curl() {
