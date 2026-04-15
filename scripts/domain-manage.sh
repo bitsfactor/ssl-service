@@ -827,10 +827,7 @@ else:
     print(f"    {' | '.join(summary_bits)}")
     if row.get("last_error"):
       print(f"    last_error: {red}{row['last_error']}{reset}")
-
 print()
-print(f"{bold}Raw Output{reset}")
-print(text)
 PY
 }
 

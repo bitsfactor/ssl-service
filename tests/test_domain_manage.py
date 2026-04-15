@@ -340,3 +340,11 @@ def test_set_target_rewrites_localhost_to_docker_host_gateway(tmp_path: Path) ->
 
   assert result.returncode == 0
   assert "upstream_target=host.docker.internal:50101" in result.stdout
+
+
+def test_successful_pretty_route_output_does_not_repeat_raw_output_block() -> None:
+  content = SCRIPT.read_text()
+
+  route_formatter_block = content.split("ui_pretty_route_rows_output() {", 1)[1].split("\n}\n\nui_pretty_logs_output()", 1)[0]
+  assert 'print(f"{bold}Raw Output{reset}")' in route_formatter_block
+  assert "    if row.get(\"last_error\"):\n      print(f\"    last_error: {red}{row['last_error']}{reset}\")\nprint()\nPY" in route_formatter_block
