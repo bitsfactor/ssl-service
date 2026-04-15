@@ -116,6 +116,21 @@ ui_clear_screen() {
   fi
 }
 
+ui_cursor_save() {
+  ui_has_tty || return 0
+  printf '\033[s' >&2
+}
+
+ui_cursor_restore() {
+  ui_has_tty || return 0
+  printf '\033[u' >&2
+}
+
+ui_clear_to_end() {
+  ui_has_tty || return 0
+  printf '\033[J' >&2
+}
+
 ui_trim() {
   local value="$1"
   value="${value#"${value%%[![:space:]]*}"}"
@@ -144,7 +159,7 @@ ui_menu_select() {
   local default_index="$2"
   shift 2
   local -a items=("$@")
-  local selected=0 key index
+  local selected=0 key index rendered=0
 
   if [[ "${default_index}" =~ ^[0-9]+$ ]] && (( default_index >= 0 && default_index < ${#items[@]} )); then
     selected="${default_index}"
@@ -156,7 +171,14 @@ ui_menu_select() {
   fi
 
   while true; do
-    ui_clear_screen
+    if [[ "${rendered}" -eq 0 ]]; then
+      ui_clear_screen
+      ui_cursor_save
+      rendered=1
+    else
+      ui_cursor_restore
+      ui_clear_to_end
+    fi
     printf '%s%s%s\n' "${COLOR_BOLD}${COLOR_CYAN}" "${title}" "${COLOR_RESET}" >&2
     printf '%sUse Up/Down arrows and Enter to select.%s\n\n' "${COLOR_DIM}" "${COLOR_RESET}" >&2
     for index in "${!items[@]}"; do

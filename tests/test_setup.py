@@ -236,6 +236,9 @@ def test_interactive_input_uses_dev_tty_and_safe_clear() -> None:
   assert "[[ -t 2 && -r /dev/tty ]]" in content
   assert "read -rsn1 key < /dev/tty" in content
   assert "printf '\\033[H\\033[2J' > /dev/tty" in content
+  assert "ui_cursor_save() {" in content
+  assert "ui_cursor_restore() {" in content
+  assert "ui_clear_to_end() {" in content
 
 
 def test_apt_install_writes_package_manager_output_to_stderr() -> None:
