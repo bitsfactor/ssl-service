@@ -199,6 +199,21 @@ ui_clear_screen() {
   fi
 }
 
+ui_cursor_save() {
+  ui_has_tty || return 0
+  printf '\033[s' >&2
+}
+
+ui_cursor_restore() {
+  ui_has_tty || return 0
+  printf '\033[u' >&2
+}
+
+ui_clear_to_end() {
+  ui_has_tty || return 0
+  printf '\033[J' >&2
+}
+
 ui_print_header() {
   local mode="$1"
   local mode_color
@@ -362,12 +377,19 @@ ui_menu_index_for_action() {
 }
 
 ui_menu_pick_action() {
-  local selected key mode
+  local selected key mode rendered=0
   selected="$(ui_menu_index_for_action "${1:-}")"
   while true; do
-    mode="$(get_config_mode)"
-    ui_print_header "${mode}"
-    ui_print_dashboard_summary "${mode}"
+    if [[ "${rendered}" -eq 0 ]]; then
+      mode="$(get_config_mode)"
+      ui_print_header "${mode}"
+      ui_print_dashboard_summary "${mode}"
+      ui_cursor_save
+      rendered=1
+    else
+      ui_cursor_restore
+      ui_clear_to_end
+    fi
     ui_print_menu "${selected}"
     printf '\n' >&2
     key="$(ui_read_key)" || return 1
@@ -442,13 +464,20 @@ ui_menu_pick_yes_no() {
   local default_label="$2"
   local yes_label="$3"
   local no_label="$4"
-  local selected=1 key
+  local selected=1 key rendered=0
   if [[ "${default_label}" == "${yes_label}" ]]; then
     selected=0
   fi
   while true; do
-    ui_clear_screen
-    printf '%s[%s]%s %sssl-service domain manager%s\n' "$(ui_mode_color "$(get_config_mode)")" "$(shell_prompt_label "$(get_config_mode)")" "${COLOR_RESET}" "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+    if [[ "${rendered}" -eq 0 ]]; then
+      ui_clear_screen
+      printf '%s[%s]%s %sssl-service domain manager%s\n' "$(ui_mode_color "$(get_config_mode)")" "$(shell_prompt_label "$(get_config_mode)")" "${COLOR_RESET}" "${COLOR_BOLD}" "${COLOR_RESET}" >&2
+      ui_cursor_save
+      rendered=1
+    else
+      ui_cursor_restore
+      ui_clear_to_end
+    fi
     printf '%s%s%s\n\n' "${COLOR_BOLD}" "${title}" "${COLOR_RESET}" >&2
     if [[ "${selected}" -eq 0 ]]; then
       printf '%s%s> %s%s\n' "${COLOR_WHITE}${COLOR_BOLD}${COLOR_REVERSE}" "" "${yes_label}" "${COLOR_RESET}" >&2
