@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEPLOY_DIR="/root/.ssl-service"
 LEGACY_DEPLOY_DIR="/opt/ssl-proxy"
@@ -1478,7 +1479,7 @@ def main(argv: list[str]) -> int:
           """
           SELECT
             r.domain,
-            COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE 'host.docker.internal:' || r.upstream_port::text END) AS upstream_target,
+            COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || r.upstream_port::text END) AS upstream_target,
             r.enabled,
             r.updated_at,
             c.status AS certificate_status,
@@ -1565,7 +1566,7 @@ def main(argv: list[str]) -> int:
           """
           SELECT
             r.domain,
-            COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE 'host.docker.internal:' || r.upstream_port::text END) AS upstream_target,
+            COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || r.upstream_port::text END) AS upstream_target,
             r.enabled,
             r.updated_at,
             c.status AS certificate_status,
@@ -2057,7 +2058,7 @@ def normalize_upstream_target(value: str) -> str:
     port = int(candidate)
     if port < 1 or port > 65535:
       raise SystemExit("upstream_target port must be between 1 and 65535")
-    return f"host.docker.internal:{port}"
+    return f"127.0.0.1:{port}"
 
   if candidate.startswith("["):
     if "]:" not in candidate:
@@ -2093,8 +2094,8 @@ def normalize_upstream_target(value: str) -> str:
   port = int(port_text)
   if port < 1 or port > 65535:
     raise SystemExit("upstream_target port must be between 1 and 65535")
-  if host in {"127.0.0.1", "localhost", "[::1]"}:
-    host = "host.docker.internal"
+  if host in {"127.0.0.1", "localhost", "[::1]", "host.docker.internal"}:
+    host = "127.0.0.1"
   return f"{host}:{port}"
 
 
@@ -2149,7 +2150,7 @@ def main(argv: list[str]) -> int:
             """
             SELECT
               r.domain,
-              COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE 'host.docker.internal:' || r.upstream_port::text END) AS upstream_target,
+              COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || r.upstream_port::text END) AS upstream_target,
               r.enabled,
               r.updated_at,
               c.status AS certificate_status,
@@ -2259,7 +2260,7 @@ def main(argv: list[str]) -> int:
             """
             SELECT
               r.domain,
-              COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE 'host.docker.internal:' || r.upstream_port::text END) AS upstream_target,
+              COALESCE(r.upstream_target, CASE WHEN r.upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || r.upstream_port::text END) AS upstream_target,
               r.enabled,
               r.updated_at,
               c.status AS certificate_status,
@@ -2346,7 +2347,7 @@ def main(argv: list[str]) -> int:
             SET enabled = TRUE
             WHERE domain = %s
             RETURNING domain,
-                      COALESCE(upstream_target, CASE WHEN upstream_port IS NULL THEN NULL ELSE 'host.docker.internal:' || upstream_port::text END) AS upstream_target,
+                      COALESCE(upstream_target, CASE WHEN upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || upstream_port::text END) AS upstream_target,
                       enabled,
                       updated_at,
                       NULL::text AS certificate_status,
@@ -2368,7 +2369,7 @@ def main(argv: list[str]) -> int:
             SET enabled = FALSE
             WHERE domain = %s
             RETURNING domain,
-                      COALESCE(upstream_target, CASE WHEN upstream_port IS NULL THEN NULL ELSE 'host.docker.internal:' || upstream_port::text END) AS upstream_target,
+                      COALESCE(upstream_target, CASE WHEN upstream_port IS NULL THEN NULL ELSE '127.0.0.1:' || upstream_port::text END) AS upstream_target,
                       enabled,
                       updated_at,
                       NULL::text AS certificate_status,

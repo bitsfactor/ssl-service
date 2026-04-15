@@ -320,7 +320,7 @@ def test_set_target_accepts_remote_ip_upstream(tmp_path: Path) -> None:
   assert "upstream_target=154.17.0.51:50101" in result.stdout
 
 
-def test_set_target_rewrites_plain_port_to_docker_host_gateway(tmp_path: Path) -> None:
+def test_set_target_preserves_plain_port_as_loopback_in_database(tmp_path: Path) -> None:
   fake_site = install_fake_psycopg(tmp_path)
   env = base_env(tmp_path)
   env["PYTHONPATH"] = f"{fake_site}:{env.get('PYTHONPATH', '')}".rstrip(":")
@@ -328,10 +328,10 @@ def test_set_target_rewrites_plain_port_to_docker_host_gateway(tmp_path: Path) -
   result = run_script(["set-target", "api.example.com", "50101"], env=env)
 
   assert result.returncode == 0
-  assert "upstream_target=host.docker.internal:50101" in result.stdout
+  assert "upstream_target=127.0.0.1:50101" in result.stdout
 
 
-def test_set_target_rewrites_localhost_to_docker_host_gateway(tmp_path: Path) -> None:
+def test_set_target_normalizes_localhost_to_loopback_in_database(tmp_path: Path) -> None:
   fake_site = install_fake_psycopg(tmp_path)
   env = base_env(tmp_path)
   env["PYTHONPATH"] = f"{fake_site}:{env.get('PYTHONPATH', '')}".rstrip(":")
@@ -339,7 +339,7 @@ def test_set_target_rewrites_localhost_to_docker_host_gateway(tmp_path: Path) ->
   result = run_script(["set-target", "api.example.com", "localhost:50101"], env=env)
 
   assert result.returncode == 0
-  assert "upstream_target=host.docker.internal:50101" in result.stdout
+  assert "upstream_target=127.0.0.1:50101" in result.stdout
 
 
 def test_successful_pretty_route_output_does_not_repeat_raw_output_block() -> None:

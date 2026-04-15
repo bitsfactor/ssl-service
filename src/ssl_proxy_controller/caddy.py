@@ -64,7 +64,7 @@ def validate_upstream_target(upstream_target: str) -> str:
 def canonicalize_upstream_target_for_container(upstream_target: str) -> str:
   normalized = validate_upstream_target(upstream_target)
   if normalized.startswith("[::1]:"):
-    return f"{DOCKER_HOST_GATEWAY_NAME}:{normalized.split(':', 1)[1]}"
+    return f"{DOCKER_HOST_GATEWAY_NAME}:{normalized.rsplit(':', 1)[1]}"
 
   host, port_text = normalized.rsplit(":", 1)
   if host in {"127.0.0.1", "localhost"}:

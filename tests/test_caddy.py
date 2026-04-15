@@ -229,6 +229,9 @@ def test_render_caddyfile_renders_ipv6_upstream_target(tmp_path: Path) -> None:
     routes=routes,
     certificates=certificates,
     admin_address="127.0.0.1:2019",
+    log_path=tmp_path / "logs" / "caddy.log",
+    log_roll_size_mb=5,
+    log_roll_keep=8,
   )
 
   content = output.read_text()

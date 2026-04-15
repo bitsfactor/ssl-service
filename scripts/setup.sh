@@ -2,9 +2,11 @@
 set -euo pipefail
 
 PROGRAM_NAME="${SSL_SERVICE_PROGRAM_NAME:-$(basename "${BASH_SOURCE[0]}")}"
-SCRIPT_PATH="$0"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SOURCE_SETUP_PATH="${REPO_DIR}/scripts/setup.sh"
+SOURCE_DOMAIN_PATH="${REPO_DIR}/scripts/domain-manage.sh"
 INSTALL_ROOT="${SSL_SERVICE_INSTALL_ROOT:-/root/.ssl-service}"
 CONFIG_DIR="${INSTALL_ROOT}/config"
 CONFIG_PATH="${CONFIG_DIR}/config.yaml"
@@ -12,12 +14,8 @@ STATE_DIR="${INSTALL_ROOT}/state"
 LOG_DIR="${INSTALL_ROOT}/logs"
 ACME_DIR="${INSTALL_ROOT}/acme"
 ENV_DIR="${INSTALL_ROOT}/env"
-BIN_DIR="${INSTALL_ROOT}/bin"
 META_DIR="${INSTALL_ROOT}/meta"
 COMPOSE_PATH="${INSTALL_ROOT}/compose.yaml"
-ENTRYPOINT_PATH="${BIN_DIR}/ssl-service"
-MANAGED_SETUP_PATH="${BIN_DIR}/setup.sh"
-MANAGED_DOMAIN_PATH="${BIN_DIR}/domain-manage.sh"
 TOOLS_VENV_DIR="${INSTALL_ROOT}/.tools-venv"
 GLOBAL_COMMAND_PATH="${SSL_SERVICE_GLOBAL_COMMAND_PATH:-/usr/local/bin/ssl-service}"
 BASHRC_PATH="${SSL_SERVICE_BASHRC_PATH:-/root/.bashrc}"
@@ -25,11 +23,11 @@ ALIAS_MARKER_BEGIN="# >>> ssl-service alias >>>"
 ALIAS_MARKER_END="# <<< ssl-service alias <<<"
 DEFAULT_ACME_EMAIL="domain@bitsfactor.com"
 DEFAULT_IMAGE="${SSL_SERVICE_IMAGE:-ghcr.io/bitsfactor/ssl-service:latest}"
-GITHUB_CONTENT_BASE_URL="${SSL_SERVICE_GITHUB_CONTENT_BASE_URL:-https://github.com/bitsfactor/ssl-service/raw/${SSL_SERVICE_INSTALL_REF:-main}}"
 GITHUB_API_BASE_URL="${SSL_SERVICE_GITHUB_API_BASE_URL:-https://api.github.com}"
 GITHUB_REPOSITORY="${SSL_SERVICE_GITHUB_REPOSITORY:-bitsfactor/ssl-service}"
 GITHUB_WORKFLOW_FILE="${SSL_SERVICE_GITHUB_WORKFLOW_FILE:-publish-image.yml}"
 GITHUB_WORKFLOW_RUNS_URL="${SSL_SERVICE_GITHUB_WORKFLOW_RUNS_URL:-}"
+DEFAULT_SOURCE_ROOT="/root/ssl-service"
 STATE_MENU_ACTIONS=(install reconfigure status domain build-status logs restart update uninstall exit)
 STATE_MENU_LABELS=(
   "Install or overwrite runtime"
@@ -102,7 +100,8 @@ Usage:
 Notes:
   - production runtime is installed under ${INSTALL_ROOT}
   - Docker is installed automatically if it is missing
-  - the global command is installed at ${GLOBAL_COMMAND_PATH}
+  - the global command is symlinked at ${GLOBAL_COMMAND_PATH}
+  - install from a source checkout so script edits take effect immediately
   - readonly uses the default ACME email ${DEFAULT_ACME_EMAIL}
 EOF
 }
@@ -220,23 +219,29 @@ ui_pause() {
   read -r _ < /dev/tty
 }
 
-is_managed_setup_invocation() {
-  local current_path managed_path
-  current_path="$(realpath "${SCRIPT_PATH}" 2>/dev/null || printf '%s' "${SCRIPT_PATH}")"
-  managed_path="$(realpath "${MANAGED_SETUP_PATH}" 2>/dev/null || printf '%s' "${MANAGED_SETUP_PATH}")"
-  [[ "${current_path}" == "${managed_path}" ]]
-}
-
 is_source_tree_invocation() {
-  [[ -f "${REPO_DIR}/pyproject.toml" && "${SCRIPT_DIR}" == "${REPO_DIR}/scripts" ]]
+  [[ -f "${REPO_DIR}/pyproject.toml" && -x "${SOURCE_SETUP_PATH}" && "${SCRIPT_PATH}" == "$(readlink -f "${SOURCE_SETUP_PATH}" 2>/dev/null || realpath "${SOURCE_SETUP_PATH}")" ]]
 }
 
 should_auto_update_from_external_setup() {
   runtime_exists || return 1
   ui_has_tty || return 1
-  is_managed_setup_invocation && return 1
   is_source_tree_invocation && return 1
   return 0
+}
+
+handoff_to_source_setup_for_update() {
+  local source_root source_setup source_setup_real script_real
+  source_root="${SSL_SERVICE_SOURCE_ROOT:-${DEFAULT_SOURCE_ROOT}}"
+  source_setup="${source_root}/scripts/setup.sh"
+  [[ -x "${source_setup}" ]] || fail "existing installation detected, but no usable source checkout was found at ${source_root}; run install.sh first"
+  source_setup_real="$(readlink -f "${source_setup}" 2>/dev/null || realpath "${source_setup}")"
+  script_real="$(readlink -f "${SCRIPT_PATH}" 2>/dev/null || realpath "${SCRIPT_PATH}")"
+  if [[ "${script_real}" == "${source_setup_real}" ]]; then
+    update_command
+    return 0
+  fi
+  exec bash "${source_setup}" update
 }
 
 prompt_required() {
@@ -359,7 +364,7 @@ docker_compose() {
 
 ensure_layout() {
   mkdir -p "${INSTALL_ROOT}" "${CONFIG_DIR}" "${STATE_DIR}" "${STATE_DIR}/generated" "${STATE_DIR}/state" "${STATE_DIR}/certs" \
-    "${LOG_DIR}" "${ACME_DIR}" "${ENV_DIR}" "${BIN_DIR}" "${META_DIR}"
+    "${LOG_DIR}" "${ACME_DIR}" "${ENV_DIR}" "${META_DIR}"
 }
 
 ensure_tools_venv() {
@@ -371,50 +376,12 @@ ensure_tools_venv() {
   "${TOOLS_VENV_DIR}/bin/pip" install "PyYAML>=6.0.1,<7.0.0" "psycopg[binary]>=3.1.18,<4.0.0" >/dev/null
 }
 
-copy_or_download() {
-  local target="$1"
-  local local_source="$2"
-  local remote_suffix="$3"
-  if [[ -r "${local_source}" ]]; then
-    install -m 0755 "${local_source}" "${target}"
-    return 0
-  fi
-  ensure_curl
-  curl -fsSL "${GITHUB_CONTENT_BASE_URL}/${remote_suffix}" -o "${target}"
-  chmod 0755 "${target}"
-}
-
 install_managed_scripts() {
-  local self_source="${SCRIPT_PATH}"
-  if [[ -r "${self_source}" && "$(realpath "${self_source}" 2>/dev/null || printf '%s' "${self_source}")" != "$(realpath "${MANAGED_SETUP_PATH}" 2>/dev/null || printf '%s' "${MANAGED_SETUP_PATH}")" ]]; then
-    install -m 0755 "${self_source}" "${MANAGED_SETUP_PATH}"
-  else
-    copy_or_download "${MANAGED_SETUP_PATH}" "/nonexistent" "scripts/setup.sh"
-  fi
-
-  local domain_local="${REPO_DIR}/scripts/domain-manage.sh"
-  if [[ ! -f "${domain_local}" ]] && [[ -f "${SCRIPT_DIR}/domain-manage.sh" ]]; then
-    domain_local="${SCRIPT_DIR}/domain-manage.sh"
-  fi
-  if [[ -r "${domain_local}" && "$(realpath "${domain_local}" 2>/dev/null || printf '%s' "${domain_local}")" == "$(realpath "${MANAGED_DOMAIN_PATH}" 2>/dev/null || printf '%s' "${MANAGED_DOMAIN_PATH}")" ]]; then
-    :
-  else
-    copy_or_download "${MANAGED_DOMAIN_PATH}" "${domain_local}" "scripts/domain-manage.sh"
-  fi
-
-  cat > "${ENTRYPOINT_PATH}" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-exec bash "${MANAGED_SETUP_PATH}" "\$@"
-EOF
-  chmod 0755 "${ENTRYPOINT_PATH}"
-
-  cat > "${GLOBAL_COMMAND_PATH}" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-exec bash "${ENTRYPOINT_PATH}" "\$@"
-EOF
-  chmod 0755 "${GLOBAL_COMMAND_PATH}"
+  [[ -x "${SOURCE_SETUP_PATH}" ]] || fail "setup.sh must be run from a source checkout; missing ${SOURCE_SETUP_PATH}"
+  [[ -x "${SOURCE_DOMAIN_PATH}" ]] || fail "domain-manage.sh not found in source checkout: ${SOURCE_DOMAIN_PATH}"
+  mkdir -p "$(dirname "${GLOBAL_COMMAND_PATH}")"
+  ln -sfn "${SOURCE_SETUP_PATH}" "${GLOBAL_COMMAND_PATH}"
+  rm -f "${INSTALL_ROOT}/bin/ssl-service" "${INSTALL_ROOT}/bin/setup.sh" "${INSTALL_ROOT}/bin/domain-manage.sh"
 }
 
 remove_shell_alias() {
@@ -731,6 +698,8 @@ write_install_meta() {
 {
   "image": "${image}",
   "config_path": "${CONFIG_PATH}",
+  "source_root": "${REPO_DIR}",
+  "global_command_path": "${GLOBAL_COMMAND_PATH}",
   "installed_at": "$(date -Is)"
 }
 EOF
@@ -1161,12 +1130,6 @@ logs_command() {
 update_command() {
   require_root
   [[ -f "${COMPOSE_PATH}" ]] || fail "runtime is not installed"
-  if is_managed_setup_invocation && [[ "${SSL_SERVICE_UPDATE_STAGE:-}" != "post-self-update" ]]; then
-    ensure_curl
-    install_managed_scripts
-    log "setup.sh refreshed; restarting update with the latest managed script"
-    exec env SSL_SERVICE_UPDATE_STAGE=post-self-update bash "${MANAGED_SETUP_PATH}" update "$@"
-  fi
   ensure_docker
   ensure_tools_venv
   if config_exists; then
@@ -1222,10 +1185,7 @@ uninstall_command() {
 
 domain_command() {
   require_root
-  local domain_script="${MANAGED_DOMAIN_PATH}"
-  if [[ ! -x "${domain_script}" && -x "${REPO_DIR}/scripts/domain-manage.sh" ]]; then
-    domain_script="${REPO_DIR}/scripts/domain-manage.sh"
-  fi
+  local domain_script="${SOURCE_DOMAIN_PATH}"
   [[ -x "${domain_script}" ]] || fail "domain manager not installed"
   SSL_PROXY_CONFIG="${CONFIG_PATH}" \
   SSL_PROXY_DOMAIN_PROGRAM_NAME="ssl-service domain" \
@@ -1311,7 +1271,7 @@ main() {
     "")
       if should_auto_update_from_external_setup; then
         log "Existing installation detected. Updating runtime from this setup.sh."
-        update_command
+        handoff_to_source_setup_for_update
         exit 0
       fi
       if ui_has_tty; then

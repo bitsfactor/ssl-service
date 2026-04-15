@@ -10,16 +10,19 @@ This README is the operator manual for production usage.
 
 ## What It Installs
 
-Production install creates a managed runtime under:
+Production install creates these top-level locations:
 
-- `/root/.ssl-service/config/config.yaml`
-- `/root/.ssl-service/compose.yaml`
-- `/root/.ssl-service/bin/setup.sh`
-- `/root/.ssl-service/bin/domain-manage.sh`
+- `/root/.ssl-service/`: managed runtime root
+- `/root/.ssl-service/config/`
 - `/root/.ssl-service/state/`
 - `/root/.ssl-service/logs/`
 - `/root/.ssl-service/acme/`
-- `/usr/local/bin/ssl-service`
+- `/root/.ssl-service/env/`
+- `/root/.ssl-service/meta/`
+- `/root/.ssl-service/.tools-venv/`
+- `/root/ssl-service/`: local source checkout
+- `/root/ssl-service/scripts/`: core operator scripts
+- `/usr/local/bin/ssl-service` -> `/root/ssl-service/scripts/setup.sh`
 
 The service itself runs as a Docker container named `ssl-service`.
 
@@ -28,11 +31,21 @@ The service itself runs as a Docker container named `ssl-service`.
 Run as `root` on the target Linux machine:
 
 ```bash
-curl -fsSL -o /tmp/setup.sh https://github.com/bitsfactor/ssl-service/raw/main/scripts/setup.sh
-bash /tmp/setup.sh
+curl -fsSL -o /tmp/ssl-service-install.sh https://github.com/bitsfactor/ssl-service/raw/main/scripts/install.sh
+bash /tmp/ssl-service-install.sh
 ```
 
-If the machine is already installed, running a fresh `setup.sh` again updates the managed runtime.
+The bootstrap installer ensures there is a local source checkout at `/root/ssl-service`, then runs the local `scripts/setup.sh`.
+
+If the machine already has a clean checkout at `/root/ssl-service`, re-running `install.sh` updates that checkout first and then runs the local `scripts/setup.sh`.
+
+If the checkout has local uncommitted changes, `install.sh` leaves the source tree as-is and continues with the current local code.
+
+You can also install directly from an existing local checkout:
+
+```bash
+bash /root/ssl-service/scripts/setup.sh
+```
 
 You can also explicitly update with:
 
@@ -80,7 +93,7 @@ ssl-service start
 ssl-service stop
 ```
 
-The interactive menu is the preferred operator path. All domain operations also live under the same entrypoint.
+The interactive menu is the preferred operator path. The global `ssl-service` command is a symlink to the source-tree `scripts/setup.sh`, so local script edits take effect immediately. All domain operations also live under the same entrypoint.
 
 ## Domain Management
 
@@ -124,7 +137,8 @@ Supported upstream formats:
 Important networking rule:
 
 - plain ports, `127.0.0.1:port`, and `localhost:port` are treated as services running on the Docker host
-- they are normalized to `host.docker.internal:port` for the containerized Caddy runtime
+- they remain stored as loopback-style targets in the database
+- the controller rewrites them to `host.docker.internal:port` only when rendering the containerized Caddy runtime
 
 This matters because the proxy runs inside Docker. Container loopback is not the host loopback.
 
@@ -132,26 +146,21 @@ This matters because the proxy runs inside Docker. Container loopback is not the
 
 State is stored under `/root/.ssl-service`:
 
-- `config/config.yaml`: runtime config
-- `compose.yaml`: generated Docker Compose file
-- `state/generated/Caddyfile`: live generated Caddy config
-- `state/certs/`: local certificate material mirrored from the database
-- `state/state/state.json`: runtime state checksum data
+- `config/`: runtime configuration
+- `state/`: generated config, certificates, and runtime state
+- `logs/`: controller and Caddy logs
 - `acme/`: Certbot ACME working state
-- `logs/`: controller and Caddy file logs
+- `env/`: runtime environment files
+- `meta/`: install metadata
+- `.tools-venv/`: local helper Python environment
 
 ## Logs
 
-There are now three log paths to know about.
+Primary logs live under:
 
-Application logs in our managed directory:
+- `/root/.ssl-service/logs/`
 
-- `/root/.ssl-service/logs/controller.log`
-- `/root/.ssl-service/logs/caddy.log`
-
-Docker fallback logs:
-
-- `/var/lib/docker/containers/<container-id>/<container-id>-json.log`
+Docker also keeps container stdout/stderr logs in its own storage.
 
 `ssl-service logs` streams the container logs:
 
@@ -185,18 +194,19 @@ ssl-service update
 
 Update does the following:
 
-1. refreshes the managed `setup.sh`
-2. re-execs into the newest managed script
-3. validates database connectivity and schema assumptions
-4. pulls the latest image
-5. rewrites generated runtime files
-6. recreates the container
+1. validates database connectivity and schema assumptions
+2. pulls the latest image
+3. refreshes the global `ssl-service` symlink to the current source checkout
+4. rewrites generated runtime files
+5. recreates the container
 
-If you are upgrading a machine from an older installer generation, running a fresh external `setup.sh` is also valid:
+`ssl-service update` does not pull Git changes for the source checkout. If you want updated command logic from the repository, update `/root/ssl-service` with `git pull` first.
+
+If you are upgrading a machine from an older installer generation, rerun the bootstrap installer:
 
 ```bash
-curl -fsSL -o /tmp/setup.sh https://github.com/bitsfactor/ssl-service/raw/main/scripts/setup.sh
-bash /tmp/setup.sh update
+curl -fsSL -o /tmp/ssl-service-install.sh https://github.com/bitsfactor/ssl-service/raw/main/scripts/install.sh
+bash /tmp/ssl-service-install.sh update
 ```
 
 ## Runtime Status Checks
@@ -212,8 +222,8 @@ ssl-service domain check api.example.com
 Useful file inspections:
 
 ```bash
-cat /root/.ssl-service/config/config.yaml
-cat /root/.ssl-service/state/generated/Caddyfile
+ls -lah /root/.ssl-service/config
+ls -lah /root/.ssl-service/state
 ls -lah /root/.ssl-service/logs
 ```
 
@@ -237,17 +247,16 @@ This queries the repository workflow configured for image publishing.
 
 ## Configuration Notes
 
-Production config file:
+Production runtime config lives under:
 
-- `/root/.ssl-service/config/config.yaml`
+- `/root/.ssl-service/config/`
 
 Key defaults written by the installer:
 
 - poll interval: `30s`
 - renew before expiry: `30 days`
 - certificate retry backoff after failure: `3600s`
-- controller log file: `/app/logs/controller.log`
-- Caddy log file: `/app/logs/caddy.log`
+- logs are written under `/root/.ssl-service/logs/`
 
 In `readwrite` mode, `install`, `reconfigure`, and `update` will create or migrate the required PostgreSQL schema objects.
 
@@ -255,8 +264,7 @@ In `readwrite` mode, `install`, `reconfigure`, and `update` will create or migra
 
 When PostgreSQL is temporarily unavailable after startup:
 
-- existing local certificates under `/root/.ssl-service/state/certs/` can continue serving TLS
-- the last generated Caddyfile can usually continue routing current traffic
+- existing local runtime state under `/root/.ssl-service/state/` can usually continue serving current traffic
 - new route sync, new certificate issuance, and renewals are affected until the database returns
 
 When upstream reachability fails:

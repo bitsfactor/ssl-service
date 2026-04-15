@@ -68,8 +68,12 @@ def test_install_sh_requires_tty_when_no_flags(tmp_path: Path) -> None:
 def test_install_sh_uses_github_download_url() -> None:
   content = INSTALL_SCRIPT.read_text()
 
-  assert "https://github.com/bitsfactor/ssl-service/raw/" in content
-  assert "raw.githubusercontent.com" not in content
+  assert 'REPO_URL="${SSL_SERVICE_REPO_URL:-https://github.com/bitsfactor/ssl-service.git}"' in content
+  assert 'normalize_repo_url() {' in content
+  assert 'git clone --depth 1 --branch "${INSTALL_REF}" "${REPO_URL}" "${SOURCE_ROOT}"' in content
+  assert 'git -C "${SOURCE_ROOT}" fetch --depth 1 origin "${INSTALL_REF}"' in content
+  assert 'Existing checkout at ${SOURCE_ROOT} has local changes; skipping git update and using current checkout' in content
+  assert 'git@github.com:' in content
 
 
 def test_install_requires_mode_without_tty_when_config_missing(tmp_path: Path) -> None:
@@ -181,8 +185,6 @@ def test_update_stops_and_cleans_legacy_runtime() -> None:
   content = SCRIPT.read_text()
 
   update_block = content.split("update_command() {", 1)[1].split("\n}\n\nuninstall_command()", 1)[0]
-  assert 'if is_managed_setup_invocation && [[ "${SSL_SERVICE_UPDATE_STAGE:-}" != "post-self-update" ]]; then' in update_block
-  assert 'exec env SSL_SERVICE_UPDATE_STAGE=post-self-update bash "${MANAGED_SETUP_PATH}" update "$@"' in update_block
   assert "stop_legacy_runtime" in update_block
   assert "remove_legacy_runtime" in update_block
   assert 'rm -f /etc/profile.d/ssl-proxy-shell.sh' in content
@@ -208,12 +210,12 @@ def test_interactive_menu_resets_default_selection_to_exit_after_actions() -> No
   assert '"Show image build status"' in content
 
 
-def test_install_writes_global_ssl_service_wrapper_and_cleans_old_aliases() -> None:
+def test_install_symlinks_global_ssl_service_to_source_tree_and_cleans_old_aliases() -> None:
   content = SCRIPT.read_text()
 
   assert 'GLOBAL_COMMAND_PATH="${SSL_SERVICE_GLOBAL_COMMAND_PATH:-/usr/local/bin/ssl-service}"' in content
-  assert 'cat > "${GLOBAL_COMMAND_PATH}" <<EOF' in content
-  assert 'exec bash "${ENTRYPOINT_PATH}" "\\$@"' in content
+  assert 'ln -sfn "${SOURCE_SETUP_PATH}" "${GLOBAL_COMMAND_PATH}"' in content
+  assert 'rm -f "${INSTALL_ROOT}/bin/ssl-service" "${INSTALL_ROOT}/bin/setup.sh" "${INSTALL_ROOT}/bin/domain-manage.sh"' in content
   assert 'remove_shell_alias' in content
   assert 'log "command: ${GLOBAL_COMMAND_PATH}"' in content
 
@@ -223,6 +225,8 @@ def test_external_setup_without_source_tree_can_auto_update_existing_runtime() -
 
   assert 'should_auto_update_from_external_setup' in content
   assert 'Existing installation detected. Updating runtime from this setup.sh.' in content
+  assert 'handoff_to_source_setup_for_update() {' in content
+  assert 'exec bash "${source_setup}" update' in content
 
 
 def test_interactive_input_uses_dev_tty_and_safe_clear() -> None:

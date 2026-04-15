@@ -66,7 +66,7 @@ def test_fetch_routes_returns_route_records(monkeypatch) -> None:
   now = datetime.now(tz=UTC)
   cursor = FakeCursor(
     rows=[
-      {"domain": "a.example.com", "upstream_target": "host.docker.internal:6111", "enabled": True, "updated_at": now},
+      {"domain": "a.example.com", "upstream_target": "127.0.0.1:6111", "enabled": True, "updated_at": now},
       {"domain": "b.example.com", "upstream_target": None, "enabled": True, "updated_at": now},
     ]
   )
@@ -76,11 +76,11 @@ def test_fetch_routes_returns_route_records(monkeypatch) -> None:
   records = Database("postgresql://example").fetch_routes()
 
   assert records == [
-    RouteRecord(domain="a.example.com", upstream_target="host.docker.internal:6111", enabled=True, updated_at=now),
+    RouteRecord(domain="a.example.com", upstream_target="127.0.0.1:6111", enabled=True, updated_at=now),
     RouteRecord(domain="b.example.com", upstream_target=None, enabled=True, updated_at=now),
   ]
   assert "FROM routes" in cursor.executed[0][0]
-  assert "host.docker.internal:" in cursor.executed[0][0]
+  assert "127.0.0.1:" in cursor.executed[0][0]
 
 
 def test_fetch_certificates_returns_domain_map(monkeypatch) -> None:
