@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
+import urllib.parse
+import urllib.request
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +17,9 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 from .config import AppConfig
 from .db import CertificateRecord, Database
+
+
+IDENTICAL_CLOUDFLARE_RECORD_ERROR = "An identical record already exists."
 
 
 def ensure_dns_cloudflare_plugin(certbot_binary: str) -> None:
@@ -51,6 +57,51 @@ def cloudflare_credentials_file(api_token: str):
     temp_path.unlink(missing_ok=True)
 
 
+def _cloudflare_request(zone_token: str, method: str, url: str) -> dict:
+  request = urllib.request.Request(
+    url,
+    method=method,
+    headers={
+      "Authorization": f"Bearer {zone_token}",
+      "Content-Type": "application/json",
+    },
+  )
+  with urllib.request.urlopen(request, timeout=20) as response:
+    return json.load(response)
+
+
+def _cleanup_cloudflare_acme_txt_records(zone_id: str, zone_token: str, domain: str) -> None:
+  validation_name = f"_acme-challenge.{domain}".rstrip(".")
+  params = urllib.parse.urlencode(
+    {
+      "type": "TXT",
+      "name": validation_name,
+      "per_page": "100",
+    }
+  )
+  records_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?{params}"
+  payload = _cloudflare_request(zone_token, "GET", records_url)
+  for record in payload.get("result", []):
+    record_id = record.get("id")
+    if not record_id:
+      continue
+    delete_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
+    _cloudflare_request(zone_token, "DELETE", delete_url)
+
+
+def _run_certbot_with_cloudflare_recovery(command: list[str], zone_id: str, zone_token: str, domain: str) -> None:
+  try:
+    subprocess.run(command, check=True)
+    return
+  except subprocess.CalledProcessError as exc:
+    details = " ".join(part for part in [str(exc), getattr(exc, "stderr", "") or "", getattr(exc, "stdout", "") or ""] if part)
+    if IDENTICAL_CLOUDFLARE_RECORD_ERROR not in details:
+      raise
+
+  _cleanup_cloudflare_acme_txt_records(zone_id, zone_token, domain)
+  subprocess.run(command, check=True)
+
+
 def issue_certificate(config: AppConfig, database: Database, domain: str) -> CertificateRecord:
   if not config.acme.email:
     raise ValueError("acme.email is required in readwrite mode")
@@ -83,7 +134,7 @@ def issue_certificate(config: AppConfig, database: Database, domain: str) -> Cer
     if config.acme.staging:
       command.append("--test-cert")
     command.extend(config.acme.certbot_args)
-    subprocess.run(command, check=True)
+    _run_certbot_with_cloudflare_recovery(command, zone_token.zone_id, zone_token.api_token, domain)
 
   live_dir = Path("/etc/letsencrypt/live") / cert_name
   fullchain_pem = live_dir.joinpath("fullchain.pem").read_text()
