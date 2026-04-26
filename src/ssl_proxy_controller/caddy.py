@@ -122,18 +122,35 @@ def render_caddyfile(
       f"https://{route.domain} {{",
       f"\ttls {domain_dir / 'fullchain.pem'} {domain_dir / 'privkey.pem'}",
     ]
-    if route.upstream_target is None:
-      block.extend(
-        [
-          '\trespond "certificate-only route" 200',
-        ]
-      )
+    # A route has upstreams if the route_upstreams table has rows for
+    # it; we fall back to the legacy single upstream_target for old
+    # callers (tests, seed data) that still construct RouteRecord with
+    # only that field.
+    targets: list[str] = []
+    if route.upstreams:
+      targets = [
+        canonicalize_upstream_target_for_container(up.target)
+        for up in route.upstreams
+      ]
+    elif route.upstream_target is not None:
+      targets = [canonicalize_upstream_target_for_container(route.upstream_target)]
+
+    if not targets:
+      block.append('\trespond "certificate-only route" 200')
     else:
-      block.extend(
-        [
-          f"\treverse_proxy {canonicalize_upstream_target_for_container(route.upstream_target)}",
-        ]
-      )
+      policy = (route.lb_policy or "random").strip()
+      joined = " ".join(targets)
+      if len(targets) == 1 and policy == "random":
+        # Keep the simple single-line form for the common case, so
+        # diffs against older-generated Caddyfiles stay minimal.
+        block.append(f"\treverse_proxy {joined}")
+      else:
+        block.append(f"\treverse_proxy {joined} {{")
+        # "random" is Caddy's default; we still emit it explicitly
+        # when there are multiple upstreams so the policy is
+        # self-documenting in the generated config.
+        block.append(f"\t\tlb_policy {policy}")
+        block.append("\t}")
     block.extend(
       [
         "}",

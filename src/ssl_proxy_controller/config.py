@@ -56,6 +56,14 @@ class LoggingConfig:
 
 
 @dataclass(slots=True)
+class AdminConfig:
+  enabled: bool = False
+  bind: str = "127.0.0.1"
+  port: int = 8088
+  token: str = ""
+
+
+@dataclass(slots=True)
 class AppConfig:
   mode: str
   postgres: PostgresConfig
@@ -64,6 +72,7 @@ class AppConfig:
   caddy: CaddyConfig
   acme: AcmeConfig
   logging: LoggingConfig
+  admin: AdminConfig = field(default_factory=AdminConfig)
 
 
 def _normalize_mode(mode: str) -> str:
@@ -138,6 +147,12 @@ def load_config(path: str | Path) -> AppConfig:
       certbot_args=list(acme.get("certbot_args", [])),
     ),
     logging=LoggingConfig(**data.get("logging", {})),
+    admin=AdminConfig(**{
+      "enabled": _normalize_bool(data.get("admin", {}).get("enabled", False)),
+      "bind": str(data.get("admin", {}).get("bind", "127.0.0.1")),
+      "port": int(data.get("admin", {}).get("port", 8088)),
+      "token": str(data.get("admin", {}).get("token", "") or ""),
+    }),
   )
   config.sync.poll_interval_seconds = _require_int("sync.poll_interval_seconds", config.sync.poll_interval_seconds, minimum=1)
   config.sync.renew_before_days = _require_int("sync.renew_before_days", config.sync.renew_before_days, minimum=0)
@@ -172,6 +187,11 @@ def load_config(path: str | Path) -> AppConfig:
     raise ValueError("caddy.reload_command must not be empty")
   if config.mode == "readwrite" and not config.acme.email.strip():
     raise ValueError("acme.email is required in readwrite mode")
+  config.admin.port = _require_int("admin.port", config.admin.port, minimum=1)
+  if config.admin.port > 65535:
+    raise ValueError("admin.port must be <= 65535")
+  if config.admin.enabled and not config.admin.token.strip():
+    raise ValueError("admin.token is required when admin.enabled is true")
   return config
 
 
@@ -211,5 +231,11 @@ def as_dict(config: AppConfig) -> dict[str, Any]:
       "caddy_log_path": config.logging.caddy_log_path,
       "caddy_log_roll_size_mb": config.logging.caddy_log_roll_size_mb,
       "caddy_log_roll_keep": config.logging.caddy_log_roll_keep,
+    },
+    "admin": {
+      "enabled": config.admin.enabled,
+      "bind": config.admin.bind,
+      "port": config.admin.port,
+      "token": "***" if config.admin.token else "",
     },
   }

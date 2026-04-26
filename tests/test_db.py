@@ -2,14 +2,29 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from ssl_proxy_controller.db import CertificateRecord, Database, RouteRecord
+from ssl_proxy_controller.db import (
+  CertificateRecord,
+  Database,
+  RouteRecord,
+  UpstreamRecord,
+)
 
 
 class FakeCursor:
-  def __init__(self, rows: list[dict] | None = None, row: dict | None = None) -> None:
-    self.rows = rows or []
+  """Minimal psycopg-like cursor.
+
+  `rows` is either a single result set (legacy shape, reused for every
+  fetchall call) or a list-of-result-sets that are returned in order
+  on each fetchall. Similarly `row` can be a single dict or a list of
+  dicts returned in order from fetchone.
+  """
+
+  def __init__(self, rows: list[dict] | list[list[dict]] | None = None, row: dict | list[dict | None] | None = None) -> None:
+    self.rows = rows if rows is not None else []
     self.row = row
     self.executed: list[tuple[str, object]] = []
+    self._fetchall_idx = 0
+    self._fetchone_idx = 0
 
   def __enter__(self) -> "FakeCursor":
     return self
@@ -21,9 +36,21 @@ class FakeCursor:
     self.executed.append((query, params))
 
   def fetchall(self) -> list[dict]:
-    return self.rows
+    # If rows is a list of batches, return them in sequence; else it's
+    # a single batch and we keep returning it.
+    if self.rows and isinstance(self.rows[0], list):
+      idx = min(self._fetchall_idx, len(self.rows) - 1)
+      self._fetchall_idx += 1
+      return self.rows[idx]  # type: ignore[return-value]
+    return self.rows  # type: ignore[return-value]
 
   def fetchone(self) -> dict | None:
+    if isinstance(self.row, list):
+      if self._fetchone_idx >= len(self.row):
+        return None
+      result = self.row[self._fetchone_idx]
+      self._fetchone_idx += 1
+      return result
     return self.row
 
 
@@ -65,9 +92,20 @@ def make_certificate(domain: str) -> CertificateRecord:
 def test_fetch_routes_returns_route_records(monkeypatch) -> None:
   now = datetime.now(tz=UTC)
   cursor = FakeCursor(
+    # Two result sets, in order: first the routes SELECT, then the
+    # route_upstreams hydration SELECT.
     rows=[
-      {"domain": "a.example.com", "upstream_target": "127.0.0.1:6111", "enabled": True, "updated_at": now},
-      {"domain": "b.example.com", "upstream_target": None, "enabled": True, "updated_at": now},
+      [
+        {"domain": "a.example.com", "upstream_target": "127.0.0.1:6111", "enabled": True, "updated_at": now, "lb_policy": "random"},
+        {"domain": "b.example.com", "upstream_target": None, "enabled": True, "updated_at": now, "lb_policy": "random"},
+        {"domain": "c.example.com", "upstream_target": "10.0.0.1:6111", "enabled": True, "updated_at": now, "lb_policy": "ip_hash"},
+      ],
+      [
+        # route_upstreams rows. c.example.com has two upstreams; a.example.com has one; b.example.com has none.
+        {"domain": "a.example.com", "target": "127.0.0.1:6111", "weight": 1},
+        {"domain": "c.example.com", "target": "10.0.0.1:6111", "weight": 1},
+        {"domain": "c.example.com", "target": "10.0.0.2:6111", "weight": 2},
+      ],
     ]
   )
   connection = FakeConnection(cursor)
@@ -75,12 +113,22 @@ def test_fetch_routes_returns_route_records(monkeypatch) -> None:
 
   records = Database("postgresql://example").fetch_routes()
 
-  assert records == [
-    RouteRecord(domain="a.example.com", upstream_target="127.0.0.1:6111", enabled=True, updated_at=now),
-    RouteRecord(domain="b.example.com", upstream_target=None, enabled=True, updated_at=now),
+  assert [r.domain for r in records] == ["a.example.com", "b.example.com", "c.example.com"]
+  assert records[0].upstream_target == "127.0.0.1:6111"
+  assert records[0].upstreams == [UpstreamRecord(target="127.0.0.1:6111", weight=1)]
+  assert records[0].lb_policy == "random"
+
+  assert records[1].upstream_target is None
+  assert records[1].upstreams == []
+  assert records[1].lb_policy == "random"
+
+  assert records[2].upstreams == [
+    UpstreamRecord(target="10.0.0.1:6111", weight=1),
+    UpstreamRecord(target="10.0.0.2:6111", weight=2),
   ]
+  assert records[2].lb_policy == "ip_hash"
   assert "FROM routes" in cursor.executed[0][0]
-  assert "127.0.0.1:" in cursor.executed[0][0]
+  assert "FROM route_upstreams" in cursor.executed[1][0]
 
 
 def test_fetch_certificates_returns_domain_map(monkeypatch) -> None:

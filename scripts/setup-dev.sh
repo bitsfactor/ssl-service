@@ -20,13 +20,15 @@ usage() {
   cat <<EOF
 Usage:
   setup-dev.sh bootstrap
-  setup-dev.sh test
+  setup-dev.sh test [pytest args...]
   setup-dev.sh run-once [--config <path>]
+  setup-dev.sh admin [--port 8088] [--bind 127.0.0.1] [--token dev-token] [--mode readwrite|readonly] [--no-seed]
   setup-dev.sh domain <domain-command> [args...]
 
 Notes:
   - run this script from the source tree
   - bootstrap creates local development venvs inside the repo
+  - admin starts the web admin UI against an in-memory fake DB (no Postgres needed)
 EOF
 }
 
@@ -98,6 +100,12 @@ domain_command() {
   SSL_PROXY_CONFIG="${REPO_DIR}/config.yaml" bash "${REPO_DIR}/scripts/domain-manage.sh" "$@"
 }
 
+admin_command() {
+  ensure_repo_root
+  [[ -x "${VENV_DIR}/bin/python" ]] || bootstrap_command
+  "${VENV_DIR}/bin/python" "${REPO_DIR}/scripts/dev-admin.py" "$@"
+}
+
 main() {
   local command="${1:-}"
   case "${command}" in
@@ -116,6 +124,10 @@ main() {
     domain)
       shift
       domain_command "$@"
+      ;;
+    admin|dev-admin|admin-server)
+      shift
+      admin_command "$@"
       ;;
     -h|--help|help|"")
       usage

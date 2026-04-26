@@ -1,0 +1,2693 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ssl-service · admin</title>
+<style>
+  :root {
+    --bg: #f7f4ee;
+    --surface: #ffffff;
+    --surface-alt: #faf7f1;
+    --border: #e6e0d6;
+    --border-strong: #d5ccbd;
+    --text: #1a1915;
+    --text-dim: #6b665c;
+    --text-soft: #928b7c;
+    --accent: #c46a3d;
+    --accent-dim: #b75c30;
+    --accent-bg: rgba(196, 106, 61, 0.08);
+    --success: #4c8a5a;
+    --success-bg: rgba(76, 138, 90, 0.1);
+    --warning: #b37c1c;
+    --warning-bg: rgba(179, 124, 28, 0.1);
+    --danger: #b13d2b;
+    --danger-bg: rgba(177, 61, 43, 0.08);
+    --info: #3a6f8d;
+    --info-bg: rgba(58, 111, 141, 0.08);
+    --radius: 8px;
+    --radius-lg: 12px;
+    --shadow: 0 1px 2px rgba(26, 25, 21, 0.04), 0 4px 16px rgba(26, 25, 21, 0.04);
+    --mono: "SFMono-Regular", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --serif: "Copernicus", "Charter", "Iowan Old Style", Georgia, serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    font-size: 14px;
+    color: var(--text);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  button, input, select, textarea { font: inherit; color: inherit; }
+
+  /* Layout */
+  .app { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
+  .sidebar {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    padding: 20px 16px;
+    display: flex; flex-direction: column; gap: 8px;
+    position: sticky; top: 0; height: 100vh;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 8px 16px 8px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 8px;
+  }
+  .brand .logo {
+    width: 28px; height: 28px; border-radius: 6px;
+    background: linear-gradient(140deg, #c46a3d, #9a4b27);
+    display: grid; place-items: center; color: #fff;
+    font-weight: 700; font-family: var(--serif); font-size: 15px;
+  }
+  .brand .title { font-family: var(--serif); font-size: 18px; font-weight: 600; line-height: 1; }
+  .brand .subtitle { color: var(--text-soft); font-size: 12px; margin-top: 2px; }
+
+  .nav { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
+  .nav a {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; border-radius: 6px;
+    color: var(--text); font-weight: 500;
+  }
+  .nav a:hover { background: var(--surface-alt); text-decoration: none; }
+  .nav a.active { background: var(--accent-bg); color: var(--accent-dim); }
+  .nav a .ico { width: 16px; height: 16px; opacity: 0.85; }
+
+  .nav-footer {
+    margin-top: auto;
+    padding-top: 16px; border-top: 1px solid var(--border);
+    color: var(--text-soft); font-size: 12px;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .nav-footer .mode-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 8px; border-radius: 999px; font-weight: 600; font-size: 11px;
+  }
+  .mode-readwrite { background: var(--danger-bg); color: var(--danger); }
+  .mode-readonly { background: var(--info-bg); color: var(--info); }
+  .mode-unknown { background: var(--surface-alt); color: var(--text-dim); }
+
+  /* Main area */
+  .main { padding: 28px 36px 64px 36px; min-width: 0; }
+  .page-header {
+    display: flex; justify-content: space-between; align-items: flex-end;
+    gap: 24px; margin-bottom: 24px;
+  }
+  .page-header h1 {
+    font-family: var(--serif); font-size: 28px; font-weight: 600;
+    margin: 0 0 4px 0;
+  }
+  .page-header .lede { color: var(--text-dim); font-size: 14px; margin: 0; }
+
+  /* Cards */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow);
+  }
+  .card + .card { margin-top: 16px; }
+  .card-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 16px 20px; border-bottom: 1px solid var(--border);
+  }
+  .card-header h2 {
+    font-family: var(--serif); font-weight: 600; font-size: 17px; margin: 0;
+  }
+  .card-header .hint { color: var(--text-soft); font-size: 12px; }
+  .card-body { padding: 20px; }
+  .card-body.tight { padding: 0; }
+  .card-footer {
+    padding: 12px 20px; border-top: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center;
+    color: var(--text-soft); font-size: 12px;
+  }
+
+  /* Stats grid */
+  .stats {
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 14px; margin-bottom: 20px;
+  }
+  @media (max-width: 1000px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .stat {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-lg); padding: 16px 18px;
+  }
+  .stat .label { color: var(--text-soft); font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; }
+  .stat .value { font-family: var(--serif); font-size: 28px; font-weight: 600; margin-top: 6px; }
+  .stat .sub { color: var(--text-dim); font-size: 12px; margin-top: 4px; }
+  .stat.highlight { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-bg); }
+  .stat .value.warn { color: var(--warning); }
+  .stat .value.danger { color: var(--danger); }
+
+  /* Forms */
+  .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+  .field label {
+    font-size: 12px; font-weight: 600;
+    color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .field .hint { color: var(--text-soft); font-size: 12px; font-weight: 400; text-transform: none; letter-spacing: 0; }
+  .input, .select, .textarea {
+    padding: 9px 12px; border-radius: 8px;
+    border: 1px solid var(--border-strong); background: var(--surface);
+    outline: none; transition: border-color .15s, box-shadow .15s;
+  }
+  .input:focus, .select:focus, .textarea:focus {
+    border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg);
+  }
+  .input.mono, .textarea.mono { font-family: var(--mono); }
+  .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .form-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px; }
+  .inline-checkbox { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+
+  /* Buttons */
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px; justify-content: center;
+    padding: 8px 14px; border-radius: 8px;
+    border: 1px solid var(--border-strong); background: var(--surface);
+    font-weight: 600; cursor: pointer; transition: background .15s, border-color .15s, color .15s;
+  }
+  .btn:hover { background: var(--surface-alt); }
+  .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn-primary:hover { background: var(--accent-dim); border-color: var(--accent-dim); }
+  .btn-ghost { background: transparent; border-color: transparent; color: var(--text-dim); }
+  .btn-ghost:hover { background: var(--surface-alt); color: var(--text); }
+  .btn-danger { color: var(--danger); border-color: rgba(177, 61, 43, 0.3); background: var(--surface); }
+  .btn-danger:hover { background: var(--danger-bg); border-color: var(--danger); }
+  .btn-sm { padding: 5px 10px; font-size: 12px; border-radius: 6px; }
+
+  /* Tables */
+  .table-wrap { overflow: auto; }
+  table.data {
+    width: 100%; border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  table.data thead th {
+    text-align: left; font-weight: 600; font-size: 11px;
+    letter-spacing: 0.04em; text-transform: uppercase;
+    color: var(--text-soft);
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: var(--surface); z-index: 1;
+  }
+  table.data tbody td {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+  }
+  table.data tbody tr:last-child td { border-bottom: none; }
+  table.data tbody tr:hover { background: var(--surface-alt); }
+  table.data td.domain { font-family: var(--mono); font-size: 13px; }
+  table.data td.actions { text-align: right; white-space: nowrap; }
+  table.data td.actions .btn { margin-left: 6px; }
+
+  /* Badges */
+  .badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 999px;
+    background: var(--surface-alt); color: var(--text-dim);
+  }
+  .badge.ok { background: var(--success-bg); color: var(--success); }
+  .badge.warn { background: var(--warning-bg); color: var(--warning); }
+  .badge.danger { background: var(--danger-bg); color: var(--danger); }
+  .badge.info { background: var(--info-bg); color: var(--info); }
+  .badge .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor;
+  }
+
+  /* Modal */
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(20, 18, 14, 0.34);
+    display: none; align-items: center; justify-content: center; z-index: 40;
+    padding: 20px;
+  }
+  .modal-backdrop.open { display: flex; }
+  .modal {
+    background: var(--surface); border-radius: 14px; width: 560px; max-width: 100%;
+    box-shadow: 0 20px 60px rgba(20, 18, 14, 0.25);
+    border: 1px solid var(--border);
+    overflow: hidden;
+    max-height: 90vh; display: flex; flex-direction: column;
+  }
+  .modal-header { padding: 18px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  .modal-header h3 { font-family: var(--serif); font-size: 18px; font-weight: 600; margin: 0; }
+  .modal-body { padding: 20px; overflow: auto; }
+  .modal-footer { padding: 14px 20px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end; }
+
+  /* Toast */
+  .toast-host { position: fixed; top: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 50; }
+  .toast {
+    min-width: 260px; max-width: 400px;
+    padding: 12px 14px; border-radius: 10px;
+    background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow);
+    font-size: 13px; display: flex; gap: 10px; align-items: flex-start;
+  }
+  .toast.success { border-color: var(--success); }
+  .toast.error { border-color: var(--danger); }
+  .toast.info { border-color: var(--info); }
+  .toast .label { font-weight: 600; }
+  .toast .close { background: none; border: none; cursor: pointer; color: var(--text-soft); margin-left: auto; }
+
+  /* Utility */
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .row.between { justify-content: space-between; }
+  .spacer { flex: 1; }
+  .mono { font-family: var(--mono); font-size: 13px; }
+  .muted { color: var(--text-soft); }
+  .sep { border-top: 1px solid var(--border); margin: 16px 0; }
+  .hidden { display: none !important; }
+  .loader {
+    display: inline-block; width: 14px; height: 14px; border-radius: 50%;
+    border: 2px solid var(--border-strong); border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Login overlay */
+  .login {
+    position: fixed; inset: 0; background: var(--bg);
+    display: none; align-items: center; justify-content: center; z-index: 60;
+    padding: 20px;
+  }
+  .login.open { display: flex; }
+  .login-card {
+    background: var(--surface); width: 420px; max-width: 100%;
+    border: 1px solid var(--border); border-radius: 14px; padding: 28px;
+    box-shadow: var(--shadow);
+  }
+  .login-card h2 { font-family: var(--serif); font-size: 24px; margin: 0 0 4px 0; }
+  .login-card p { margin: 0 0 20px 0; color: var(--text-dim); }
+
+  /* Log viewer */
+  .log-viewer {
+    background: #12110f; color: #f1ece2; font-family: var(--mono); font-size: 12.5px;
+    padding: 14px 16px; border-radius: 8px; max-height: 540px; overflow: auto;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .log-viewer .dim { color: #7c7669; }
+
+  /* Empty state */
+  .empty {
+    padding: 36px 16px; text-align: center; color: var(--text-dim);
+  }
+  .empty .title { font-family: var(--serif); font-size: 18px; color: var(--text); margin-bottom: 4px; }
+  .empty .sub { color: var(--text-soft); font-size: 13px; }
+
+  /* Action menu (dropdown for row actions) */
+  .menu-host { position: relative; display: inline-block; }
+  .menu-pop {
+    position: absolute; right: 0; top: calc(100% + 4px);
+    min-width: 180px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(20, 18, 14, 0.18);
+    padding: 4px; z-index: 30;
+    display: none;
+  }
+  .menu-host.open .menu-pop { display: block; }
+  .menu-pop .group-label {
+    font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--text-soft);
+    padding: 6px 10px 4px 10px;
+  }
+  .menu-pop button {
+    display: block; width: 100%; text-align: left;
+    background: transparent; border: 0; padding: 7px 10px;
+    border-radius: 6px; font-size: 13px; font-weight: 500;
+    color: var(--text); cursor: pointer;
+  }
+  .menu-pop button:hover { background: var(--surface-alt); }
+  .menu-pop button.danger { color: var(--danger); }
+  .menu-pop button.danger:hover { background: var(--danger-bg); }
+  .menu-pop hr { border: 0; border-top: 1px solid var(--border); margin: 4px 0; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+  .tab {
+    padding: 10px 14px; font-weight: 600; font-size: 13px;
+    color: var(--text-dim); cursor: pointer; border-bottom: 2px solid transparent;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+</style>
+</head>
+<body>
+
+<!-- Login overlay -->
+<div id="login" class="login">
+  <div class="login-card">
+    <div class="brand" style="margin: 0 0 18px 0; padding: 0; border-bottom: 0;">
+      <div class="logo">ss</div>
+      <div>
+        <div class="title">ssl-service</div>
+        <div class="subtitle">admin console</div>
+      </div>
+    </div>
+    <h2>Sign in</h2>
+    <p>Enter the admin token configured in <span class="mono">config.yaml</span> under <span class="mono">admin.token</span>.</p>
+    <form id="login-form">
+      <div class="field">
+        <label for="login-token">Admin token</label>
+        <input id="login-token" class="input mono" type="password" autocomplete="current-password" required />
+      </div>
+      <div class="field inline-checkbox">
+        <input id="login-remember" type="checkbox" checked />
+        <label for="login-remember" style="margin: 0;">Remember this session</label>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary" type="submit">Continue</button>
+      </div>
+      <div id="login-error" class="hint" style="color: var(--danger); min-height: 16px; margin-top: 6px;"></div>
+    </form>
+  </div>
+</div>
+
+<!-- App shell -->
+<div id="app" class="app hidden">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">ss</div>
+      <div>
+        <div class="title">ssl-service</div>
+        <div class="subtitle">admin console</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <a href="#/dashboard" data-nav="dashboard">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="5" height="6" rx="1"/><rect x="9" y="2" width="5" height="4" rx="1"/><rect x="2" y="10" width="5" height="4" rx="1"/><rect x="9" y="8" width="5" height="6" rx="1"/></svg>
+        Dashboard
+      </a>
+      <a href="#/routes" data-nav="routes">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="3" cy="3" r="1.5"/><circle cx="13" cy="8" r="1.5"/><circle cx="3" cy="13" r="1.5"/><path d="M3 3h4a3 3 0 0 1 3 3v0M3 13h4a3 3 0 0 0 3-3V8"/></svg>
+        Routes
+      </a>
+      <a href="#/certificates" data-nav="certificates">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 1l6 3v3c0 4-2.5 7-6 8-3.5-1-6-4-6-8V4l6-3z"/><path d="M5.5 8l2 2 3-4"/></svg>
+        Certificates
+      </a>
+      <a href="#/zones" data-nav="zones">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c2 2 3 4 3 6s-1 4-3 6c-2-2-3-4-3-6s1-4 3-6z"/></svg>
+        DNS Zones
+      </a>
+      <a href="#/nodes" data-nav="nodes">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="12" height="4" rx="1"/><rect x="2" y="9" width="12" height="4" rx="1"/><circle cx="4.5" cy="5" r="0.5" fill="currentColor"/><circle cx="4.5" cy="11" r="0.5" fill="currentColor"/></svg>
+        Nodes
+      </a>
+      <a href="#/services" data-nav="services">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4l6-2 6 2v8l-6 2-6-2V4z"/><path d="M2 4l6 2 6-2M8 6v8"/></svg>
+        Services
+      </a>
+      <a href="#/logs" data-nav="logs">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="12" height="12" rx="2"/><path d="M5 6h6M5 9h6M5 12h3"/></svg>
+        Logs
+      </a>
+      <a href="#/settings" data-nav="settings">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="2"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M3.2 12.8l1.4-1.4M11.4 4.6l1.4-1.4"/></svg>
+        Settings
+      </a>
+    </nav>
+    <div class="nav-footer">
+      <span id="mode-pill" class="mode-pill mode-unknown"><span class="dot" style="width:6px;height:6px;border-radius:50%;background:currentColor"></span><span id="mode-label">…</span></span>
+      <span id="server-time" class="muted mono">—</span>
+      <button class="btn btn-sm btn-ghost" id="logout-btn" style="margin-top: 8px; align-self: flex-start;">Sign out</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div id="view-root"></div>
+  </main>
+</div>
+
+<!-- Modal -->
+<div id="modal-backdrop" class="modal-backdrop">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="modal-title">Title</h3>
+      <button class="btn btn-ghost btn-sm" id="modal-close">✕</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-footer" id="modal-footer"></div>
+  </div>
+</div>
+
+<!-- Toasts -->
+<div id="toast-host" class="toast-host"></div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---------------------------------------------------------------------------
+  // Token management & API client
+  // ---------------------------------------------------------------------------
+
+  const TOKEN_STORAGE_KEY = "ssl-service-admin-token";
+
+  const Store = {
+    getToken() {
+      try { return localStorage.getItem(TOKEN_STORAGE_KEY) || sessionStorage.getItem(TOKEN_STORAGE_KEY) || ""; }
+      catch (_) { return ""; }
+    },
+    setToken(value, remember) {
+      try {
+        (remember ? localStorage : sessionStorage).setItem(TOKEN_STORAGE_KEY, value);
+        const other = remember ? sessionStorage : localStorage;
+        other.removeItem(TOKEN_STORAGE_KEY);
+      } catch (_) {}
+    },
+    clearToken() {
+      try {
+        localStorage.removeItem(TOKEN_STORAGE_KEY);
+        sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+      } catch (_) {}
+    },
+  };
+
+  async function api(method, path, body = undefined) {
+    const token = Store.getToken();
+    const headers = { "Accept": "application/json" };
+    if (token) headers["Authorization"] = "Bearer " + token;
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    const res = await fetch(path, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const text = await res.text();
+    let data = null;
+    if (text) {
+      try { data = JSON.parse(text); } catch { data = text; }
+    }
+    if (!res.ok) {
+      const err = new Error((data && data.error && data.error.message) || res.statusText);
+      err.status = res.status;
+      err.code = data && data.error && data.error.code;
+      err.payload = data;
+      throw err;
+    }
+    return data;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Utilities
+  // ---------------------------------------------------------------------------
+
+  const h = (tag, attrs = {}, ...children) => {
+    const el = document.createElement(tag);
+    for (const [key, value] of Object.entries(attrs || {})) {
+      if (value == null || value === false) continue;
+      if (key === "class" || key === "className") el.setAttribute("class", String(value));
+      else if (key === "style" && typeof value === "object") Object.assign(el.style, value);
+      else if (key.startsWith("on") && typeof value === "function") el.addEventListener(key.slice(2).toLowerCase(), value);
+      else if (key === "html") el.innerHTML = value;
+      else el.setAttribute(key, value === true ? "" : String(value));
+    }
+    for (const child of children.flat()) {
+      if (child == null || child === false) continue;
+      el.appendChild(child instanceof Node ? child : document.createTextNode(String(child)));
+    }
+    return el;
+  };
+
+  function fmtDate(value) {
+    if (!value) return "—";
+    try {
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return String(value);
+      return d.toLocaleString();
+    } catch { return String(value); }
+  }
+
+  function fmtRelative(value) {
+    if (!value) return "";
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return "";
+    const diff = (d.getTime() - Date.now()) / 1000;
+    const abs = Math.abs(diff);
+    const units = [["year", 31536000], ["month", 2592000], ["day", 86400], ["hour", 3600], ["minute", 60]];
+    for (const [label, seconds] of units) {
+      if (abs >= seconds) {
+        const n = Math.round(diff / seconds);
+        return n >= 0 ? `in ${n} ${label}${Math.abs(n) === 1 ? "" : "s"}` : `${Math.abs(n)} ${label}${Math.abs(n) === 1 ? "" : "s"} ago`;
+      }
+    }
+    return diff >= 0 ? "just now" : "moments ago";
+  }
+
+  function certStatusBadge(cert) {
+    if (!cert) return h("span", { class: "badge" }, "no cert");
+    const days = cert.expires_in_days;
+    if (cert.status === "error") return h("span", { class: "badge danger" }, h("span", { class: "dot" }), "error");
+    if (days != null && days < 0) return h("span", { class: "badge danger" }, h("span", { class: "dot" }), "expired");
+    if (days != null && days < 14) return h("span", { class: "badge warn" }, h("span", { class: "dot" }), `${days}d left`);
+    if (days != null) return h("span", { class: "badge ok" }, h("span", { class: "dot" }), `${days}d left`);
+    return h("span", { class: "badge info" }, "active");
+  }
+
+  function routeStatusBadge(route) {
+    return route.enabled
+      ? h("span", { class: "badge ok" }, h("span", { class: "dot" }), "enabled")
+      : h("span", { class: "badge" }, "disabled");
+  }
+
+  function modeBadge(mode) {
+    const cls = mode === "readwrite" ? "mode-readwrite" : mode === "readonly" ? "mode-readonly" : "mode-unknown";
+    const label = mode === "readwrite" ? "READ/WRITE" : mode === "readonly" ? "READ-ONLY" : "UNKNOWN";
+    return { cls, label };
+  }
+
+  // ---------------------------------------------------------------------------
+  // UI: Toast, Modal
+  // ---------------------------------------------------------------------------
+
+  function toast(kind, title, msg) {
+    const host = document.getElementById("toast-host");
+    const el = h(
+      "div",
+      { class: `toast ${kind}` },
+      h("div", null, h("div", { class: "label" }, title), msg ? h("div", { class: "muted" }, msg) : null),
+      h("button", { class: "close", onclick: () => el.remove(), "aria-label": "Close" }, "✕"),
+    );
+    host.appendChild(el);
+    setTimeout(() => el.remove(), 5000);
+  }
+
+  const Modal = {
+    open({ title, body, footer }) {
+      document.getElementById("modal-title").textContent = title;
+      const bodyEl = document.getElementById("modal-body");
+      const footerEl = document.getElementById("modal-footer");
+      bodyEl.innerHTML = "";
+      footerEl.innerHTML = "";
+      if (body) bodyEl.appendChild(body);
+      if (footer) footerEl.appendChild(footer);
+      document.getElementById("modal-backdrop").classList.add("open");
+    },
+    close() {
+      document.getElementById("modal-backdrop").classList.remove("open");
+    },
+  };
+  document.getElementById("modal-close").addEventListener("click", () => Modal.close());
+  document.getElementById("modal-backdrop").addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) Modal.close();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Views
+  // ---------------------------------------------------------------------------
+
+  const App = {
+    overview: null,
+    mode: null,
+  };
+
+  async function refreshOverview() {
+    try {
+      const data = await api("GET", "/api/overview");
+      App.overview = data;
+      App.mode = data.mode;
+      const { cls, label } = modeBadge(data.mode);
+      const pill = document.getElementById("mode-pill");
+      pill.className = "mode-pill " + cls;
+      document.getElementById("mode-label").textContent = label;
+      document.getElementById("server-time").textContent = fmtDate(data.server_time);
+    } catch (err) {
+      if (err.status === 401) showLogin();
+      else toast("error", "Failed to load overview", err.message);
+    }
+  }
+
+  function setActiveNav(name) {
+    document.querySelectorAll("[data-nav]").forEach(el => {
+      el.classList.toggle("active", el.getAttribute("data-nav") === name);
+    });
+  }
+
+  // ----- Dashboard view -----
+  async function renderDashboard(root) {
+    setActiveNav("dashboard");
+    root.innerHTML = "";
+    root.appendChild(h("div", { class: "page-header" },
+      h("div", null,
+        h("h1", null, "Dashboard"),
+        h("p", { class: "lede" }, "Overview of routes, certificates, and node state."),
+      ),
+      h("div", { class: "row" },
+        h("button", { class: "btn", onclick: async () => { await refreshOverview(); renderDashboard(root); toast("success", "Refreshed"); } }, "Refresh"),
+        App.mode === "readwrite" ?
+          h("button", { class: "btn btn-primary", onclick: async () => {
+            try { const r = await api("POST", "/api/sync"); toast("success", "Caddy reloaded", fmtDate(r.at)); await refreshOverview(); renderDashboard(root); }
+            catch (err) { toast("error", "Sync failed", err.message); }
+          } }, "Sync now") : null,
+      ),
+    ));
+
+    const o = App.overview || { counts: {}, paths: {} };
+    const c = o.counts || {};
+
+    const stats = h("div", { class: "stats" });
+    stats.appendChild(statCard("Routes", c.routes_total ?? "—", `${c.routes_enabled ?? 0} enabled · ${c.routes_disabled ?? 0} disabled`));
+    stats.appendChild(statCard("Certificates", c.certificates_total ?? "—",
+      `${(c.certificates_expiring_soon ?? 0)} expiring · ${(c.certificates_expired ?? 0)} expired`,
+      (c.certificates_expired ?? 0) > 0 ? "danger" : (c.certificates_expiring_soon ?? 0) > 0 ? "warn" : null));
+    stats.appendChild(statCard("DNS zones", c.zones_total ?? "—", "Cloudflare tokens"));
+    stats.appendChild(statCard("Mode", (o.mode || "—").toUpperCase(), (o.acme_email ? `ACME: ${o.acme_email}` : "readonly node")));
+    root.appendChild(stats);
+
+    // Recent routes card
+    const routesCard = h("div", { class: "card" });
+    routesCard.appendChild(h("div", { class: "card-header" },
+      h("h2", null, "Routes"),
+      h("a", { href: "#/routes" }, "View all →"),
+    ));
+    const routesBody = h("div", { class: "card-body tight" });
+    routesCard.appendChild(routesBody);
+    root.appendChild(routesCard);
+
+    const certsCard = h("div", { class: "card" });
+    certsCard.appendChild(h("div", { class: "card-header" },
+      h("h2", null, "Expiring soon"),
+      h("a", { href: "#/certificates" }, "View all →"),
+    ));
+    const certsBody = h("div", { class: "card-body tight" });
+    certsCard.appendChild(certsBody);
+    root.appendChild(certsCard);
+
+    try {
+      const [routesResp, certsResp] = await Promise.all([
+        api("GET", "/api/routes"),
+        api("GET", "/api/certificates"),
+      ]);
+      const recent = [...routesResp.routes].sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || "")).slice(0, 6);
+      routesBody.appendChild(renderRoutesTable(recent, { compact: true }));
+      const soon = [...certsResp.certificates]
+        .filter(c => c.expires_in_days != null && c.expires_in_days < (App.overview?.renew_before_days ?? 30))
+        .sort((a, b) => (a.expires_in_days ?? 0) - (b.expires_in_days ?? 0));
+      if (soon.length === 0) {
+        certsBody.appendChild(h("div", { class: "empty" },
+          h("div", { class: "title" }, "All certificates healthy"),
+          h("div", { class: "sub" }, "No certificates are within the renewal window."),
+        ));
+      } else {
+        certsBody.appendChild(renderCertsTable(soon));
+      }
+    } catch (err) {
+      toast("error", "Could not load dashboard data", err.message);
+    }
+  }
+
+  function statCard(label, value, sub, level) {
+    const valueClass = "value" + (level ? " " + level : "");
+    return h("div", { class: "stat" },
+      h("div", { class: "label" }, label),
+      h("div", { class: valueClass }, String(value)),
+      h("div", { class: "sub" }, sub || ""),
+    );
+  }
+
+  // ----- Routes view -----
+
+  async function renderRoutesView(root, params) {
+    setActiveNav("routes");
+    root.innerHTML = "";
+    root.appendChild(h("div", { class: "page-header" },
+      h("div", null,
+        h("h1", null, "Routes"),
+        h("p", { class: "lede" }, "Domains proxied by this SSL service. Inputs accept " +
+          "a plain port (→ host), " + "`host:port`, or `[ipv6]:port`."),
+      ),
+      h("div", { class: "row" },
+        h("input", { id: "route-search", class: "input", placeholder: "Filter domains…",
+          oninput: (e) => { const q = e.target.value; filterRoutesTable(q); } }),
+        App.mode === "readwrite" ?
+          h("button", { class: "btn btn-primary", onclick: () => openAddRouteModal(async () => renderRoutesView(root, params)) }, "+ Add route") : null,
+      ),
+    ));
+
+    const card = h("div", { class: "card" });
+    card.appendChild(h("div", { class: "card-header" },
+      h("h2", null, "All routes"),
+      h("span", { class: "hint", id: "routes-count" }, ""),
+    ));
+    const body = h("div", { class: "card-body tight", id: "routes-body" });
+    card.appendChild(body);
+    root.appendChild(card);
+
+    try {
+      const resp = await api("GET", "/api/routes");
+      const rows = resp.routes || [];
+      document.getElementById("routes-count").textContent = `${rows.length} route${rows.length === 1 ? "" : "s"}`;
+      if (!rows.length) {
+        body.appendChild(h("div", { class: "empty" },
+          h("div", { class: "title" }, "No routes yet"),
+          h("div", { class: "sub" }, App.mode === "readwrite" ? "Add your first route to get started." : "This is a read-only node — routes are managed elsewhere."),
+        ));
+      } else {
+        body.appendChild(renderRoutesTable(rows));
+      }
+    } catch (err) {
+      if (err.status === 401) showLogin();
+      else toast("error", "Failed to load routes", err.message);
+    }
+  }
+
+  function filterRoutesTable(q) {
+    const lc = (q || "").toLowerCase();
+    document.querySelectorAll("#routes-body tr[data-domain]").forEach(row => {
+      const d = row.getAttribute("data-domain") || "";
+      row.style.display = d.toLowerCase().includes(lc) ? "" : "none";
+    });
+  }
+
+  const LB_POLICIES = ["random", "round_robin", "ip_hash", "uri_hash"];
+  const LB_POLICY_LABELS = {
+    random: "random",
+    round_robin: "round-robin",
+    ip_hash: "ip-hash",
+    uri_hash: "uri-hash",
+  };
+
+  function upstreamsOf(route) {
+    // Prefer the new `upstreams` array; fall back to the legacy scalar.
+    if (Array.isArray(route.upstreams) && route.upstreams.length) {
+      return route.upstreams.map(u => ({ target: u.target, weight: u.weight ?? 1 }));
+    }
+    if (route.upstream_target) {
+      return [{ target: route.upstream_target, weight: 1 }];
+    }
+    return [];
+  }
+
+  function renderUpstreamsCell(route) {
+    const ups = upstreamsOf(route);
+    if (!ups.length) return h("span", { class: "muted" }, "certificate-only");
+    if (ups.length === 1) return h("span", { class: "mono" }, ups[0].target);
+    // Primary + "+N more" — hover title shows the full list.
+    const title = ups.map(u => u.weight === 1 ? u.target : `${u.target} (w=${u.weight})`).join("\n");
+    return h("span", { class: "mono", title },
+      ups[0].target,
+      h("span", { class: "badge info", style: "margin-left: 6px" }, `+${ups.length - 1}`),
+    );
+  }
+
+  function lbPolicyBadge(policy) {
+    const p = policy || "random";
+    if (p === "random") return h("span", { class: "badge muted" }, LB_POLICY_LABELS[p]);
+    if (p === "ip_hash" || p === "uri_hash") return h("span", { class: "badge info" }, LB_POLICY_LABELS[p]);
+    return h("span", { class: "badge info" }, LB_POLICY_LABELS[p] || p);
+  }
+
+  function renderRoutesTable(rows, opts = {}) {
+    const compact = !!opts.compact;
+    const table = h("table", { class: "data" });
+    const thead = h("thead", null,
+      h("tr", null,
+        h("th", null, "Domain"),
+        h("th", null, "Upstreams"),
+        h("th", null, "Policy"),
+        h("th", null, "Status"),
+        h("th", null, "Updated"),
+        h("th", null, ""),
+      ),
+    );
+    table.appendChild(thead);
+    const tbody = h("tbody");
+    for (const r of rows) {
+      const actions = h("td", { class: "actions" });
+      if (!compact) {
+        actions.appendChild(h("button", { class: "btn btn-sm",
+          onclick: () => openEditRouteModal(r, async () => {
+            const root = document.getElementById("view-root");
+            await renderRoutesView(root, {});
+          }) }, "Edit"));
+        if (App.mode === "readwrite") {
+          actions.appendChild(r.enabled
+            ? h("button", { class: "btn btn-sm", onclick: () => toggleRoute(r.domain, false) }, "Disable")
+            : h("button", { class: "btn btn-sm", onclick: () => toggleRoute(r.domain, true) }, "Enable"));
+          actions.appendChild(h("button", { class: "btn btn-sm btn-danger", onclick: () => confirmDelete(r) }, "Delete"));
+        }
+      }
+      const row = h("tr", { "data-domain": r.domain },
+        h("td", { class: "domain" }, r.domain),
+        h("td", null, renderUpstreamsCell(r)),
+        h("td", null, lbPolicyBadge(r.lb_policy)),
+        h("td", null, routeStatusBadge(r)),
+        h("td", { class: "muted" }, fmtRelative(r.updated_at)),
+        actions,
+      );
+      tbody.appendChild(row);
+    }
+    table.appendChild(tbody);
+    const wrap = h("div", { class: "table-wrap" });
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  // Editor for a list of upstream rows + lb_policy selector. Returns an
+  // object with `collect()` returning { upstreams: [{target,weight}], lb_policy }.
+  function buildUpstreamsEditor(initialUpstreams, initialPolicy) {
+    const wrap = h("div");
+
+    const listWrap = h("div", { class: "field" });
+    listWrap.appendChild(h("label", null, "Upstream targets ",
+      h("span", { class: "hint" }, " — host:port, plain port (→ host), or [ipv6]:port. Leave empty for certificate-only.")));
+    const list = h("div", { id: "upstream-list", style: "display: flex; flex-direction: column; gap: 8px;" });
+    listWrap.appendChild(list);
+
+    const addBtn = h("button", {
+      class: "btn btn-sm", type: "button",
+      style: "margin-top: 8px; align-self: flex-start;",
+      onclick: (e) => { e.preventDefault(); addRow("", 1); },
+    }, "+ Add upstream");
+    listWrap.appendChild(addBtn);
+    wrap.appendChild(listWrap);
+
+    const policyWrap = h("div", { class: "field" },
+      h("label", null, "Load-balancing policy ",
+        h("span", { class: "hint" }, " — `random` is the default; the hash/round-robin policies require 2 or more upstreams.")),
+    );
+    const policySel = h("select", { class: "select", id: "lb-policy" });
+    for (const p of LB_POLICIES) {
+      policySel.appendChild(h("option", { value: p, selected: (initialPolicy || "random") === p },
+        LB_POLICY_LABELS[p]));
+    }
+    policyWrap.appendChild(policySel);
+    wrap.appendChild(policyWrap);
+
+    function addRow(target, weight) {
+      const row = h("div", { class: "row", style: "gap: 8px; align-items: center;" });
+      const targetInput = h("input", {
+        class: "input mono", type: "text",
+        style: "flex: 1",
+        placeholder: "127.0.0.1:6111 or [2001:db8::10]:6111 or 6111",
+        value: target || "",
+      });
+      const weightInput = h("input", {
+        class: "input mono", type: "number", min: "1", max: "1000",
+        style: "width: 90px",
+        value: String(weight || 1),
+        title: "Weight",
+      });
+      const removeBtn = h("button", {
+        class: "btn btn-sm btn-ghost", type: "button", title: "Remove",
+        onclick: (e) => { e.preventDefault(); row.remove(); },
+      }, "✕");
+      row.appendChild(targetInput);
+      row.appendChild(h("span", { class: "muted", style: "font-size: 12px" }, "weight"));
+      row.appendChild(weightInput);
+      row.appendChild(removeBtn);
+      list.appendChild(row);
+    }
+
+    const seed = (initialUpstreams && initialUpstreams.length)
+      ? initialUpstreams
+      : [{ target: "", weight: 1 }];
+    for (const u of seed) addRow(u.target || "", u.weight || 1);
+
+    return {
+      root: wrap,
+      collect() {
+        const upstreams = [];
+        for (const row of list.children) {
+          const target = row.querySelector('input[type="text"]').value.trim();
+          const weightRaw = row.querySelector('input[type="number"]').value;
+          const weight = parseInt(weightRaw || "1", 10);
+          if (!target) continue; // blank rows are ignored
+          upstreams.push({ target, weight: Number.isFinite(weight) && weight > 0 ? weight : 1 });
+        }
+        return { upstreams, lb_policy: policySel.value };
+      },
+    };
+  }
+
+  async function toggleRoute(domain, enabled) {
+    try {
+      await api("PATCH", `/api/routes/${encodeURIComponent(domain)}`, { enabled });
+      toast("success", enabled ? "Enabled" : "Disabled", domain);
+      const root = document.getElementById("view-root");
+      await renderRoutesView(root, {});
+    } catch (err) { toast("error", "Failed to update", err.message); }
+  }
+
+  function confirmDelete(route) {
+    const body = h("div", null,
+      h("p", null, "This will delete the route ", h("span", { class: "mono" }, route.domain), "."),
+      h("div", { class: "field inline-checkbox" },
+        h("input", { type: "checkbox", id: "purge-check" }),
+        h("label", { for: "purge-check", style: "margin: 0" }, "Also purge the certificate (required if a cert exists)"),
+      ),
+    );
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { class: "btn btn-danger", onclick: async () => {
+        const purge = document.getElementById("purge-check").checked;
+        try {
+          await api("DELETE", `/api/routes/${encodeURIComponent(route.domain)}${purge ? "?purge=1" : ""}`);
+          Modal.close();
+          toast("success", purge ? "Purged" : "Deleted", route.domain);
+          const root = document.getElementById("view-root");
+          await renderRoutesView(root, {});
+        } catch (err) {
+          toast("error", "Delete failed", err.message);
+        }
+      } }, "Delete"),
+    );
+    Modal.open({ title: `Delete ${route.domain}?`, body, footer });
+  }
+
+  function openAddRouteModal(onSaved) {
+    const form = h("form");
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Domain"),
+      h("input", { id: "add-domain", class: "input mono", required: true, placeholder: "api.example.com" }),
+    ));
+    const editor = buildUpstreamsEditor([{ target: "", weight: 1 }], "random");
+    form.appendChild(editor.root);
+    form.appendChild(h("div", { class: "field inline-checkbox" },
+      h("input", { type: "checkbox", id: "add-enabled", checked: true }),
+      h("label", { for: "add-enabled", style: "margin: 0" }, "Enabled"),
+    ));
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { class: "btn btn-primary", onclick: async (e) => {
+        e.preventDefault();
+        const domain = document.getElementById("add-domain").value.trim();
+        const enabled = document.getElementById("add-enabled").checked;
+        const { upstreams, lb_policy } = editor.collect();
+        if (lb_policy !== "random" && upstreams.length < 2) {
+          toast("error", "Policy needs more upstreams",
+            `"${LB_POLICY_LABELS[lb_policy]}" requires at least 2 upstream targets.`);
+          return;
+        }
+        try {
+          const payload = { domain, enabled, upstreams, lb_policy };
+          await api("POST", "/api/routes", payload);
+          Modal.close();
+          toast("success", "Route added", domain);
+          onSaved && onSaved();
+        } catch (err) {
+          toast("error", "Could not add route", err.message);
+        }
+      } }, "Add route"),
+    );
+    Modal.open({ title: "Add route", body: form, footer });
+  }
+
+  function openEditRouteModal(route, onSaved) {
+    const form = h("form");
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Domain"),
+      h("input", { class: "input mono", value: route.domain, disabled: true }),
+    ));
+    const rw = App.mode === "readwrite";
+    const initialUpstreams = upstreamsOf(route);
+    const editor = buildUpstreamsEditor(initialUpstreams, route.lb_policy || "random");
+    form.appendChild(editor.root);
+    form.appendChild(h("div", { class: "field inline-checkbox" },
+      h("input", { type: "checkbox", id: "edit-enabled", checked: !!route.enabled }),
+      h("label", { for: "edit-enabled", style: "margin: 0" }, "Enabled"),
+    ));
+    // Disable every form control in read-only mode.
+    if (!rw) {
+      form.querySelectorAll("input, select, button").forEach(el => {
+        if (el.type !== "submit") el.disabled = true;
+      });
+    }
+    const footer = h("div", { class: "row" },
+      rw ? h("button", { class: "btn", onclick: async () => {
+        try { await api("POST", `/api/routes/${encodeURIComponent(route.domain)}/clear-retry`); toast("success", "Retry window cleared"); } catch (err) { toast("error", "Failed", err.message); }
+      } }, "Clear retry-after") : null,
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      rw ? h("button", { class: "btn btn-primary", onclick: async (e) => {
+        e.preventDefault();
+        const enabled = document.getElementById("edit-enabled").checked;
+        const { upstreams, lb_policy } = editor.collect();
+        if (lb_policy !== "random" && upstreams.length < 2) {
+          toast("error", "Policy needs more upstreams",
+            `"${LB_POLICY_LABELS[lb_policy]}" requires at least 2 upstream targets.`);
+          return;
+        }
+        try {
+          const payload = { enabled, upstreams, lb_policy };
+          await api("PATCH", `/api/routes/${encodeURIComponent(route.domain)}`, payload);
+          Modal.close();
+          toast("success", "Saved", route.domain);
+          onSaved && onSaved();
+        } catch (err) { toast("error", "Save failed", err.message); }
+      } }, "Save") : null,
+    );
+    Modal.open({ title: `Edit ${route.domain}`, body: form, footer });
+  }
+
+  // ----- Certificates view -----
+
+  async function renderCertificatesView(root) {
+    setActiveNav("certificates");
+    root.innerHTML = "";
+    root.appendChild(h("div", { class: "page-header" },
+      h("div", null,
+        h("h1", null, "Certificates"),
+        h("p", { class: "lede" }, "Certificates managed from PostgreSQL. In readwrite mode they are issued via DNS-01 on Cloudflare."),
+      ),
+      h("div", { class: "row" },
+        h("button", { class: "btn", onclick: () => renderCertificatesView(root) }, "Refresh"),
+      ),
+    ));
+    const card = h("div", { class: "card" });
+    card.appendChild(h("div", { class: "card-header" }, h("h2", null, "All certificates"), h("span", { class: "hint", id: "certs-count" })));
+    const body = h("div", { class: "card-body tight" });
+    card.appendChild(body);
+    root.appendChild(card);
+
+    try {
+      const resp = await api("GET", "/api/certificates");
+      const rows = resp.certificates || [];
+      document.getElementById("certs-count").textContent = `${rows.length} certificate${rows.length === 1 ? "" : "s"}`;
+      if (!rows.length) {
+        body.appendChild(h("div", { class: "empty" },
+          h("div", { class: "title" }, "No certificates"),
+          h("div", { class: "sub" }, "Certificates appear here once issued."),
+        ));
+      } else {
+        body.appendChild(renderCertsTable(rows));
+      }
+    } catch (err) {
+      if (err.status === 401) showLogin();
+      else toast("error", "Failed to load certificates", err.message);
+    }
+  }
+
+  function renderCertsTable(rows) {
+    const table = h("table", { class: "data" });
+    table.appendChild(h("thead", null,
+      h("tr", null,
+        h("th", null, "Domain"),
+        h("th", null, "Status"),
+        h("th", null, "Not before"),
+        h("th", null, "Not after"),
+        h("th", null, "Version"),
+        h("th", null, "Source"),
+        h("th", null, "Retry after"),
+      ),
+    ));
+    const tbody = h("tbody");
+    for (const c of rows) {
+      const tr = h("tr", { "data-domain": c.domain, "title": c.last_error || "" },
+        h("td", { class: "domain" }, c.domain),
+        h("td", null, certStatusBadge(c)),
+        h("td", { class: "muted" }, fmtDate(c.not_before)),
+        h("td", { class: "muted" }, fmtDate(c.not_after)),
+        h("td", { class: "mono" }, String(c.version ?? "—")),
+        h("td", { class: "muted" }, c.source || "—"),
+        h("td", { class: "muted" }, c.retry_after ? fmtRelative(c.retry_after) : "—"),
+      );
+      if (c.last_error) {
+        const err = h("tr", { style: "background: var(--danger-bg)" },
+          h("td", { colspan: "7", class: "mono", style: "color: var(--danger); white-space: pre-wrap;" }, c.last_error),
+        );
+        tbody.appendChild(tr);
+        tbody.appendChild(err);
+      } else {
+        tbody.appendChild(tr);
+      }
+    }
+    table.appendChild(tbody);
+    const wrap = h("div", { class: "table-wrap" });
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  // ----- Zones view -----
+
+  async function renderZonesView(root) {
+    setActiveNav("zones");
+    root.innerHTML = "";
+    root.appendChild(h("div", { class: "page-header" },
+      h("div", null,
+        h("h1", null, "DNS zones"),
+        h("p", { class: "lede" }, "Cloudflare API tokens scoped per zone. Needed for DNS-01 issuance."),
+      ),
+      h("div", { class: "row" },
+        h("button", { class: "btn", onclick: () => renderZonesView(root) }, "Refresh"),
+        App.mode === "readwrite"
+          ? h("button", { class: "btn btn-primary", onclick: () => openZoneModal(null, () => renderZonesView(root)) }, "+ Add zone")
+          : null,
+      ),
+    ));
+    const card = h("div", { class: "card" });
+    card.appendChild(h("div", { class: "card-header" }, h("h2", null, "All zones"), h("span", { class: "hint", id: "zones-count" })));
+    const body = h("div", { class: "card-body tight" });
+    card.appendChild(body);
+    root.appendChild(card);
+
+    try {
+      const resp = await api("GET", "/api/zones");
+      const rows = resp.zones || [];
+      document.getElementById("zones-count").textContent = `${rows.length} zone${rows.length === 1 ? "" : "s"}`;
+      if (!rows.length) {
+        body.appendChild(h("div", { class: "empty" },
+          h("div", { class: "title" }, "No zones configured"),
+          h("div", { class: "sub" }, "Add a Cloudflare zone to enable certificate issuance."),
+        ));
+      } else {
+        body.appendChild(renderZonesTable(rows));
+      }
+    } catch (err) {
+      if (err.status === 401) showLogin();
+      else toast("error", "Failed to load zones", err.message);
+    }
+  }
+
+  function renderZonesTable(rows) {
+    const table = h("table", { class: "data" });
+    table.appendChild(h("thead", null,
+      h("tr", null,
+        h("th", null, "Zone"),
+        h("th", null, "Provider"),
+        h("th", null, "Zone ID"),
+        h("th", null, "API token"),
+        h("th", null, "Updated"),
+        h("th", null, ""),
+      ),
+    ));
+    const tbody = h("tbody");
+    for (const z of rows) {
+      const actions = h("td", { class: "actions" });
+      if (App.mode === "readwrite") {
+        actions.appendChild(h("button", { class: "btn btn-sm", onclick: () => openZoneModal(z, () => renderZonesView(document.getElementById("view-root"))) }, "Edit"));
+        actions.appendChild(h("button", { class: "btn btn-sm btn-danger", onclick: async () => {
+          if (!confirm(`Delete zone ${z.zone_name}?`)) return;
+          try {
+            await api("DELETE", `/api/zones/${encodeURIComponent(z.zone_name)}`);
+            toast("success", "Zone deleted", z.zone_name);
+            renderZonesView(document.getElementById("view-root"));
+          } catch (err) { toast("error", "Delete failed", err.message); }
+        } }, "Delete"));
+      }
+      tbody.appendChild(h("tr", { "data-zone": z.zone_name },
+        h("td", { class: "domain" }, z.zone_name),
+        h("td", null, z.provider),
+        h("td", { class: "mono muted" }, z.zone_id),
+        h("td", { class: "mono muted" }, z.api_token),
+        h("td", { class: "muted" }, fmtRelative(z.updated_at)),
+        actions,
+      ));
+    }
+    table.appendChild(tbody);
+    const wrap = h("div", { class: "table-wrap" });
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  function openZoneModal(existing, onSaved) {
+    const form = h("form");
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Zone name"),
+      h("input", { id: "zone-name", class: "input mono", value: existing ? existing.zone_name : "", disabled: !!existing, required: true, placeholder: "example.com" }),
+    ));
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Cloudflare zone ID"),
+      h("input", { id: "zone-id", class: "input mono", value: existing ? existing.zone_id : "", required: true }),
+    ));
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "API token ", h("span", { class: "hint" }, " — stored encrypted-at-rest in your DB")),
+      h("input", { id: "zone-token", class: "input mono", type: "password", placeholder: existing ? "(leave blank to keep current)" : "" }),
+    ));
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { class: "btn btn-primary", onclick: async (e) => {
+        e.preventDefault();
+        const zone_name = document.getElementById("zone-name").value.trim();
+        const zone_id = document.getElementById("zone-id").value.trim();
+        const token_input = document.getElementById("zone-token").value;
+        const api_token = token_input || (existing ? undefined : "");
+        if (existing && !api_token) {
+          // Need at least existing values; fetch current reveal isn't possible,
+          // so require user to supply token to update
+          toast("error", "Token required", "Enter the API token to save (it is re-saved into the DB).");
+          return;
+        }
+        try {
+          await api("POST", "/api/zones", { zone_name, zone_id, api_token, provider: "cloudflare" });
+          Modal.close();
+          toast("success", existing ? "Zone updated" : "Zone added", zone_name);
+          onSaved && onSaved();
+        } catch (err) { toast("error", "Save failed", err.message); }
+      } }, "Save"),
+    );
+    Modal.open({ title: existing ? `Edit ${existing.zone_name}` : "Add zone", body: form, footer });
+  }
+
+  // ----- Nodes view -----
+
+  function fmtUptime(seconds) {
+    if (seconds == null || isNaN(seconds)) return "—";
+    const s = Math.max(0, parseInt(seconds, 10));
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m";
+    if (s < 86400) {
+      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+      return m ? `${h}h ${m}m` : `${h}h`;
+    }
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600);
+    return h ? `${d}d ${h}h` : `${d}d`;
+  }
+
+  function nodeReachBadge(status) {
+    if (!status) return h("span", { class: "badge" }, "unprobed");
+    if (status.reachable) return h("span", { class: "badge ok" }, h("span", { class: "dot" }), "reachable");
+    return h("span", { class: "badge danger", title: status.last_probe_error || "" },
+      h("span", { class: "dot" }), "unreachable");
+  }
+
+  function nodeServiceBadge(status) {
+    if (!status || status.service_running == null) return h("span", { class: "badge" }, "—");
+    if (status.service_running) {
+      const mode = status.service_mode || "running";
+      const cls = mode === "readwrite" ? "badge danger" : (mode === "readonly" ? "badge info" : "badge ok");
+      return h("span", { class: cls }, h("span", { class: "dot" }), mode);
+    }
+    if (status.service_installed === false) return h("span", { class: "badge" }, "not installed");
+    return h("span", { class: "badge warn" }, h("span", { class: "dot" }), "stopped");
+  }
+
+  async function renderNodesView(root) {
+    setActiveNav("nodes");
+    root.innerHTML = "";
+    root.appendChild(h("div", { class: "page-header" },
+      h("div", null,
+        h("h1", null, "Nodes"),
+        h("p", { class: "lede" }, "Remote machines this admin manages over SSH. Probe to refresh health, deploy or update the ssl-service install."),
+      ),
+      h("div", { class: "row" },
+        h("button", { class: "btn", onclick: () => renderNodesView(root) }, "Refresh"),
+        App.mode === "readwrite"
+          ? h("button", { class: "btn btn-primary", onclick: () => openNodeModal(null, () => renderNodesView(root)) }, "+ Add node")
+          : null,
+      ),
+    ));
+
+    const card = h("div", { class: "card" });
+    card.appendChild(h("div", { class: "card-header" },
+      h("h2", null, "All nodes"),
+      h("span", { class: "hint", id: "nodes-count" }, ""),
+    ));
+    const body = h("div", { class: "card-body tight", id: "nodes-body" });
+    card.appendChild(body);
+    root.appendChild(card);
+
+    try {
+      const resp = await api("GET", "/api/nodes");
+      const nodes = resp.nodes || [];
+      document.getElementById("nodes-count").textContent = `${nodes.length} node${nodes.length === 1 ? "" : "s"}`;
+      if (!nodes.length) {
+        body.appendChild(h("div", { class: "empty" },
+          h("div", { class: "title" }, "No nodes registered"),
+          h("div", { class: "sub" }, App.mode === "readwrite" ? "Add your first node above." : "This is a read-only admin."),
+        ));
+      } else {
+        body.appendChild(renderNodesTable(nodes));
+      }
+    } catch (err) {
+      if (err.status === 401) showLogin();
+      else toast("error", "Failed to load nodes", err.message);
+    }
+  }
+
+  // Track the currently-open action menu so global click can close it.
+  let _openActionMenu = null;
+  document.addEventListener("click", (e) => {
+    if (_openActionMenu && !_openActionMenu.contains(e.target)) {
+      _openActionMenu.classList.remove("open");
+      _openActionMenu = null;
+    }
+  });
+
+  function buildNodeActionMenu(n) {
+    const host = h("div", { class: "menu-host" });
+    const trigger = h("button", { class: "btn btn-sm", title: "More actions",
+      onclick: (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (_openActionMenu && _openActionMenu !== host) {
+          _openActionMenu.classList.remove("open");
+        }
+        host.classList.toggle("open");
+        _openActionMenu = host.classList.contains("open") ? host : null;
+      } }, "Actions ▾");
+    host.appendChild(trigger);
+    const pop = h("div", { class: "menu-pop" });
+    const closeMenu = () => { host.classList.remove("open"); _openActionMenu = null; };
+
+    // Group: Inspect
+    pop.appendChild(h("div", { class: "group-label" }, "Inspect"));
+    pop.appendChild(h("button", { onclick: () => { closeMenu(); openNodeModal(n, () => renderNodesView(document.getElementById("view-root"))); } }, "Edit details"));
+    pop.appendChild(h("button", { onclick: () => { closeMenu(); openInitHistoryModal(n); } }, "Init history"));
+    pop.appendChild(h("hr"));
+
+    // Group: Lifecycle (readwrite only)
+    if (App.mode === "readwrite") {
+      pop.appendChild(h("div", { class: "group-label" }, "Lifecycle"));
+      pop.appendChild(h("button", { onclick: () => { closeMenu(); openInitializeWizard(n, () => renderNodesView(document.getElementById("view-root"))); } }, "Initialize…"));
+      pop.appendChild(h("button", { onclick: () => { closeMenu(); openDeployServiceModal(n); } }, "Deploy service…"));
+      pop.appendChild(h("button", { onclick: () => { closeMenu(); openNodeRunModal(n, "deploy"); } }, "Run free-form deploy…"));
+      pop.appendChild(h("button", { onclick: () => { closeMenu(); openNodeRunModal(n, "update"); } }, "Run free-form update…"));
+      pop.appendChild(h("hr"));
+
+      pop.appendChild(h("div", { class: "group-label" }, "Danger"));
+      pop.appendChild(h("button", { class: "danger", onclick: () => { closeMenu(); confirmDeleteNode(n); } }, "Delete node"));
+    }
+    host.appendChild(pop);
+    return host;
+  }
+
+  function renderNodesTable(nodes) {
+    const table = h("table", { class: "data" });
+    table.appendChild(h("thead", null,
+      h("tr", null,
+        h("th", null, "Node"),
+        h("th", null, "Host"),
+        h("th", null, "Reachability"),
+        h("th", null, "Service"),
+        h("th", null, "Uptime"),
+        h("th", null, "Last probed"),
+        h("th", null, ""),
+      ),
+    ));
+    const tbody = h("tbody");
+    for (const n of nodes) {
+      const status = n.status || null;
+      const actions = h("td", { class: "actions" });
+      // Single primary action stays inline (Probe — most frequent).
+      actions.appendChild(h("button", { class: "btn btn-sm",
+        onclick: async (e) => { e.preventDefault(); await probeNode(n.name); }
+      }, "Probe"));
+      actions.appendChild(buildNodeActionMenu(n));
+      const tr = h("tr", { "data-node": n.name },
+        h("td", { class: "domain" }, n.name,
+          n.description ? h("div", { class: "muted", style: "font-size: 11px; margin-top: 2px" }, n.description) : null),
+        h("td", { class: "mono" }, `${n.ssh_user}@${n.host}:${n.ssh_port}`,
+          h("div", { class: "muted", style: "font-size: 11px; margin-top: 2px" }, `auth: ${n.auth_method}`)),
+        h("td", null, nodeReachBadge(status)),
+        h("td", null, nodeServiceBadge(status),
+          status && status.service_version ? h("span", { class: "muted mono", style: "margin-left:6px; font-size:11px" }, status.service_version) : null),
+        h("td", { class: "muted" }, status ? fmtUptime(status.uptime_seconds) : "—"),
+        h("td", { class: "muted" }, status && status.last_probed_at ? fmtRelative(status.last_probed_at) : "never"),
+        actions,
+      );
+      tbody.appendChild(tr);
+      // Detail row: load avg / mem / disk / OS / probe error
+      if (status) {
+        const cells = [];
+        if (status.os_release) cells.push(`OS: ${status.os_release}`);
+        if (status.load_avg) cells.push(`load: ${status.load_avg}`);
+        if (status.memory) cells.push(`mem: ${status.memory}`);
+        if (status.disk_usage) cells.push(`disk: ${status.disk_usage}`);
+        if (cells.length) {
+          tbody.appendChild(h("tr", { style: "background: var(--surface-alt)" },
+            h("td", { colspan: "7", class: "muted mono", style: "font-size: 11.5px; padding: 6px 16px" }, cells.join("  ·  "))));
+        }
+        if (status.last_probe_error) {
+          tbody.appendChild(h("tr", { style: "background: var(--danger-bg)" },
+            h("td", { colspan: "7", class: "mono", style: "color: var(--danger); font-size: 11.5px; padding: 6px 16px" }, status.last_probe_error)));
+        }
+      }
+    }
+    table.appendChild(tbody);
+    const wrap = h("div", { class: "table-wrap" });
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  async function probeNode(name) {
+    toast("info", "Probing", name);
+    try {
+      const status = await api("POST", `/api/nodes/${encodeURIComponent(name)}/probe`);
+      if (status.reachable) toast("success", "Probe complete", `${name} is reachable`);
+      else toast("error", "Unreachable", status.last_probe_error || name);
+      await renderNodesView(document.getElementById("view-root"));
+    } catch (err) { toast("error", "Probe failed", err.message); }
+  }
+
+  function confirmDeleteNode(node) {
+    const body = h("div", null,
+      h("p", null, "Delete node ", h("span", { class: "mono" }, node.name), "? This removes the SSH credentials and probe history."),
+    );
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { class: "btn btn-danger", onclick: async () => {
+        try {
+          await api("DELETE", `/api/nodes/${encodeURIComponent(node.name)}`);
+          Modal.close();
+          toast("success", "Node deleted", node.name);
+          renderNodesView(document.getElementById("view-root"));
+        } catch (err) { toast("error", "Delete failed", err.message); }
+      } }, "Delete"),
+    );
+    Modal.open({ title: `Delete ${node.name}?`, body, footer });
+  }
+
+  function openNodeModal(existing, onSaved) {
+    const form = h("form");
+    const isEdit = !!existing;
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Name", isEdit ? h("span", { class: "hint" }, " — rename allowed; child tables follow") : null),
+        h("input", { id: "node-name", class: "input mono", value: existing ? existing.name : "", required: true, placeholder: "edge-sg-1" }),
+      ),
+      h("div", { class: "field" },
+        h("label", null, "Tags ", h("span", { class: "hint" }, " — comma separated")),
+        h("input", { id: "node-tags", class: "input", value: existing ? (existing.tags || []).join(", ") : "" }),
+      ),
+    ));
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Host / IP"),
+        h("input", { id: "node-host", class: "input mono", value: existing ? existing.host : "", required: true, placeholder: "1.2.3.4 or edge.example.com" }),
+      ),
+      h("div", { class: "field" },
+        h("label", null, "SSH port"),
+        h("input", { id: "node-port", class: "input mono", type: "number", min: "1", max: "65535", value: existing ? existing.ssh_port : 22 }),
+      ),
+    ));
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "SSH user"),
+        h("input", { id: "node-user", class: "input mono", value: existing ? existing.ssh_user : "root" }),
+      ),
+      h("div", { class: "field" },
+        h("label", null, "Auth method"),
+        (() => {
+          const sel = h("select", { id: "node-auth", class: "select" });
+          for (const v of [["password", "Password"], ["key", "Private key"]]) {
+            const opt = h("option", { value: v[0] }, v[1]);
+            if (existing && existing.auth_method === v[0]) opt.selected = true;
+            sel.appendChild(opt);
+          }
+          return sel;
+        })(),
+      ),
+    ));
+    // Password block — plaintext as requested
+    const pwdWrap = h("div", { class: "field", id: "node-pwd-wrap" },
+      h("label", null, "SSH password"),
+      h("input", { id: "node-pwd", class: "input mono", type: "text",
+        value: isEdit && existing.ssh_password ? existing.ssh_password : "" }),
+    );
+    // Key block — plaintext, expanded textarea
+    const keyWrap = h("div", { id: "node-key-wrap" },
+      h("div", { class: "field" },
+        h("label", null, "SSH private key (PEM)"),
+        h("textarea", { id: "node-key", class: "textarea mono", rows: "10",
+          placeholder: "-----BEGIN OPENSSH PRIVATE KEY-----\n..." },
+          (isEdit && existing.ssh_private_key) ? existing.ssh_private_key : ""),
+      ),
+      h("div", { class: "field" },
+        h("label", null, "Key passphrase (optional)"),
+        h("input", { id: "node-keypass", class: "input mono", type: "text",
+          value: isEdit && existing.ssh_key_passphrase ? existing.ssh_key_passphrase : "" }),
+      ),
+    );
+    form.appendChild(pwdWrap);
+    form.appendChild(keyWrap);
+
+    const updateAuthVisibility = () => {
+      const v = document.getElementById("node-auth").value;
+      pwdWrap.style.display = v === "password" ? "" : "none";
+      keyWrap.style.display = v === "key" ? "" : "none";
+    };
+
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Description (optional)"),
+      h("input", { id: "node-desc", class: "input", value: existing && existing.description ? existing.description : "" }),
+    ));
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Deploy command (optional override) ",
+        h("span", { class: "hint" }, " — leave blank to use the default install script")),
+      h("textarea", { id: "node-deploy", class: "textarea mono", rows: "3",
+        value: existing && existing.deploy_command ? existing.deploy_command : "",
+        placeholder: "e.g. curl -fsSL https://.../setup.sh | sudo bash" }),
+    ));
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Update command (optional override)"),
+      h("textarea", { id: "node-update", class: "textarea mono", rows: "3",
+        value: existing && existing.update_command ? existing.update_command : "",
+        placeholder: "e.g. cd /opt/ssl-service && git pull && systemctl restart ssl-service" }),
+    ));
+
+    // Initialization defaults — used by the Initialize wizard, editable here directly.
+    const initSection = h("details", { style: "margin-top: 14px; border-top: 1px solid var(--border); padding-top: 14px" });
+    initSection.appendChild(h("summary", { style: "cursor: pointer; font-weight: 600; margin-bottom: 12px" },
+      "Initialization defaults",
+      h("span", { class: "muted", style: "font-weight: 400; font-size: 12px; margin-left: 8px" },
+        "— pre-fill these fields, the wizard reuses them"),
+    ));
+    initSection.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Desired SSH port"),
+        h("input", { id: "node-init-port", class: "input mono", type: "number", min: "1", max: "65535",
+          value: existing && existing.init_desired_ssh_port != null ? existing.init_desired_ssh_port : 60101 }),
+      ),
+      h("div", { class: "field" },
+        h("label", null, "Timezone"),
+        h("input", { id: "node-init-tz", class: "input mono",
+          value: existing && existing.init_timezone ? existing.init_timezone : "Asia/Shanghai" }),
+      ),
+    ));
+    initSection.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Git user.name"),
+        h("input", { id: "node-init-gitname", class: "input",
+          value: existing && existing.init_git_user_name ? existing.init_git_user_name : "" }),
+      ),
+      h("div", { class: "field" },
+        h("label", null, "Git user.email"),
+        h("input", { id: "node-init-gitemail", class: "input",
+          value: existing && existing.init_git_user_email ? existing.init_git_user_email : "" }),
+      ),
+    ));
+    initSection.appendChild(h("div", { class: "field" },
+      h("label", null, "Git deploy key (PEM, optional)"),
+      h("textarea", { id: "node-init-gitkey", class: "textarea mono", rows: "6",
+        placeholder: "-----BEGIN OPENSSH PRIVATE KEY-----\n..." },
+        existing && existing.init_git_private_key ? existing.init_git_private_key : ""),
+    ));
+    initSection.appendChild(h("div", { class: "field inline-checkbox" },
+      h("input", { type: "checkbox", id: "node-init-codex",
+        checked: !existing || existing.init_install_codex !== false }),
+      h("label", { for: "node-init-codex", style: "margin: 0" }, "Install Codex CLI by default"),
+    ));
+    initSection.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "OPENAI_BASE_URL"),
+        h("input", { id: "node-init-codexurl", class: "input mono",
+          placeholder: "(blank = script default)",
+          value: existing && existing.init_codex_base_url ? existing.init_codex_base_url : "" }),
+      ),
+      h("div", { class: "field" },
+        h("label", null, "OPENAI_API_KEY"),
+        h("input", { id: "node-init-codexkey", class: "input mono", type: "text",
+          value: existing && existing.init_codex_api_key ? existing.init_codex_api_key : "" }),
+      ),
+    ));
+    form.appendChild(initSection);
+
+    // Wire visibility toggle now that elements exist.
+    setTimeout(updateAuthVisibility, 0);
+    setTimeout(() => document.getElementById("node-auth").addEventListener("change", updateAuthVisibility), 0);
+
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { class: "btn btn-primary", onclick: async (e) => {
+        e.preventDefault();
+        const auth = document.getElementById("node-auth").value;
+        const payload = {
+          host: document.getElementById("node-host").value.trim(),
+          ssh_port: parseInt(document.getElementById("node-port").value || "22", 10),
+          ssh_user: document.getElementById("node-user").value.trim() || "root",
+          auth_method: auth,
+          description: document.getElementById("node-desc").value.trim() || null,
+          tags: document.getElementById("node-tags").value.split(",").map(s => s.trim()).filter(Boolean),
+          deploy_command: document.getElementById("node-deploy").value.trim() || null,
+          update_command: document.getElementById("node-update").value.trim() || null,
+        };
+        // Secrets — always send what's in the textarea since fields are now plaintext.
+        const pwd = document.getElementById("node-pwd").value;
+        const key = document.getElementById("node-key").value;
+        const keypass = document.getElementById("node-keypass").value;
+        payload.ssh_password = pwd || null;
+        payload.ssh_private_key = key || null;
+        payload.ssh_key_passphrase = keypass || null;
+        if (auth === "password" && !pwd) { toast("error", "Password required"); return; }
+        if (auth === "key" && !key) { toast("error", "Private key required"); return; }
+
+        // Init defaults section — only push when the section is open OR
+        // we already have an existing record (so values are pre-populated).
+        // Always include them on edit; we send the current values regardless.
+        const initPort = parseInt(document.getElementById("node-init-port").value || "60101", 10);
+        payload.init_desired_ssh_port = initPort;
+        payload.init_timezone = document.getElementById("node-init-tz").value.trim() || "Asia/Shanghai";
+        payload.init_git_user_name = document.getElementById("node-init-gitname").value.trim() || null;
+        payload.init_git_user_email = document.getElementById("node-init-gitemail").value.trim() || null;
+        payload.init_git_private_key = document.getElementById("node-init-gitkey").value.trim() || null;
+        payload.init_install_codex = document.getElementById("node-init-codex").checked;
+        payload.init_codex_base_url = document.getElementById("node-init-codexurl").value.trim() || null;
+        payload.init_codex_api_key = document.getElementById("node-init-codexkey").value.trim() || null;
+        try {
+          const enteredName = document.getElementById("node-name").value.trim();
+          if (isEdit) {
+            // If user changed the name, send it as `new_name` so the backend
+            // routes through the rename path.
+            if (enteredName && enteredName !== existing.name) {
+              payload.new_name = enteredName;
+            }
+            await api("PATCH", `/api/nodes/${encodeURIComponent(existing.name)}`, payload);
+          } else {
+            payload.name = enteredName;
+            await api("POST", "/api/nodes", payload);
+          }
+          Modal.close();
+          toast("success", isEdit ? "Node updated" : "Node added", enteredName || existing.name);
+          onSaved && onSaved();
+        } catch (err) { toast("error", "Save failed", err.message); }
+      } }, isEdit ? "Save" : "Add node"),
+    );
+    Modal.open({ title: isEdit ? `Edit ${existing.name}` : "Add node", body: form, footer });
+  }
+
+  // Modal that runs deploy/update with a previewable command + streams the
+  // result inline.
+  function openNodeRunModal(node, kind) {
+    const defaultCmd = kind === "deploy"
+      ? (node.deploy_command || "")
+      : (node.update_command || "");
+    const form = h("div");
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, kind === "deploy" ? "Deploy command" : "Update command",
+        h("span", { class: "hint" }, " — leave blank to use the configured default")),
+      h("textarea", { id: "run-cmd", class: "textarea mono", rows: "4",
+        value: defaultCmd, placeholder: "Will use the built-in default if left empty" }),
+    ));
+    form.appendChild(h("div", { class: "muted", style: "font-size: 12px; margin-top: 6px" },
+      `Connects to ${node.ssh_user}@${node.host}:${node.ssh_port} via ${node.auth_method} auth`));
+    const out = h("pre", { class: "log-viewer", style: "margin-top: 12px; max-height: 360px;" },
+      h("span", { class: "dim" }, "(no output yet — click Run to execute)"));
+    form.appendChild(out);
+
+    let running = false;
+    const runBtn = h("button", { class: "btn btn-primary", onclick: async (e) => {
+      e.preventDefault();
+      if (running) return;
+      running = true;
+      runBtn.disabled = true;
+      runBtn.textContent = "Running…";
+      out.innerHTML = "";
+      out.appendChild(h("span", { class: "dim" }, "Running on " + node.host + " …\n"));
+      const command = document.getElementById("run-cmd").value.trim();
+      const path = `/api/nodes/${encodeURIComponent(node.name)}/${kind}`;
+      try {
+        const r = await api("POST", path, command ? { command } : {});
+        out.innerHTML = "";
+        out.appendChild(h("div", { class: "dim" }, `$ ${r.command}\n`));
+        if (r.stdout) out.appendChild(document.createTextNode(r.stdout));
+        if (r.stderr) {
+          const e = h("span", { style: "color: #ff8c5c" }, "\n" + r.stderr);
+          out.appendChild(e);
+        }
+        out.appendChild(h("div", { class: "dim", style: "margin-top: 8px" },
+          `\n[exit ${r.exit_code} · ${r.duration_seconds}s]`));
+        toast(r.exit_code === 0 ? "success" : "error",
+          (kind === "deploy" ? "Deploy" : "Update") + (r.exit_code === 0 ? " complete" : " failed"),
+          `exit ${r.exit_code}`);
+      } catch (err) {
+        out.innerHTML = "";
+        out.appendChild(h("span", { style: "color: var(--danger)" }, err.message));
+        toast("error", (kind === "deploy" ? "Deploy" : "Update") + " failed", err.message);
+      } finally {
+        running = false;
+        runBtn.disabled = false;
+        runBtn.textContent = "Run";
+      }
+    } }, "Run");
+
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Close"),
+      runBtn,
+    );
+    Modal.open({ title: `${kind === "deploy" ? "Deploy" : "Update"} on ${node.name}`, body: form, footer });
+  }
+
+  // ----- Deploy a registered service -----
+
+  async function openDeployServiceModal(node) {
+    let services = [];
+    try {
+      services = (await api("GET", "/api/services")).services || [];
+    } catch (err) { toast("error", "Could not load services", err.message); return; }
+    if (!services.length) {
+      toast("error", "No services", "Add one in the Services tab first.");
+      return;
+    }
+
+    const wrap = h("div");
+    wrap.appendChild(h("div", { class: "muted", style: "margin-bottom: 12px; font-size: 13px" },
+      `Pick a service to deploy on ${node.name} (${node.host}). The admin will SSH in, clone the repo, write a .env, and run docker compose up -d --build.`));
+
+    // Service picker
+    const sel = h("select", { id: "ds-svc", class: "select", style: "width: 100%" });
+    for (const s of services) {
+      sel.appendChild(h("option", { value: s.name }, `${s.display_name} (${s.name})`));
+    }
+    wrap.appendChild(h("div", { class: "field" }, h("label", null, "Service"), sel));
+
+    const branchInput = h("input", { id: "ds-branch", class: "input mono" });
+    wrap.appendChild(h("div", { class: "field" },
+      h("label", null, "Branch"), branchInput));
+
+    const envText = h("textarea", { id: "ds-env", class: "textarea mono", rows: "8",
+      placeholder: "KEY=value (one per line). These OVERRIDE the service defaults." });
+    wrap.appendChild(h("div", { class: "field" },
+      h("label", null, "Per-deployment env overrides"),
+      envText,
+      h("div", { class: "muted", style: "font-size: 12px; margin-top: 4px" },
+        "Service defaults are merged with these overrides; overrides win.")));
+
+    const rebuild = h("input", { type: "checkbox", id: "ds-rebuild", checked: true });
+    wrap.appendChild(h("div", { class: "field inline-checkbox" }, rebuild,
+      h("label", { for: "ds-rebuild", style: "margin: 0" }, "Rebuild image (--build)")));
+
+    const cmdPreview = h("pre", { class: "log-viewer", id: "ds-preview", style: "max-height: 200px; font-size: 11.5px" });
+    wrap.appendChild(h("div", { class: "field" },
+      h("label", null, "Generated command preview"),
+      cmdPreview,
+      h("div", { class: "muted", style: "font-size: 12px; margin-top: 4px" },
+        "Click Preview to render. Click Run to execute via SSH.")));
+
+    const out = h("pre", { class: "log-viewer", id: "ds-out", style: "max-height: 280px; font-size: 11.5px" });
+    wrap.appendChild(out);
+
+    const refreshDefaultsForService = (svcName) => {
+      const svc = services.find(s => s.name === svcName);
+      if (!svc) return;
+      branchInput.value = svc.default_branch || "main";
+      // Don't overwrite user-typed env; only show defaults as placeholder text.
+      envText.placeholder = "Service defaults:\n" +
+        Object.entries(svc.default_env || {}).map(([k, v]) => `${k}=${v}`).join("\n") +
+        "\n\nWrite KEY=value lines here to override.";
+    };
+    sel.addEventListener("change", () => refreshDefaultsForService(sel.value));
+    refreshDefaultsForService(sel.value);
+
+    async function build(dryRun) {
+      const payload = {
+        service: sel.value,
+        branch: branchInput.value.trim() || undefined,
+        env_overrides: envTextToDict(envText.value),
+        rebuild: rebuild.checked,
+        dry_run: dryRun,
+      };
+      return api("POST", `/api/nodes/${encodeURIComponent(node.name)}/deploy-service`, payload);
+    }
+
+    const previewBtn = h("button", { class: "btn", onclick: async (e) => {
+      e.preventDefault();
+      cmdPreview.textContent = "Building…";
+      try {
+        const r = await build(true);
+        cmdPreview.textContent = r.command;
+      } catch (err) { cmdPreview.textContent = "ERROR: " + err.message; }
+    } }, "Preview");
+
+    let running = false;
+    const runBtn = h("button", { class: "btn btn-primary", onclick: async (e) => {
+      e.preventDefault();
+      if (running) return;
+      running = true;
+      runBtn.disabled = true;
+      runBtn.textContent = "Running…";
+      out.textContent = "Running on " + node.host + " …\n";
+      try {
+        const r = await build(false);
+        out.textContent = "";
+        if (r.stdout) out.appendChild(document.createTextNode(r.stdout));
+        if (r.stderr) {
+          out.appendChild(h("span", { style: "color: #ff8c5c" }, "\n--- stderr ---\n" + r.stderr));
+        }
+        out.appendChild(h("div", { class: "muted", style: "margin-top: 8px" },
+          `\n[exit ${r.exit_code} · ${r.duration_seconds}s]`));
+        toast(r.exit_code === 0 ? "success" : "error",
+          "Deploy " + (r.exit_code === 0 ? "complete" : "failed"),
+          `${r.service} → ${r.node}, exit ${r.exit_code}`);
+      } catch (err) {
+        out.textContent = "ERROR: " + err.message;
+        toast("error", "Deploy failed", err.message);
+      } finally {
+        running = false;
+        runBtn.disabled = false;
+        runBtn.textContent = "Run";
+      }
+    } }, "Run");
+
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Close"),
+      previewBtn,
+      runBtn,
+    );
+    Modal.open({ title: `Deploy service on ${node.name}`, body: wrap, footer });
+  }
+
+  // ----- Init runs history -----
+
+  function initRunBadge(status) {
+    if (status === "success") return h("span", { class: "badge ok" }, h("span", { class: "dot" }), "success");
+    if (status === "failed") return h("span", { class: "badge danger" }, h("span", { class: "dot" }), "failed");
+    if (status === "cancelled") return h("span", { class: "badge" }, "cancelled");
+    if (status === "running") return h("span", { class: "badge info" }, h("span", { class: "dot" }), "running");
+    return h("span", { class: "badge" }, status || "queued");
+  }
+
+  function fmtDuration(start, end) {
+    if (!start) return "—";
+    const a = new Date(start);
+    const b = end ? new Date(end) : new Date();
+    if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return "—";
+    const sec = Math.max(0, Math.round((b.getTime() - a.getTime()) / 1000));
+    if (sec < 60) return sec + "s";
+    return Math.floor(sec / 60) + "m " + (sec % 60) + "s";
+  }
+
+  async function openInitHistoryModal(node) {
+    const wrap = h("div");
+    wrap.appendChild(h("div", { class: "muted", style: "margin-bottom: 12px; font-size: 13px" },
+      `Last 20 runs for ${node.name}. Click any row to expand the full log.`));
+    const listWrap = h("div", { id: "init-history-list" }, h("span", { class: "loader" }));
+    wrap.appendChild(listWrap);
+
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: async () => {
+        listWrap.innerHTML = "";
+        listWrap.appendChild(h("span", { class: "loader" }));
+        await fetchAndRender();
+      } }, "Refresh"),
+      h("button", { class: "btn btn-primary", onclick: () => Modal.close() }, "Close"),
+    );
+
+    async function fetchAndRender() {
+      try {
+        const resp = await api("GET", `/api/nodes/${encodeURIComponent(node.name)}/init/runs`);
+        const runs = resp.runs || [];
+        listWrap.innerHTML = "";
+        if (!runs.length) {
+          listWrap.appendChild(h("div", { class: "empty" },
+            h("div", { class: "title" }, "No init runs yet"),
+            h("div", { class: "sub" }, "Click Initialize on the node to start one.")));
+          return;
+        }
+        const table = h("table", { class: "data" });
+        table.appendChild(h("thead", null,
+          h("tr", null,
+            h("th", null, "#"),
+            h("th", null, "Started"),
+            h("th", null, "Status"),
+            h("th", null, "Step"),
+            h("th", null, "Exit"),
+            h("th", null, "Duration"),
+            h("th", null, ""),
+          ),
+        ));
+        const tbody = h("tbody");
+        for (const run of runs) {
+          tbody.appendChild(h("tr", null,
+            h("td", { class: "mono" }, "#" + run.id),
+            h("td", { class: "muted" }, fmtRelative(run.started_at)),
+            h("td", null, initRunBadge(run.status)),
+            h("td", { class: "mono", style: "font-size: 11.5px" }, run.current_step || "—"),
+            h("td", { class: "mono" }, run.exit_code != null ? String(run.exit_code) : "—"),
+            h("td", { class: "muted" }, fmtDuration(run.started_at, run.finished_at)),
+            h("td", { class: "actions" },
+              h("button", { class: "btn btn-sm",
+                onclick: () => openInitRunDetailModal(node, run.id)
+              }, "View log"),
+            ),
+          ));
+        }
+        table.appendChild(tbody);
+        const tw = h("div", { class: "table-wrap" });
+        tw.appendChild(table);
+        listWrap.appendChild(tw);
+      } catch (err) {
+        listWrap.innerHTML = "";
+        listWrap.appendChild(h("div", { class: "muted" }, "Failed to load: " + err.message));
+      }
+    }
+
+    Modal.open({ title: `Init history · ${node.name}`, body: wrap, footer });
+    fetchAndRender();
+  }
+
+  async function openInitRunDetailModal(node, runId) {
+    const wrap = h("div");
+    const header = h("div", { class: "muted", style: "margin-bottom: 8px; font-size: 13px" }, "Loading…");
+    const log = h("pre", { class: "log-viewer", style: "max-height: 480px" });
+    wrap.appendChild(header);
+    wrap.appendChild(log);
+
+    let pollTimer = null;
+    async function refresh() {
+      try {
+        const r = await api("GET", `/api/nodes/${encodeURIComponent(node.name)}/init/runs/${runId}`);
+        header.innerHTML = "";
+        header.appendChild(document.createTextNode(`Run #${r.id} · `));
+        header.appendChild(initRunBadge(r.status));
+        header.appendChild(document.createTextNode(` · started ${fmtRelative(r.started_at)}`));
+        if (r.current_step) header.appendChild(document.createTextNode(` · step ${r.current_step}`));
+        if (r.exit_code != null) header.appendChild(document.createTextNode(` · exit ${r.exit_code}`));
+        const wasNearBottom = (log.scrollTop + log.clientHeight) >= (log.scrollHeight - 30);
+        log.textContent = r.log_text || "";
+        if (wasNearBottom) log.scrollTop = log.scrollHeight;
+        if (r.status === "running" || r.status === "queued") {
+          if (!pollTimer) pollTimer = setInterval(refresh, 1500);
+        } else {
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        }
+      } catch (err) {
+        header.textContent = "Failed: " + err.message;
+        if (pollTimer) clearInterval(pollTimer);
+      }
+    }
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn btn-primary", onclick: () => {
+        if (pollTimer) clearInterval(pollTimer);
+        Modal.close();
+      } }, "Close"),
+    );
+    Modal.open({ title: `Init run #${runId} · ${node.name}`, body: wrap, footer });
+    refresh();
+  }
+
+  // ----- Initialize wizard -----
+
+  async function openInitializeWizard(node, onDone) {
+    // Pull the most up-to-date node row (with all secrets) so we can pre-fill defaults.
+    let detail;
+    try {
+      const resp = await api("GET", `/api/nodes/${encodeURIComponent(node.name)}`);
+      detail = resp;
+    } catch (err) { toast("error", "Could not load node", err.message); return; }
+
+    // Load local SSH key list as wizard step 1 options.
+    let localKeys = [];
+    try {
+      localKeys = (await api("GET", "/api/host/ssh-keys")).keys || [];
+    } catch (err) { /* non-fatal — user can paste manually */ }
+
+    const state = {
+      step: 1,
+      git_private_key: detail.init_git_private_key || "",
+      git_user_name: detail.init_git_user_name || "",
+      git_user_email: detail.init_git_user_email || "",
+      desired_ssh_port: detail.init_desired_ssh_port || 60101,
+      install_codex: detail.init_install_codex !== false,
+      codex_base_url: detail.init_codex_base_url || "",
+      codex_api_key: detail.init_codex_api_key || "",
+      timezone: detail.init_timezone || "Asia/Shanghai",
+    };
+
+    const TOTAL_STEPS = 5;
+    const wrap = h("div", { id: "init-wizard-body" });
+    const footer = h("div", { class: "row", id: "init-wizard-footer" });
+
+    function renderStep() {
+      wrap.innerHTML = "";
+      footer.innerHTML = "";
+      const header = h("div", { class: "muted", style: "font-size: 12px; margin-bottom: 12px" },
+        `Step ${state.step} of ${TOTAL_STEPS}`);
+      wrap.appendChild(header);
+      switch (state.step) {
+        case 1: renderKeyStep(); break;
+        case 2: renderPortStep(); break;
+        case 3: renderCodexStep(); break;
+        case 4: renderGitIdentityStep(); break;
+        case 5: renderConfirmStep(); break;
+        case 6: renderRunStep(); break;
+      }
+    }
+
+    function navButtons({back = true, nextLabel = "Next →", onNext = () => { state.step++; renderStep(); }} = {}) {
+      const f = footer;
+      f.innerHTML = "";
+      f.appendChild(h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"));
+      if (back && state.step > 1) {
+        f.appendChild(h("button", { class: "btn", onclick: () => { state.step--; renderStep(); } }, "← Back"));
+      }
+      f.appendChild(h("button", { class: "btn btn-primary", onclick: onNext }, nextLabel));
+    }
+
+    function renderKeyStep() {
+      wrap.appendChild(h("div", { class: "field" },
+        h("label", null, "Step 1 · Git deploy key"),
+        h("p", { class: "muted", style: "font-size: 13px; margin: 4px 0 12px" },
+          "This private key will be installed at /root/.ssh/ on the target server so it can git-clone your private repos."),
+      ));
+      if (localKeys.length) {
+        const list = h("div", { style: "display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px" });
+        list.appendChild(h("div", { class: "muted", style: "font-size: 12px" }, "Pick a key from your Mac:"));
+        for (const k of localKeys) {
+          list.appendChild(h("div", { class: "row", style: "gap: 8px" },
+            h("button", { class: "btn btn-sm", onclick: async (e) => {
+              e.preventDefault();
+              try {
+                const r = await api("POST", "/api/host/ssh-keys/read", {path: k.path});
+                state.git_private_key = r.content;
+                document.getElementById("wiz-key").value = r.content;
+                toast("success", "Loaded", k.name);
+              } catch (err) { toast("error", "Failed to read", err.message); }
+            } }, `Use ${k.name}`),
+            h("span", { class: "muted mono", style: "font-size: 11.5px" },
+              `${k.type || "?"}  ${k.fingerprint || ""}`),
+          ));
+        }
+        wrap.appendChild(list);
+      } else {
+        wrap.appendChild(h("div", { class: "muted", style: "font-size: 12px; margin-bottom: 8px" },
+          "No keys auto-detected at ~/.ssh — paste one manually below."));
+      }
+      wrap.appendChild(h("div", { class: "field" },
+        h("label", null, "Private key body"),
+        h("textarea", { id: "wiz-key", class: "textarea mono", rows: "10",
+          placeholder: "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----" },
+          state.git_private_key || ""),
+      ));
+      navButtons({ onNext: () => {
+        state.git_private_key = document.getElementById("wiz-key").value.trim();
+        // Allow skipping for "no git access needed"
+        state.step = 2; renderStep();
+      } });
+    }
+
+    function renderPortStep() {
+      wrap.appendChild(h("div", { class: "field" },
+        h("label", null, "Step 2 · SSH port"),
+        h("p", { class: "muted", style: "font-size: 13px; margin: 4px 0 12px" },
+          "Change the SSH port on the target server. After init succeeds the node's stored port will be auto-updated."),
+      ));
+      wrap.appendChild(h("div", { class: "field" },
+        h("label", null, "Desired SSH port (1024-65535)"),
+        h("input", { id: "wiz-port", class: "input mono", type: "number", min: "1024", max: "65535",
+          value: state.desired_ssh_port }),
+        h("div", { class: "muted", style: "font-size: 12px; margin-top: 4px" },
+          "Set the same as current (e.g. 22) to keep the existing port."),
+      ));
+      navButtons({ onNext: () => {
+        const v = parseInt(document.getElementById("wiz-port").value || "60101", 10);
+        // Allow 22 as the explicit "no change" sentinel (orchestrator skips it).
+        if (!(v >= 1 && v < 65536)) { toast("error", "Port must be 1-65535"); return; }
+        if (v !== 22 && v < 1024) { toast("error", "Port must be either 22 (no change) or 1024-65535"); return; }
+        state.desired_ssh_port = v;
+        state.step = 3; renderStep();
+      } });
+    }
+
+    function renderCodexStep() {
+      wrap.appendChild(h("div", { class: "field" },
+        h("label", null, "Step 3 · Codex CLI"),
+        h("p", { class: "muted", style: "font-size: 13px; margin: 4px 0 12px" },
+          "Install the OpenAI Codex CLI and configure its API endpoint."),
+      ));
+      wrap.appendChild(h("div", { class: "field inline-checkbox" },
+        h("input", { id: "wiz-install-codex", type: "checkbox", checked: state.install_codex }),
+        h("label", { for: "wiz-install-codex", style: "margin: 0" }, "Install Codex CLI"),
+      ));
+      wrap.appendChild(h("div", { class: "field" },
+        h("label", null, "OPENAI_BASE_URL ", h("span", { class: "hint" }, " — leave blank to use script default")),
+        h("input", { id: "wiz-codex-url", class: "input mono", value: state.codex_base_url,
+          placeholder: "https://api.openai.com/v1 (or your proxy)" }),
+      ));
+      wrap.appendChild(h("div", { class: "field" },
+        h("label", null, "OPENAI_API_KEY"),
+        h("input", { id: "wiz-codex-key", class: "input mono", type: "text", value: state.codex_api_key,
+          placeholder: "sk-..." }),
+      ));
+      navButtons({ onNext: () => {
+        state.install_codex = document.getElementById("wiz-install-codex").checked;
+        state.codex_base_url = document.getElementById("wiz-codex-url").value.trim();
+        state.codex_api_key = document.getElementById("wiz-codex-key").value.trim();
+        if (state.install_codex && !state.codex_api_key) {
+          if (!confirm("No Codex API key set — continue without configuring API?")) return;
+        }
+        state.step = 4; renderStep();
+      } });
+    }
+
+    function renderGitIdentityStep() {
+      wrap.appendChild(h("div", { class: "field" },
+        h("label", null, "Step 4 · Git identity"),
+        h("p", { class: "muted", style: "font-size: 13px; margin: 4px 0 12px" },
+          "Used by `git config --global user.name` / `user.email` on the server. The git.sh script auto-detects from GitHub if blank."),
+      ));
+      wrap.appendChild(h("div", { class: "form-row" },
+        h("div", { class: "field" },
+          h("label", null, "user.name (optional)"),
+          h("input", { id: "wiz-git-name", class: "input", value: state.git_user_name }),
+        ),
+        h("div", { class: "field" },
+          h("label", null, "user.email (optional)"),
+          h("input", { id: "wiz-git-email", class: "input", value: state.git_user_email }),
+        ),
+      ));
+      wrap.appendChild(h("div", { class: "field" },
+        h("label", null, "Timezone"),
+        h("input", { id: "wiz-tz", class: "input mono", value: state.timezone }),
+      ));
+      navButtons({ onNext: () => {
+        state.git_user_name = document.getElementById("wiz-git-name").value.trim();
+        state.git_user_email = document.getElementById("wiz-git-email").value.trim();
+        state.timezone = document.getElementById("wiz-tz").value.trim() || "Asia/Shanghai";
+        state.step = 5; renderStep();
+      } });
+    }
+
+    function renderConfirmStep() {
+      wrap.appendChild(h("div", { class: "field" },
+        h("label", null, "Step 5 · Confirm"),
+        h("p", { class: "muted", style: "font-size: 13px; margin: 4px 0 12px" },
+          `Review the plan. Confirm to save these settings to ${node.name} and start initialization.`),
+      ));
+      const summary = h("div", { class: "log-viewer", style: "max-height: 320px; font-size: 12.5px" });
+      const lines = [
+        `Target:               ${node.ssh_user}@${node.host}:${node.ssh_port}`,
+        `Timezone:             ${state.timezone}`,
+        `Git deploy key:       ${state.git_private_key ? "(set, " + state.git_private_key.length + " bytes)" : "(none — skipped)"}`,
+        `Git user.name:        ${state.git_user_name || "(auto)"}`,
+        `Git user.email:       ${state.git_user_email || "(auto)"}`,
+        `Install Codex CLI:    ${state.install_codex ? "yes" : "no"}`,
+        `Codex BASE_URL:       ${state.codex_base_url || "(script default)"}`,
+        `Codex API key:        ${state.codex_api_key ? "(set, " + state.codex_api_key.length + " chars)" : "(none — skipped)"}`,
+        `Desired SSH port:     ${state.desired_ssh_port}`,
+        ``,
+        `Steps that will run:`,
+        `  1. set-timezone`,
+        `  2. install-git`,
+        `  3. install-python`,
+        `  4. install-node`,
+        `  5. install-go`,
+        `  6. install-docker`,
+        state.git_private_key ? `  7. set-git-key` : `  7. set-git-key  (skipped — no key)`,
+        state.install_codex ? `  8. install-codex` : `  8. install-codex  (skipped)`,
+        (state.install_codex && state.codex_api_key) ? `  9. set-codex-api` : `  9. set-codex-api  (skipped)`,
+        `  10. change-ssh-port → verify → update node row`,
+      ];
+      summary.appendChild(document.createTextNode(lines.join("\n")));
+      wrap.appendChild(summary);
+      navButtons({ nextLabel: "Save & Run →", onNext: () => { state.step = 6; renderStep(); kickoffInit(); } });
+    }
+
+    function renderRunStep() {
+      wrap.appendChild(h("div", { class: "field" },
+        h("label", null, "Initializing"),
+        h("p", { class: "muted", style: "font-size: 13px; margin: 4px 0 12px" },
+          "Live log below. You can close the modal — the job keeps running and will appear in node history when done."),
+      ));
+      wrap.appendChild(h("div", { id: "wiz-status", class: "muted", style: "margin-bottom: 8px" }, "Starting…"));
+      const out = h("pre", { class: "log-viewer", id: "wiz-log", style: "max-height: 420px" });
+      wrap.appendChild(out);
+
+      footer.innerHTML = "";
+      footer.appendChild(h("button", { class: "btn", onclick: () => Modal.close() }, "Close"));
+    }
+
+    let pollTimer = null;
+    let currentRunId = null;
+    let modalOpen = true;
+
+    async function kickoffInit() {
+      const payload = {
+        init_git_private_key: state.git_private_key || null,
+        init_git_user_name: state.git_user_name || null,
+        init_git_user_email: state.git_user_email || null,
+        init_desired_ssh_port: state.desired_ssh_port,
+        init_install_codex: state.install_codex,
+        init_codex_base_url: state.codex_base_url || null,
+        init_codex_api_key: state.codex_api_key || null,
+        init_timezone: state.timezone,
+      };
+      try {
+        const r = await api("POST", `/api/nodes/${encodeURIComponent(node.name)}/init/start`, payload);
+        currentRunId = r.id;
+        document.getElementById("wiz-status").textContent = `Run #${r.id} · ${r.status}`;
+        startPolling();
+      } catch (err) {
+        document.getElementById("wiz-status").textContent = `Failed to start: ${err.message}`;
+        toast("error", "Init start failed", err.message);
+      }
+    }
+
+    function startPolling() {
+      const poll = async () => {
+        if (!currentRunId) return;
+        try {
+          const r = await api("GET", `/api/nodes/${encodeURIComponent(node.name)}/init/runs/${currentRunId}`);
+          if (modalOpen) {
+            const statusEl = document.getElementById("wiz-status");
+            const logEl = document.getElementById("wiz-log");
+            if (statusEl) statusEl.textContent = `Run #${r.id} · ${r.status}` + (r.current_step ? ` · ${r.current_step}` : "");
+            if (logEl) {
+              const wasNearBottom = (logEl.scrollTop + logEl.clientHeight) >= (logEl.scrollHeight - 30);
+              logEl.textContent = r.log_text || "";
+              if (wasNearBottom) logEl.scrollTop = logEl.scrollHeight;
+            }
+          }
+          if (r.status === "success" || r.status === "failed" || r.status === "cancelled") {
+            clearInterval(pollTimer); pollTimer = null;
+            toast(r.status === "success" ? "success" : "error",
+              `Init ${r.status}`,
+              r.status === "success" ? `Node ${node.name} initialized` : `exit ${r.exit_code}`);
+            onDone && onDone();
+          }
+        } catch (err) {
+          // network blip; keep trying
+        }
+      };
+      pollTimer = setInterval(poll, 1500);
+      poll();
+    }
+
+    // Override Modal.close to stop polling.
+    const origClose = Modal.close.bind(Modal);
+    const myClose = () => { modalOpen = false; if (pollTimer) clearInterval(pollTimer); origClose(); Modal.close = origClose; };
+    Modal.close = myClose;
+
+    Modal.open({ title: `Initialize ${node.name}`, body: wrap, footer: footer });
+    renderStep();
+  }
+
+  // ----- Services view -----
+
+  async function renderServicesView(root) {
+    setActiveNav("services");
+    root.innerHTML = "";
+    root.appendChild(h("div", { class: "page-header" },
+      h("div", null,
+        h("h1", null, "Services"),
+        h("p", { class: "lede" }, "Deployable services. Each entry points to a GitHub repo + compose file. The Deploy action on a node clones the repo, writes a .env, and runs `docker compose up -d --build`."),
+      ),
+      h("div", { class: "row" },
+        h("button", { class: "btn", onclick: () => renderServicesView(root) }, "Refresh"),
+        App.mode === "readwrite"
+          ? h("button", { class: "btn btn-primary", onclick: () => openServiceModal(null, () => renderServicesView(root)) }, "+ Add service")
+          : null,
+      ),
+    ));
+    const card = h("div", { class: "card" });
+    card.appendChild(h("div", { class: "card-header" }, h("h2", null, "Catalog"), h("span", { class: "hint", id: "services-count" })));
+    const body = h("div", { class: "card-body tight" });
+    card.appendChild(body);
+    root.appendChild(card);
+    try {
+      const resp = await api("GET", "/api/services");
+      const rows = resp.services || [];
+      document.getElementById("services-count").textContent = `${rows.length} service${rows.length === 1 ? "" : "s"}`;
+      if (!rows.length) {
+        body.appendChild(h("div", { class: "empty" },
+          h("div", { class: "title" }, "No services registered"),
+          h("div", { class: "sub" }, App.mode === "readwrite" ? "Add your first service to make it deployable from the Nodes page." : "Read-only admin.")));
+      } else {
+        body.appendChild(renderServicesTable(rows));
+      }
+    } catch (err) {
+      if (err.status === 401) showLogin();
+      else toast("error", "Failed to load services", err.message);
+    }
+  }
+
+  function renderServicesTable(services) {
+    const table = h("table", { class: "data" });
+    table.appendChild(h("thead", null,
+      h("tr", null,
+        h("th", null, "Name"),
+        h("th", null, "Repo"),
+        h("th", null, "Compose"),
+        h("th", null, "Branch"),
+        h("th", null, "Updated"),
+        h("th", null, ""),
+      ),
+    ));
+    const tbody = h("tbody");
+    for (const s of services) {
+      const actions = h("td", { class: "actions" });
+      actions.appendChild(h("button", { class: "btn btn-sm",
+        onclick: () => openServiceModal(s, () => renderServicesView(document.getElementById("view-root")))
+      }, "Edit"));
+      if (App.mode === "readwrite") {
+        actions.appendChild(h("button", { class: "btn btn-sm btn-danger",
+          onclick: async () => {
+            if (!confirm(`Delete service ${s.name}?`)) return;
+            try {
+              await api("DELETE", `/api/services/${encodeURIComponent(s.name)}`);
+              toast("success", "Deleted", s.name);
+              renderServicesView(document.getElementById("view-root"));
+            } catch (err) { toast("error", "Delete failed", err.message); }
+          } }, "Delete"));
+      }
+      tbody.appendChild(h("tr", null,
+        h("td", { class: "domain" }, s.name,
+          s.description ? h("div", { class: "muted", style: "font-size: 11px; margin-top: 2px" }, s.description) : null),
+        h("td", { class: "mono", style: "font-size: 12px" }, s.github_repo_url),
+        h("td", { class: "mono", style: "font-size: 12px" }, s.compose_file),
+        h("td", { class: "mono", style: "font-size: 12px" }, s.default_branch),
+        h("td", { class: "muted" }, fmtRelative(s.updated_at)),
+        actions,
+      ));
+    }
+    table.appendChild(tbody);
+    const wrap = h("div", { class: "table-wrap" });
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  function envDictToText(envDict) {
+    if (!envDict) return "";
+    return Object.entries(envDict).map(([k, v]) => `${k}=${v}`).join("\n");
+  }
+  function envTextToDict(text) {
+    const out = {};
+    for (const raw of (text || "").split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || line.startsWith("#")) continue;
+      const eq = line.indexOf("=");
+      if (eq < 0) continue;
+      const k = line.slice(0, eq).trim();
+      const v = line.slice(eq + 1);
+      if (k) out[k] = v;
+    }
+    return out;
+  }
+
+  function openServiceModal(existing, onSaved) {
+    const isEdit = !!existing;
+    const form = h("form");
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Name"),
+        h("input", { id: "svc-name", class: "input mono", required: true, disabled: isEdit,
+          value: existing ? existing.name : "" }),
+      ),
+      h("div", { class: "field" },
+        h("label", null, "Display name"),
+        h("input", { id: "svc-display", class: "input",
+          value: existing ? existing.display_name : "" }),
+      ),
+    ));
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Description"),
+      h("input", { id: "svc-desc", class: "input",
+        value: existing && existing.description ? existing.description : "" }),
+    ));
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "GitHub repo URL"),
+        h("input", { id: "svc-repo", class: "input mono", required: true,
+          placeholder: "git@github.com:bitsfactor/ssl-service.git",
+          value: existing ? existing.github_repo_url : "" }),
+      ),
+      h("div", { class: "field" },
+        h("label", null, "Branch"),
+        h("input", { id: "svc-branch", class: "input mono",
+          value: existing ? existing.default_branch : "main" }),
+      ),
+    ));
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Compose file (relative to repo root)"),
+        h("input", { id: "svc-compose", class: "input mono",
+          value: existing ? existing.compose_file : "docker-compose.yml" }),
+      ),
+      h("div", { class: "field" },
+        h("label", null, "Install dir template ", h("span", { class: "hint" }, " — {name} = service name")),
+        h("input", { id: "svc-installdir", class: "input mono",
+          value: existing ? existing.install_dir_template : "/opt/{name}" }),
+      ),
+    ));
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Default env (KEY=value, one per line)"),
+      h("textarea", { id: "svc-env", class: "textarea mono", rows: "6",
+        placeholder: "POSTGRES_DSN=postgresql://...\nADMIN_TOKEN=replace-me" },
+        existing ? envDictToText(existing.default_env || {}) : ""),
+    ));
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Pre-deploy command (optional, runs before docker compose up)"),
+      h("textarea", { id: "svc-pre", class: "textarea mono", rows: "2",
+        placeholder: "(blank)" },
+        existing && existing.pre_deploy_command ? existing.pre_deploy_command : ""),
+    ));
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Post-deploy command (optional)"),
+      h("textarea", { id: "svc-post", class: "textarea mono", rows: "2",
+        placeholder: "(blank)" },
+        existing && existing.post_deploy_command ? existing.post_deploy_command : ""),
+    ));
+
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { class: "btn btn-primary", onclick: async (e) => {
+        e.preventDefault();
+        const payload = {
+          display_name: document.getElementById("svc-display").value.trim(),
+          description: document.getElementById("svc-desc").value.trim() || null,
+          github_repo_url: document.getElementById("svc-repo").value.trim(),
+          default_branch: document.getElementById("svc-branch").value.trim() || "main",
+          compose_file: document.getElementById("svc-compose").value.trim() || "docker-compose.yml",
+          install_dir_template: document.getElementById("svc-installdir").value.trim() || "/opt/{name}",
+          default_env: envTextToDict(document.getElementById("svc-env").value),
+          pre_deploy_command: document.getElementById("svc-pre").value.trim() || null,
+          post_deploy_command: document.getElementById("svc-post").value.trim() || null,
+        };
+        try {
+          if (isEdit) {
+            await api("PATCH", `/api/services/${encodeURIComponent(existing.name)}`, payload);
+          } else {
+            payload.name = document.getElementById("svc-name").value.trim();
+            await api("POST", "/api/services", payload);
+          }
+          Modal.close();
+          toast("success", isEdit ? "Service updated" : "Service added", payload.name || existing.name);
+          onSaved && onSaved();
+        } catch (err) { toast("error", "Save failed", err.message); }
+      } }, isEdit ? "Save" : "Add service"),
+    );
+    Modal.open({ title: isEdit ? `Edit ${existing.name}` : "Add service", body: form, footer });
+  }
+
+  // ----- Logs view -----
+
+  async function renderLogsView(root) {
+    setActiveNav("logs");
+    root.innerHTML = "";
+    root.appendChild(h("div", { class: "page-header" },
+      h("div", null,
+        h("h1", null, "Logs"),
+        h("p", { class: "lede" }, "Tail the most recent lines of the controller and Caddy logs."),
+      ),
+    ));
+
+    const tabs = h("div", { class: "tabs" });
+    const controllerTab = h("div", { class: "tab active", "data-which": "controller" }, "Controller");
+    const caddyTab = h("div", { class: "tab", "data-which": "caddy" }, "Caddy");
+    tabs.appendChild(controllerTab);
+    tabs.appendChild(caddyTab);
+    root.appendChild(tabs);
+
+    const row = h("div", { class: "row between", style: "margin-bottom: 12px" },
+      h("div", { class: "muted", id: "log-meta" }, ""),
+      h("div", { class: "row" },
+        h("label", { class: "muted" }, "Tail: "),
+        (() => {
+          const sel = h("select", { class: "select", id: "log-tail" });
+          for (const n of [100, 500, 1000, 2000, 5000]) sel.appendChild(h("option", { value: String(n) }, `${n} lines`));
+          sel.value = "500";
+          sel.addEventListener("change", reload);
+          return sel;
+        })(),
+        h("button", { class: "btn btn-sm", onclick: reload }, "Refresh"),
+        (() => {
+          const auto = h("label", { class: "inline-checkbox" },
+            h("input", { type: "checkbox", id: "log-auto" }), " Auto-refresh");
+          return auto;
+        })(),
+      ),
+    );
+    root.appendChild(row);
+
+    const card = h("div", { class: "card" });
+    const body = h("div", { class: "card-body" });
+    const viewer = h("div", { class: "log-viewer", id: "log-viewer" }, h("span", { class: "dim" }, "Loading…"));
+    body.appendChild(viewer);
+    card.appendChild(body);
+    root.appendChild(card);
+
+    let which = "controller";
+    let autoTimer = null;
+
+    controllerTab.addEventListener("click", () => { which = "controller"; controllerTab.classList.add("active"); caddyTab.classList.remove("active"); reload(); });
+    caddyTab.addEventListener("click", () => { which = "caddy"; caddyTab.classList.add("active"); controllerTab.classList.remove("active"); reload(); });
+
+    async function reload() {
+      const tail = document.getElementById("log-tail").value || "500";
+      try {
+        const resp = await api("GET", `/api/logs?which=${encodeURIComponent(which)}&tail=${encodeURIComponent(tail)}`);
+        viewer.innerHTML = "";
+        document.getElementById("log-meta").textContent = `${resp.path}`;
+        if (!resp.lines || !resp.lines.length) {
+          viewer.appendChild(h("span", { class: "dim" }, "(no log lines yet)"));
+        } else {
+          viewer.appendChild(document.createTextNode(resp.lines.join("\n")));
+        }
+        viewer.scrollTop = viewer.scrollHeight;
+      } catch (err) {
+        if (err.status === 401) showLogin();
+        else toast("error", "Could not read log", err.message);
+      }
+    }
+
+    document.getElementById("log-auto").addEventListener("change", (e) => {
+      if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+      if (e.target.checked) autoTimer = setInterval(reload, 3000);
+    });
+
+    reload();
+    // cleanup on leaving view
+    App._leaveCurrent = () => { if (autoTimer) clearInterval(autoTimer); };
+  }
+
+  // ----- Settings view -----
+
+  async function renderSettingsView(root) {
+    setActiveNav("settings");
+    root.innerHTML = "";
+    root.appendChild(h("div", { class: "page-header" },
+      h("div", null,
+        h("h1", null, "Settings"),
+        h("p", { class: "lede" }, "Runtime configuration summary. Editing is done in ", h("span", { class: "mono" }, "config.yaml"), "."),
+      ),
+      h("div", { class: "row" }, h("button", { class: "btn", onclick: () => renderSettingsView(root) }, "Refresh")),
+    ));
+
+    const o = App.overview || {};
+    const grid = h("div", { class: "stats" });
+    grid.appendChild(statCard("Mode", (o.mode || "—").toUpperCase(), "See sidebar badge"));
+    grid.appendChild(statCard("Poll interval", (o.poll_interval_seconds ?? "—") + "s", "Controller loop cadence"));
+    grid.appendChild(statCard("Renew before", (o.renew_before_days ?? "—") + " days", "Certificate expiry threshold"));
+    grid.appendChild(statCard("Retry backoff", (o.retry_backoff_seconds ?? "—") + "s", "After ACME failure"));
+    root.appendChild(grid);
+
+    const pathsCard = h("div", { class: "card" });
+    pathsCard.appendChild(h("div", { class: "card-header" }, h("h2", null, "Paths")));
+    const pathsBody = h("div", { class: "card-body" });
+    const paths = o.paths || {};
+    for (const [k, v] of Object.entries(paths)) {
+      pathsBody.appendChild(h("div", { class: "row", style: "gap: 12px; padding: 6px 0;" },
+        h("div", { class: "muted", style: "min-width: 180px;" }, k),
+        h("div", { class: "mono" }, v),
+      ));
+    }
+    pathsCard.appendChild(pathsBody);
+    root.appendChild(pathsCard);
+
+    const acmeCard = h("div", { class: "card" });
+    acmeCard.appendChild(h("div", { class: "card-header" }, h("h2", null, "ACME")));
+    const acmeBody = h("div", { class: "card-body" });
+    acmeBody.appendChild(h("div", { class: "row", style: "gap: 12px; padding: 6px 0;" },
+      h("div", { class: "muted", style: "min-width: 180px;" }, "email"),
+      h("div", { class: "mono" }, o.acme_email || "—"),
+    ));
+    acmeBody.appendChild(h("div", { class: "row", style: "gap: 12px; padding: 6px 0;" },
+      h("div", { class: "muted", style: "min-width: 180px;" }, "staging"),
+      h("div", null, o.acme_staging ? h("span", { class: "badge warn" }, "staging") : h("span", { class: "badge ok" }, "production")),
+    ));
+    acmeCard.appendChild(acmeBody);
+    root.appendChild(acmeCard);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Router
+  // ---------------------------------------------------------------------------
+
+  const routes = {
+    "#/dashboard": renderDashboard,
+    "#/routes": renderRoutesView,
+    "#/certificates": renderCertificatesView,
+    "#/zones": renderZonesView,
+    "#/nodes": renderNodesView,
+    "#/services": renderServicesView,
+    "#/logs": renderLogsView,
+    "#/settings": renderSettingsView,
+  };
+
+  function navigate() {
+    if (App._leaveCurrent) { try { App._leaveCurrent(); } catch (_) {} App._leaveCurrent = null; }
+    const hash = location.hash || "#/dashboard";
+    const render = routes[hash] || renderDashboard;
+    const root = document.getElementById("view-root");
+    render(root, {});
+  }
+
+  window.addEventListener("hashchange", navigate);
+
+  document.getElementById("logout-btn").addEventListener("click", () => {
+    Store.clearToken();
+    showLogin();
+  });
+
+  function showLogin() {
+    document.getElementById("app").classList.add("hidden");
+    document.getElementById("login").classList.add("open");
+    const tokenEl = document.getElementById("login-token");
+    setTimeout(() => tokenEl.focus(), 50);
+  }
+
+  function hideLogin() {
+    document.getElementById("login").classList.remove("open");
+    document.getElementById("app").classList.remove("hidden");
+  }
+
+  async function verifyAndEnter() {
+    try {
+      await api("GET", "/api/overview");
+      hideLogin();
+      await refreshOverview();
+      navigate();
+      return true;
+    } catch (err) {
+      if (err.status === 401) showLogin();
+      else toast("error", "Connection error", err.message);
+      return false;
+    }
+  }
+
+  document.getElementById("login-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const token = document.getElementById("login-token").value.trim();
+    const remember = document.getElementById("login-remember").checked;
+    if (!token) return;
+    Store.setToken(token, remember);
+    const errEl = document.getElementById("login-error");
+    errEl.textContent = "";
+    try {
+      await api("GET", "/api/overview");
+      document.getElementById("login-token").value = "";
+      hideLogin();
+      await refreshOverview();
+      if (!location.hash) location.hash = "#/dashboard";
+      navigate();
+    } catch (err) {
+      errEl.textContent = err.status === 401 ? "Invalid token." : ("Could not connect: " + err.message);
+      Store.clearToken();
+    }
+  });
+
+  // Boot
+  if (!Store.getToken()) {
+    showLogin();
+  } else {
+    verifyAndEnter().then(ok => { if (ok && !location.hash) location.hash = "#/dashboard"; });
+  }
+
+  // Refresh sidebar periodically
+  setInterval(() => { if (!document.hidden && !document.getElementById("login").classList.contains("open")) refreshOverview(); }, 15000);
+
+})();
+</script>
+
+</body>
+</html>

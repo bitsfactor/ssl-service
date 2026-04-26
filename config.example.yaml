@@ -35,3 +35,13 @@ acme:
 
 logging:
   level: INFO
+
+# Web admin backend (optional). When enabled, a small HTTP server is exposed
+# on the bind/port below and serves both the REST API under /api/* and the
+# single-page admin UI at /. All /api/* requests require a bearer token equal
+# to admin.token (via `Authorization: Bearer ...` or `X-Admin-Token` header).
+admin:
+  enabled: false
+  bind: 127.0.0.1
+  port: 8088
+  token: ""

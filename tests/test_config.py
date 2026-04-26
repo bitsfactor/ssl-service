@@ -276,3 +276,108 @@ caddy:
 
   with pytest.raises(ValueError, match=r"acme\.email is required in readwrite mode"):
     load_config(config_path)
+
+
+def test_load_config_parses_admin_section(tmp_path: Path) -> None:
+  config_path = tmp_path / "config.yaml"
+  config_path.write_text(
+    """
+mode: readonly
+postgres:
+  dsn: postgresql://example
+caddy:
+  reload_command: ["/usr/bin/caddy", "reload"]
+admin:
+  enabled: true
+  bind: 0.0.0.0
+  port: 8080
+  token: secret-token
+"""
+  )
+
+  config = load_config(config_path)
+
+  assert config.admin.enabled is True
+  assert config.admin.bind == "0.0.0.0"
+  assert config.admin.port == 8080
+  assert config.admin.token == "secret-token"
+
+
+def test_load_config_admin_defaults_off(tmp_path: Path) -> None:
+  config_path = tmp_path / "config.yaml"
+  config_path.write_text(
+    """
+mode: readonly
+postgres:
+  dsn: postgresql://example
+caddy:
+  reload_command: ["/usr/bin/caddy", "reload"]
+"""
+  )
+
+  config = load_config(config_path)
+
+  assert config.admin.enabled is False
+  assert config.admin.bind == "127.0.0.1"
+  assert config.admin.port == 8088
+  assert config.admin.token == ""
+
+
+def test_load_config_admin_requires_token_when_enabled(tmp_path: Path) -> None:
+  config_path = tmp_path / "config.yaml"
+  config_path.write_text(
+    """
+mode: readonly
+postgres:
+  dsn: postgresql://example
+caddy:
+  reload_command: ["/usr/bin/caddy", "reload"]
+admin:
+  enabled: true
+  port: 8088
+"""
+  )
+
+  with pytest.raises(ValueError, match=r"admin\.token is required"):
+    load_config(config_path)
+
+
+def test_load_config_admin_rejects_invalid_port(tmp_path: Path) -> None:
+  config_path = tmp_path / "config.yaml"
+  config_path.write_text(
+    """
+mode: readonly
+postgres:
+  dsn: postgresql://example
+caddy:
+  reload_command: ["/usr/bin/caddy", "reload"]
+admin:
+  enabled: true
+  port: 70000
+  token: t
+"""
+  )
+
+  with pytest.raises(ValueError, match=r"admin\.port must be <= 65535"):
+    load_config(config_path)
+
+
+def test_as_dict_masks_admin_token(tmp_path: Path) -> None:
+  config_path = tmp_path / "config.yaml"
+  config_path.write_text(
+    """
+mode: readonly
+postgres:
+  dsn: postgresql://example
+caddy:
+  reload_command: ["/usr/bin/caddy", "reload"]
+admin:
+  enabled: true
+  token: super-secret
+"""
+  )
+
+  payload = as_dict(load_config(config_path))
+
+  assert payload["admin"]["enabled"] is True
+  assert payload["admin"]["token"] == "***"

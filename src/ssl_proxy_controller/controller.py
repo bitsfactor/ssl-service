@@ -14,6 +14,7 @@ from tempfile import NamedTemporaryFile
 from urllib.parse import urlsplit
 
 from .acme import issue_certificate
+from .admin import AdminServer
 from .caddy import reload_caddy, render_caddyfile, state_payload
 from .config import AppConfig, load_config
 from .db import CertificateRecord, Database, RouteRecord
@@ -23,12 +24,16 @@ LOGGER = logging.getLogger("ssl_proxy_controller")
 
 
 def normalize_admin_address(admin_url: str) -> str:
-  parsed = urlsplit(admin_url)
-  if parsed.netloc:
-    return parsed.netloc
-  if parsed.path:
-    return parsed.path
-  raise ValueError("caddy admin_url must not be empty")
+  value = (admin_url or "").strip()
+  if not value:
+    raise ValueError("caddy admin_url must not be empty")
+  if "://" in value:
+    parsed = urlsplit(value)
+    if parsed.netloc:
+      return parsed.netloc
+    if parsed.path:
+      return parsed.path
+  return value
 
 
 class Controller:
@@ -59,18 +64,32 @@ class Controller:
     signal.signal(signal.SIGTERM, self.stop)
     signal.signal(signal.SIGINT, self.stop)
 
-    while self._running:
+    admin_server: AdminServer | None = None
+    if self.config.admin.enabled:
+      admin_server = AdminServer(self.config, self.database)
       try:
-        self.run_once()
-      except Exception:
-        LOGGER.exception("controller loop failed")
+        admin_server.start()
+      except OSError as exc:
+        LOGGER.error("failed to start admin server on %s:%s: %s",
+                     self.config.admin.bind, self.config.admin.port, exc)
+        admin_server = None
+
+    try:
+      while self._running:
+        try:
+          self.run_once()
+        except Exception:
+          LOGGER.exception("controller loop failed")
+          if not self._running:
+            break
+          time.sleep(self.config.sync.loop_error_backoff_seconds)
+          continue
         if not self._running:
           break
-        time.sleep(self.config.sync.loop_error_backoff_seconds)
-        continue
-      if not self._running:
-        break
-      time.sleep(self.config.sync.poll_interval_seconds)
+        time.sleep(self.config.sync.poll_interval_seconds)
+    finally:
+      if admin_server is not None:
+        admin_server.stop()
 
   def run_once(self) -> None:
     routes = self.database.fetch_routes()
@@ -223,6 +242,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="ssl proxy controller")
   parser.add_argument("--config", required=True, help="path to YAML config")
   parser.add_argument("--once", action="store_true", help="run one sync iteration and exit")
+  parser.add_argument(
+    "--admin-only",
+    action="store_true",
+    help="run only the admin server (useful for testing or dedicated admin nodes)",
+  )
   return parser.parse_args(argv)
 
 
@@ -255,6 +279,22 @@ def main(argv: list[str] | None = None) -> int:
   if args.once:
     controller.ensure_directories()
     controller.run_once()
+    return 0
+
+  if args.admin_only:
+    if not config.admin.enabled:
+      LOGGER.error("admin-only mode requires admin.enabled to be true in config")
+      return 2
+    controller.ensure_directories()
+    admin_server = AdminServer(config, controller.database)
+    admin_server.start()
+    signal.signal(signal.SIGTERM, controller.stop)
+    signal.signal(signal.SIGINT, controller.stop)
+    try:
+      while controller._running:
+        time.sleep(1)
+    finally:
+      admin_server.stop()
     return 0
 
   controller.run_forever()

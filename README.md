@@ -273,13 +273,57 @@ When upstream reachability fails:
 - then verify the target from inside the container, not only from the host
 - if the upstream is host-local, use a plain port or `localhost:port` via `ssl-service domain`, not a hardcoded container loopback assumption
 
+## Web Admin
+
+`ssl-service` ships with an optional, dependency-free HTTP admin on the same host as the controller. It serves a single-page UI (dashboard, routes, certificates, DNS zones, logs, settings) and a REST API under `/api/*`. All `/api/*` requests require a bearer token equal to `admin.token` sent as `Authorization: Bearer <token>`, `X-Admin-Token: <token>`, or `?token=<token>`.
+
+Enable it in `config.yaml`:
+
+```yaml
+admin:
+  enabled: true
+  bind: 127.0.0.1      # use 0.0.0.0 if you need LAN access (put a TLS terminator in front)
+  port: 8088
+  token: "replace-with-a-strong-random-token"
+```
+
+Then restart the service and open `http://<host>:8088/` in a browser. On a readonly node the UI is view-only (mutations return HTTP 403); on a readwrite node you can add/edit/delete routes, upsert Cloudflare DNS zone tokens, clear a certificate's retry window, and trigger an immediate Caddyfile reload.
+
+You can also run the controller in admin-only mode (no sync loop, just the HTTP admin) with:
+
+```bash
+python -m ssl_proxy_controller --admin-only --config /path/to/config.yaml
+```
+
 ## Development
 
 Development helpers are separate from production install and should only be used inside the source tree:
 
 ```bash
-bash scripts/setup-dev.sh bootstrap
-bash scripts/setup-dev.sh test
-bash scripts/setup-dev.sh run-once --config config.yaml
-bash scripts/setup-dev.sh domain list
+bash scripts/setup-dev.sh bootstrap           # create .venv / .tools-venv / .acme-venv
+bash scripts/setup-dev.sh test                # run pytest
+bash scripts/setup-dev.sh run-once --config config.yaml   # one sync tick against real Postgres
+bash scripts/setup-dev.sh domain list         # use the domain CLI
+bash scripts/setup-dev.sh admin               # launch the admin UI locally with fake data
 ```
+
+### Trying the Admin UI without Postgres
+
+`scripts/dev-admin.py` boots the admin server against an in-memory "fake database" pre-seeded with demo routes, certificates (including one expiring soon and one in error), and DNS zone tokens. It needs no PostgreSQL, no Caddy, no Docker — just Python 3.11+.
+
+```bash
+# first time: create a dev venv at .venv
+bash scripts/setup-dev.sh bootstrap
+
+# then launch the admin:
+bash scripts/setup-dev.sh admin                       # default: :8088, token "dev-token", readwrite
+bash scripts/setup-dev.sh admin --port 9000           # custom port
+bash scripts/setup-dev.sh admin --mode readonly       # show the view-only experience
+bash scripts/setup-dev.sh admin --token my-secret     # custom token
+bash scripts/setup-dev.sh admin --no-seed             # start with empty state
+
+# or invoke the dev script directly without the venv wrapper:
+python3 scripts/dev-admin.py
+```
+
+Open the printed URL, paste the token into the sign-in screen, and click around. Mutations work against the in-memory store and reset on each restart.

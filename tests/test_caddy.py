@@ -14,7 +14,7 @@ from ssl_proxy_controller.caddy import (
   state_payload,
   validate_upstream_target,
 )
-from ssl_proxy_controller.db import CertificateRecord, RouteRecord
+from ssl_proxy_controller.db import CertificateRecord, RouteRecord, UpstreamRecord
 
 
 def make_certificate(domain: str) -> CertificateRecord:
@@ -260,6 +260,98 @@ def test_reload_caddy_runs_subprocess(monkeypatch) -> None:
   reload_caddy(["/usr/bin/caddy", "reload"])
 
   assert calls == [["/usr/bin/caddy", "reload"]]
+
+
+def test_render_caddyfile_renders_multiple_upstreams_with_lb_policy(tmp_path: Path) -> None:
+  output = tmp_path / "generated" / "Caddyfile"
+  routes = [
+    RouteRecord(
+      domain="balanced.example.com",
+      upstream_target="10.0.0.10:6111",
+      enabled=True,
+      updated_at=datetime.now(tz=UTC),
+      upstreams=[
+        UpstreamRecord(target="10.0.0.10:6111", weight=1),
+        UpstreamRecord(target="10.0.0.11:6111", weight=1),
+        UpstreamRecord(target="10.0.0.12:6111", weight=2),
+      ],
+      lb_policy="ip_hash",
+    )
+  ]
+  certificates = {"balanced.example.com": make_certificate("balanced.example.com")}
+
+  render_caddyfile(
+    output_path=output,
+    routes=routes,
+    certificates=certificates,
+    admin_address="127.0.0.1:2019",
+    log_path=tmp_path / "logs" / "caddy.log",
+    log_roll_size_mb=5,
+    log_roll_keep=8,
+  )
+
+  content = output.read_text()
+  assert "reverse_proxy 10.0.0.10:6111 10.0.0.11:6111 10.0.0.12:6111 {" in content
+  assert "lb_policy ip_hash" in content
+
+
+def test_render_caddyfile_single_upstream_random_stays_on_one_line(tmp_path: Path) -> None:
+  output = tmp_path / "generated" / "Caddyfile"
+  routes = [
+    RouteRecord(
+      domain="solo.example.com",
+      upstream_target="10.0.0.25:6111",
+      enabled=True,
+      updated_at=datetime.now(tz=UTC),
+      upstreams=[UpstreamRecord(target="10.0.0.25:6111", weight=1)],
+      lb_policy="random",
+    )
+  ]
+  certificates = {"solo.example.com": make_certificate("solo.example.com")}
+
+  render_caddyfile(
+    output_path=output,
+    routes=routes,
+    certificates=certificates,
+    admin_address="127.0.0.1:2019",
+    log_path=tmp_path / "logs" / "caddy.log",
+    log_roll_size_mb=5,
+    log_roll_keep=8,
+  )
+
+  content = output.read_text()
+  assert "reverse_proxy 10.0.0.25:6111" in content
+  # No block form or lb_policy directive when a single upstream uses the default policy.
+  assert "lb_policy" not in content
+
+
+def test_render_caddyfile_single_upstream_with_non_random_policy_uses_block_form(tmp_path: Path) -> None:
+  output = tmp_path / "generated" / "Caddyfile"
+  routes = [
+    RouteRecord(
+      domain="solo2.example.com",
+      upstream_target="10.0.0.25:6111",
+      enabled=True,
+      updated_at=datetime.now(tz=UTC),
+      upstreams=[UpstreamRecord(target="10.0.0.25:6111", weight=1)],
+      lb_policy="round_robin",
+    )
+  ]
+  certificates = {"solo2.example.com": make_certificate("solo2.example.com")}
+
+  render_caddyfile(
+    output_path=output,
+    routes=routes,
+    certificates=certificates,
+    admin_address="127.0.0.1:2019",
+    log_path=tmp_path / "logs" / "caddy.log",
+    log_roll_size_mb=5,
+    log_roll_keep=8,
+  )
+
+  content = output.read_text()
+  assert "reverse_proxy 10.0.0.25:6111 {" in content
+  assert "lb_policy round_robin" in content
 
 
 def test_state_payload_is_sorted_json() -> None:
