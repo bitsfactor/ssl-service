@@ -5204,6 +5204,19 @@
     listBody.appendChild(h("div", { class: "muted", style: "padding: 8px 0;" },
       "Loading…"));
 
+    // ---- Card 1.5: push DSN to deployed services ----
+    // After switching the local admin's active DB, the ssl-service
+    // containers running on remote nodes are still pointing at the
+    // old DSN. This card is the explicit "push the new DSN to those
+    // containers" action — re-deploys ssl-service everywhere so the
+    // containers respawn with the new env.
+    const pushCard = h("div", { class: "card" });
+    pushCard.appendChild(h("div", { class: "card-header" },
+      h("h2", null, "Push DSN to deployed services")));
+    const pushBody = h("div", { class: "card-body" });
+    pushCard.appendChild(pushBody);
+    root.appendChild(pushCard);
+
     // ---- Card 2: sync ----
     const syncCard = h("div", { class: "card", id: "sync-card",
       style: "display: none" });
@@ -5320,6 +5333,103 @@
           `Last sync: ${fromLabel} → ${toLabel} · `,
           `${ls.totals_applied || 0} rows · ${fmtRelative(ls.at)}`));
       }
+
+      // Render push-DSN section (depends on the active entry's DSN).
+      renderPushSection(view);
+    };
+
+    // Render the "Push DSN to deployed services" card body. Pulls
+    // /api/services-summary so we can show how many ssl-service
+    // nodes will be touched.
+    const renderPushSection = async (view) => {
+      pushBody.innerHTML = "";
+      const activeEntry = view.entries.find(e => e.is_current) || view.entries.find(e => e.is_active);
+      if (!activeEntry) {
+        pushBody.appendChild(h("div", { class: "muted" },
+          "No active database — pick one in the table above first."));
+        return;
+      }
+      pushBody.appendChild(h("div", { class: "muted", style: "margin-bottom: 8px" },
+        "After switching the live database (above), deployed ssl-service containers ",
+        "on your remote nodes are still pointing at the old DSN. Use this to push the ",
+        h("strong", null, "currently in-use"), " DSN (",
+        h("span", { class: "mono", style: "font-size: 11.5px" }, activeEntry.dsn_masked || "—"),
+        ") to every ssl-service node, then docker compose restarts the containers ",
+        "with the new env."));
+
+      // Async fetch service summary to know how many ssl-service nodes
+      // would actually get touched.
+      let counts = null;
+      try {
+        const r = await api("GET", "/api/services-summary").catch(() => ({ services: [] }));
+        const svc = (r.services || []).find(s => s.name === "ssl-service");
+        if (svc) counts = svc;
+      } catch (_) { /* ignore */ }
+
+      if (!counts) {
+        pushBody.appendChild(h("div", { class: "muted",
+          style: "padding: 6px 0; font-size: 12px" },
+          "ssl-service is not registered as a service in the catalog — register it first."));
+        return;
+      }
+      const totalNodes = counts.total || 0;
+      const runningNodes = counts.running || 0;
+      const unhealthyNodes = counts.unhealthy || 0;
+      pushBody.appendChild(h("div", { style: "margin-bottom: 8px; font-size: 13px" },
+        h("strong", null, `${totalNodes} ssl-service node${totalNodes === 1 ? "" : "s"}`),
+        " on record · ",
+        h("span", { class: "badge ok" }, `${runningNodes} running`),
+        unhealthyNodes
+          ? h("span", { class: "badge danger", style: "margin-left: 4px" },
+              `${unhealthyNodes} unhealthy`)
+          : null,
+      ));
+      if (totalNodes === 0) {
+        pushBody.appendChild(h("div", { class: "muted", style: "padding: 4px 0" },
+          "No deployed ssl-service nodes yet. Deploy first from the Nodes page."));
+        return;
+      }
+
+      const includeAbsentChk = h("input", { type: "checkbox", id: "push-incl-absent" });
+      pushBody.appendChild(h("label", {
+        for: "push-incl-absent", class: "muted",
+        style: "display: block; font-size: 12px; margin: 6px 0; cursor: pointer",
+      }, includeAbsentChk, " Also push to nodes where the container is currently absent (will respawn it)"));
+
+      const pushBtn = h("button", { class: "btn btn-primary",
+        onclick: async () => {
+          const includeAbsent = includeAbsentChk.checked;
+          const targetCount = includeAbsent ? totalNodes : runningNodes;
+          if (targetCount === 0) {
+            toast("info", "No targets",
+              includeAbsent ? "Nothing to push to." : "All known nodes are absent — tick the checkbox to also include them.");
+            return;
+          }
+          const msg =
+            `Push DSN to ${targetCount} ssl-service node(s)?\n\n` +
+            `DSN: ${activeEntry.dsn_masked || "?"}\n\n` +
+            `Each node will: git pull → write fresh .env (with new SSL_SERVICE_PG_DSN) → docker compose up -d --build.\n\n` +
+            `Containers will restart and reconnect to the new database.`;
+          if (!confirm(msg)) return;
+          pushBtn.disabled = true; pushBtn.textContent = "Pushing…";
+          try {
+            const r = await api("POST", "/api/databases/push-dsn-to-nodes",
+              { include_absent: includeAbsent });
+            const ok = r.success || 0;
+            const fail = r.fail || 0;
+            toast(fail === 0 ? "success" : "info", "Push complete",
+              `${ok}/${r.total || ok + fail} ok · ${fail} failed`);
+            // Reuse the existing per-deploy report modal.
+            if (typeof openServiceDeployReportModal === "function" && r.results) {
+              openServiceDeployReportModal(r);
+            }
+          } catch (err) {
+            toast("error", "Push failed", err.message);
+          } finally {
+            pushBtn.disabled = false; pushBtn.textContent = "Push DSN to deployed nodes";
+          }
+        } }, "Push DSN to deployed nodes");
+      pushBody.appendChild(pushBtn);
     };
 
     // -------- Render: sync picker --------

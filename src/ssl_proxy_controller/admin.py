@@ -3397,6 +3397,57 @@ def _build_router(ctx: AdminContext) -> _Router:
     connection pool — no restart needed."""
     return databases_activate_handler(request)
 
+  def databases_push_dsn_handler(request: _Request) -> _Response:
+    """Re-deploy ssl-service to every node that has a row for it,
+    using the admin's currently-active DSN as SSL_SERVICE_PG_DSN
+    in the env. This is what you run after locally switching DB
+    schema so the deployed containers reconnect to the same data.
+
+    Body (all optional):
+      service: 'ssl-service'   — which service in the catalog
+      env_var: 'SSL_SERVICE_PG_DSN'  — which env var to set
+      include_absent: false    — include nodes whose container is absent
+                                  (off by default — they'd just respawn
+                                  the missing container with the new DSN)
+    """
+    _require_readwrite(ctx)
+    payload = request.json_body() if request.body else {}
+    service_name = (payload.get("service") or "ssl-service").strip()
+    env_var = (payload.get("env_var") or "SSL_SERVICE_PG_DSN").strip()
+    include_absent = bool(payload.get("include_absent", False))
+
+    service_name = _normalize_service_name(service_name)
+    if ctx.database.get_service(service_name) is None:
+      raise HttpError(
+        HTTPStatus.NOT_FOUND,
+        f"service '{service_name}' not registered in the catalog — register it first",
+        code="service_not_registered",
+      )
+    states = ctx.database.list_service_node_states(service_name=service_name)
+    if not include_absent:
+      states = [s for s in states if (s.container_state or "absent") != "absent"]
+    node_names = sorted({s.node_name for s in states})
+    if not node_names:
+      return _json_response(HTTPStatus.OK, {
+        "service": service_name,
+        "refreshed": 0, "total": 0, "results": [], "errors": [],
+        "message": f"No deployed {service_name} nodes to push to.",
+        "at": _to_jsonable(datetime.now(tz=UTC)),
+      })
+
+    active_dsn = _current_dsn()
+    LOGGER.info(
+      "databases.push_dsn: pushing to %d %s nodes, env_var=%s",
+      len(node_names), service_name, env_var,
+    )
+    out = deploy_service_to_nodes(ctx, service_name, {
+      "nodes": node_names,
+      "env": {env_var: active_dsn},
+    })
+    out["pushed_dsn_masked"] = db_sync_mod.mask_dsn(active_dsn)
+    out["env_var"] = env_var
+    return _json_response(HTTPStatus.OK, out)
+
   def databases_activate_handler(request: _Request) -> _Response:
     """Switch the live admin process to a different database.
 
@@ -3522,6 +3573,7 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("POST",   "/api/databases/{id}/apply-schema", with_auth(databases_apply_schema_handler))
   router.add("PUT",    "/api/databases/{id}/primary", with_auth(databases_set_primary_handler))
   router.add("PUT",    "/api/databases/{id}/activate", with_auth(databases_activate_handler))
+  router.add("POST",   "/api/databases/push-dsn-to-nodes", with_auth(databases_push_dsn_handler))
   router.add("POST",   "/api/sync/analyze", with_auth(sync_analyze_handler))
   router.add("POST",   "/api/sync/apply", with_auth(sync_apply_handler))
   router.add("GET", "/api/services/{name}/nodes", with_auth(service_nodes_handler))
