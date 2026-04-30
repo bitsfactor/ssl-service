@@ -5407,42 +5407,76 @@
       analysisStamp.textContent = stampParts.join(" · ");
       analysisBody.innerHTML = "";
 
-      // Bootstrap-schema banner when the target is missing tables we
-      // could otherwise sync. Stops being a hard "schema not initialized"
-      // dead-end and becomes a one-click action that the user can take
-      // alongside the rest of the analysis.
+      // Step 1 of 2: target is missing tables we'd otherwise sync. Until
+      // those tables exist, "Apply sync" can't do anything useful, so we
+      // ONLY show the Bootstrap button here and hide Apply sync further
+      // down. After Bootstrap completes we auto-re-Analyze, which moves
+      // us into Step 2 (showing Apply sync).
       if (targetMissingCount > 0) {
         const targetEntry = (view.entries || []).find(e => e.id === analysis.to_id);
         const banner = h("div", {
           style: "background: var(--surface-alt); border-left: 4px solid var(--danger); padding: 10px 12px; margin-bottom: 14px;",
         });
         banner.appendChild(h("div", { style: "font-weight: 600; margin-bottom: 4px" },
-          `Target '${toLabel}' is missing ${targetMissingCount} table(s): `,
+          `Step 1 of 2 — Target '${toLabel}' is missing ${targetMissingCount} table(s): `,
           h("span", { class: "mono", style: "font-size: 11.5px" },
             (analysis.target_missing || []).join(", "))));
         banner.appendChild(h("div", { class: "muted", style: "font-size: 12px; margin-bottom: 8px" },
-          `If you bootstrap the target schema, ${wouldInsert} more rows would be inserted.`));
+          `Bootstrap the schema first; ${wouldInsert} rows from the source are waiting. Apply sync will appear after that.`));
         if (targetEntry && App.mode === "readwrite") {
-          banner.appendChild(h("button", {
+          const bootstrapBtn = h("button", {
             class: "btn btn-sm btn-primary",
-            onclick: async () => {
-              if (!confirm(`Run schema.sql against '${toLabel}'?\n\nThis creates the missing sync tables. Idempotent — safe even if some tables already exist.`)) return;
-              try {
-                const r = await api("POST",
-                  `/api/databases/${encodeURIComponent(targetEntry.id)}/apply-schema`, {});
-                const stillMissing = (r.missing_tables || []).length;
-                toast(stillMissing === 0 ? "success" : "info",
-                  "Schema applied",
-                  stillMissing === 0
-                    ? "All sync tables present. Click Analyze again."
-                    : `${stillMissing} tables still missing.`);
-              } catch (err) {
-                toast("error", "Apply schema failed", err.message);
+          }, `Bootstrap schema on ${toLabel}`);
+          bootstrapBtn.onclick = async () => {
+            if (!confirm(`Run schema.sql against '${toLabel}'?\n\nThis creates the missing sync tables. Idempotent — safe even if some tables already exist.`)) return;
+            bootstrapBtn.disabled = true;
+            bootstrapBtn.textContent = "Bootstrapping schema…";
+            const progress = h("div", { class: "muted",
+              style: "font-size: 12px; margin-top: 6px;" },
+              "Running schema.sql… this can take ~10s on Supabase.");
+            banner.appendChild(progress);
+            try {
+              const r = await api("POST",
+                `/api/databases/${encodeURIComponent(targetEntry.id)}/apply-schema`, {});
+              const stillMissing = (r.missing_tables || []).length;
+              if (stillMissing > 0) {
+                toast("error", "Bootstrap incomplete",
+                  `${stillMissing} tables still missing after schema.sql ran.`);
+                bootstrapBtn.disabled = false;
+                bootstrapBtn.textContent = `Bootstrap schema on ${toLabel}`;
+                progress.textContent = `Still missing: ${(r.missing_tables || []).join(", ")}`;
+                return;
               }
-            },
-          }, `Bootstrap schema on ${toLabel}`));
+              progress.textContent = "Schema ready. Re-analyzing…";
+              toast("success", "Schema bootstrapped",
+                `${(r.checked_tables || []).length} sync tables created on ${toLabel}.`);
+              // Auto-rerun Analyze so the user immediately sees Step 2.
+              try {
+                const fresh = await api("POST", "/api/sync/analyze",
+                  { from_id: analysis.from_id, to_id: analysis.to_id });
+                renderAnalysis(fresh, view);
+              } catch (err) {
+                toast("error", "Re-analyze failed", err.message);
+                bootstrapBtn.disabled = false;
+                bootstrapBtn.textContent = `Bootstrap schema on ${toLabel}`;
+              }
+            } catch (err) {
+              toast("error", "Apply schema failed", err.message);
+              bootstrapBtn.disabled = false;
+              bootstrapBtn.textContent = `Bootstrap schema on ${toLabel}`;
+              progress.remove();
+            }
+          };
+          banner.appendChild(bootstrapBtn);
         }
         analysisBody.appendChild(banner);
+      } else if ((t.insert || 0) + (t.overwrite || 0) > 0) {
+        // Schema is good and there's something to apply — tell the user
+        // explicitly that we're in Step 2.
+        analysisBody.appendChild(h("div", {
+          class: "muted",
+          style: "background: var(--surface-alt); border-left: 4px solid var(--success, #2a8a3e); padding: 8px 12px; margin-bottom: 14px; font-size: 12px;",
+        }, `Step 2 of 2 — Schema is in sync. Review the per-table changes below, then click "Apply sync" at the bottom to write them.`));
       }
 
       // Real DB errors get their own callout.
@@ -5555,35 +5589,40 @@
         analysisBody.appendChild(wrap2);
       }
 
-      // Apply button
-      const apply = h("button", { class: "btn btn-danger",
-        style: "margin-top: 16px", onclick: async () => {
-          const msg =
-            `Apply this sync?\n\n` +
-            `Source: ${fromLabel}\n` +
-            `Target: ${toLabel}\n\n` +
-            `${analysis.totals.insert} new rows will be inserted.\n` +
-            `${analysis.totals.overwrite} EXISTING rows will be OVERWRITTEN.\n` +
-            `${analysis.totals.preserve_only_in_target} target-only rows will be kept.\n\n` +
-            `This writes to '${toLabel}'. Irreversible.`;
-          if (!confirm(msg)) return;
-          apply.disabled = true; apply.textContent = "Applying…";
-          try {
-            const r = await api("POST", "/api/sync/apply",
-              { from_id: analysis.from_id, to_id: analysis.to_id });
-            const ok = (r.results || []).reduce((a, b) => a + (b.rows_applied || 0), 0);
-            const fail = (r.errors || []).length;
-            toast(fail === 0 ? "success" : "info", "Sync complete",
-              `${ok} rows applied · ${fail} table(s) failed`);
-            await refresh();
-            analysisCard.style.display = "none";
-          } catch (err) {
-            toast("error", "Apply failed", err.message);
-          } finally {
-            apply.disabled = false; apply.textContent = "Apply sync";
-          }
-        } }, "Apply sync");
-      analysisBody.appendChild(apply);
+      // Apply sync — only when there's actually something to apply AND
+      // target schema is ready. Stops the user from clicking it during
+      // Step 1 (when Bootstrap is the only sensible action).
+      const haveChanges = (t.insert || 0) + (t.overwrite || 0) > 0;
+      if (targetMissingCount === 0 && haveChanges) {
+        const apply = h("button", { class: "btn btn-danger",
+          style: "margin-top: 16px", onclick: async () => {
+            const msg =
+              `Apply this sync?\n\n` +
+              `Source: ${fromLabel}\n` +
+              `Target: ${toLabel}\n\n` +
+              `${t.insert || 0} new rows will be inserted.\n` +
+              `${t.overwrite || 0} EXISTING rows will be OVERWRITTEN.\n` +
+              `${t.preserve_only_in_target || 0} target-only rows will be kept.\n\n` +
+              `This writes to '${toLabel}'. Irreversible.`;
+            if (!confirm(msg)) return;
+            apply.disabled = true; apply.textContent = "Applying…";
+            try {
+              const r = await api("POST", "/api/sync/apply",
+                { from_id: analysis.from_id, to_id: analysis.to_id });
+              const ok = (r.results || []).reduce((a, b) => a + (b.rows_applied || 0), 0);
+              const fail = (r.errors || []).length;
+              toast(fail === 0 ? "success" : "info", "Sync complete",
+                `${ok} rows applied · ${fail} table(s) failed`);
+              await refresh();
+              analysisCard.style.display = "none";
+            } catch (err) {
+              toast("error", "Apply failed", err.message);
+            } finally {
+              apply.disabled = false; apply.textContent = "Apply sync";
+            }
+          } }, "Apply sync");
+        analysisBody.appendChild(apply);
+      }
     };
 
     // -------- Action handlers --------
