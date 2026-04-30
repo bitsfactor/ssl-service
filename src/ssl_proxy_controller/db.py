@@ -334,6 +334,11 @@ class Database:
         )
         self._pool = None
 
+  @property
+  def dsn(self) -> str:
+    """The DSN currently in use. Updates after ``swap_to()``."""
+    return self._dsn
+
   def close(self) -> None:
     """Close the underlying pool. Safe to call multiple times."""
     if self._pool is not None:

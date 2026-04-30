@@ -3266,7 +3266,13 @@ def _build_router(ctx: AdminContext) -> _Router:
   # (auto-bootstrapped). Users add more, pick any two for sync.
 
   def _current_dsn() -> str:
-    return ctx.config.postgres.dsn
+    """The DSN the admin is currently connected to.
+
+    NOT ``ctx.config.postgres.dsn`` — that's the boot-time DSN and is
+    immutable. After an Activate swap, the live DSN lives on the
+    Database instance. Falls back to the config DSN if the Database
+    object happens to lack a .dsn attribute (older builds)."""
+    return getattr(ctx.database, "dsn", None) or ctx.config.postgres.dsn
 
   def _resolve_dsn_or_400(db_id: str) -> str:
     dsn = db_registry_mod.get_dsn(ctx.database, db_id)
