@@ -1326,6 +1326,49 @@
     return h ? `${d}d ${h}h` : `${d}d`;
   }
 
+  // Helpers that prefer the new structured node_status fields and return
+  // null when nothing's parsed (callers fall back to the legacy display
+  // string in that case).
+  function fmtKbHuman(kb) {
+    if (kb == null || isNaN(kb)) return null;
+    const n = Number(kb);
+    if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " GB";
+    if (n >= 1024) return (n / 1024).toFixed(0) + " MB";
+    return n + " KB";
+  }
+  function fmtLoadAvg(status) {
+    if (!status) return null;
+    const a = status.load_avg_1m, b = status.load_avg_5m, c = status.load_avg_15m;
+    if (a == null && b == null && c == null) return null;
+    const f = (v) => v == null ? "—" : Number(v).toFixed(2);
+    return `${f(a)} / ${f(b)} / ${f(c)}  (1m / 5m / 15m)`;
+  }
+  function fmtMemory(status) {
+    if (!status) return null;
+    const total = status.memory_total_kb, used = status.memory_used_kb;
+    if (total == null && used == null) return null;
+    const pct = (total && used) ? Math.round((used / total) * 100) + "%" : "—";
+    return `${fmtKbHuman(used) || "—"} / ${fmtKbHuman(total) || "—"} (${pct})`;
+  }
+  function fmtDiskRoot(status) {
+    if (!status) return null;
+    const total = status.disk_root_total_kb, used = status.disk_root_used_kb;
+    const pct = status.disk_root_used_pct;
+    if (total == null && used == null && pct == null) return null;
+    const pctStr = pct == null ? "—" : (pct + "%");
+    return `${fmtKbHuman(used) || "—"} / ${fmtKbHuman(total) || "—"} (${pctStr})`;
+  }
+  function fmtOs(status) {
+    if (!status) return null;
+    if (status.os_pretty_name) return status.os_pretty_name;
+    if (status.os_id) {
+      return status.os_version_id
+        ? `${status.os_id} ${status.os_version_id}`
+        : status.os_id;
+    }
+    return null;
+  }
+
   function nodeReachBadge(status) {
     if (!status) return h("span", { class: "badge" }, "unprobed");
     if (status.reachable) return h("span", { class: "badge ok" }, h("span", { class: "dot" }), "reachable");
@@ -1945,11 +1988,11 @@
         ["Reachable", status.reachable ? "yes" : "no"],
         ["Last probed", fmtDate(status.last_probed_at)],
         ["Probe error", status.last_probe_error],
-        ["OS", status.os_release],
+        ["OS", fmtOs(status) || status.os_release],
         ["Uptime", fmtUptime(status.uptime_seconds)],
-        ["Load", status.load_avg],
-        ["Memory", status.memory],
-        ["Disk", status.disk_usage],
+        ["Load", fmtLoadAvg(status) || status.load_avg],
+        ["Memory", fmtMemory(status) || status.memory],
+        ["Disk (/)", fmtDiskRoot(status) || status.disk_usage],
         ["Service installed", status.service_installed === null ? null : (status.service_installed ? "yes" : "no")],
         ["Service running", status.service_running === null ? null : (status.service_running ? "yes" : "no")],
         ["Service mode", status.service_mode],

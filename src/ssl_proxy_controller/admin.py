@@ -643,6 +643,23 @@ def _node_status_to_dict(
     "os_release": status.os_release,
     "last_probed_at": _to_jsonable(status.last_probed_at),
     "last_probe_error": status.last_probe_error,
+    # Structured probe metrics (None when probe couldn't parse). The
+    # legacy display strings above are kept populated for back-compat;
+    # a new UI prefers these because they're computable / sortable.
+    "load_avg_1m": status.load_avg_1m,
+    "load_avg_5m": status.load_avg_5m,
+    "load_avg_15m": status.load_avg_15m,
+    "memory_total_kb": status.memory_total_kb,
+    "memory_used_kb": status.memory_used_kb,
+    "memory_free_kb": status.memory_free_kb,
+    "memory_available_kb": status.memory_available_kb,
+    "disk_root_total_kb": status.disk_root_total_kb,
+    "disk_root_used_kb": status.disk_root_used_kb,
+    "disk_root_avail_kb": status.disk_root_avail_kb,
+    "disk_root_used_pct": status.disk_root_used_pct,
+    "os_id": status.os_id,
+    "os_version_id": status.os_version_id,
+    "os_pretty_name": status.os_pretty_name,
   }
   # raw_probe is heavy (full sectioned shell output); only ship it on the
   # single-node detail endpoint, not the list.

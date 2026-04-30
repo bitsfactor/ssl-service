@@ -221,6 +221,17 @@ def test_issue_certificate_retries_after_identical_cloudflare_record_error(monke
 
   record = issue_certificate(config, FakeDatabase(), "example.com")
 
+  # 3 subprocess calls: plugins probe + first certbot (fails) + retry certbot.
   assert len(command_calls) == 3
-  assert cleanup_calls == [("zone-id", "token", "example.com")]
+  # 2 cleanup calls: PROACTIVE (always, before first certbot) + REACTIVE
+  # (after the first certbot fails with "record already exists"). The
+  # proactive call is the user-facing fix — it makes most "DNS record
+  # already exists" failures impossible because we delete stale records
+  # before certbot ever sees them. The reactive call is the safety net
+  # for races (e.g. a parallel renewer recreates a record between the
+  # proactive cleanup and certbot's first attempt).
+  assert cleanup_calls == [
+    ("zone-id", "token", "example.com"),
+    ("zone-id", "token", "example.com"),
+  ]
   assert record.status == "active"

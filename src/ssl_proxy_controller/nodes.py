@@ -225,11 +225,20 @@ def _run(client: paramiko.SSHClient, command: str, timeout: float = 12.0) -> Com
 # never trust exit codes here — every command swallows its own errors.
 _PROBE_SCRIPT = r"""
 emit() { echo "===$1===" ; eval "$2" 2>&1 || true ; echo "===END===" ; }
-emit OS_RELEASE 'cat /etc/os-release 2>/dev/null | head -5'
+emit OS_RELEASE 'cat /etc/os-release 2>/dev/null | head -10'
 emit UPTIME 'cat /proc/uptime 2>/dev/null'
 emit LOAD 'uptime'
 emit MEM 'free -m | awk "/Mem:/{print \$3 \"/\" \$2 \" MB\"}"'
 emit DISK 'df -h / | awk "NR==2{print \$5 \" used of \" \$2}"'
+# Structured (raw KiB/numeric) variants of the above — populated alongside
+# the human-readable strings so the admin can show parsed values without
+# regex-matching display text. Format:
+#   MEM_KB:  total_kb used_kb free_kb available_kb     (single line)
+#   DISK_KB: total_kb used_kb avail_kb used_pct        (single line, no '%')
+emit MEM_KB 'free -k | awk "/Mem:/{print \$2, \$3, \$4, \$7}"'
+emit DISK_KB 'df -k --output=size,used,avail,pcent / 2>/dev/null | tail -1 | awk "{gsub(\"%\", \"\", \$4); print \$1, \$2, \$3, \$4}"'
+# /proc/loadavg is the canonical 3-tuple — far cleaner than parsing `uptime`.
+emit LOADAVG 'cat /proc/loadavg 2>/dev/null'
 emit SERVICE_ACTIVE 'systemctl is-active ssl-service 2>/dev/null || systemctl is-active ssl-proxy-controller 2>/dev/null || echo none'
 emit SERVICE_VERSION 'cat /opt/ssl-service/VERSION 2>/dev/null || cat /root/ssl-service/VERSION 2>/dev/null || true'
 emit SERVICE_INSTALLED 'test -d /opt/ssl-service && echo yes; test -d /root/ssl-service && echo yes; command -v ssl-service >/dev/null 2>&1 && echo yes; true'
@@ -326,11 +335,19 @@ def probe_node(node: NodeRecord, *, linked_keys: list[dict] | None = None) -> No
     status.reachable = True
     status.raw_probe = {"sections": sections, "exit_code": result.exit_code}
 
-    # OS / pretty name
+    # OS / pretty name — parse os-release for ID, VERSION_ID, PRETTY_NAME
     os_text = sections.get("OS_RELEASE", "")
     pretty = re.search(r'^PRETTY_NAME="?([^"\n]+)"?', os_text, flags=re.MULTILINE)
     if pretty:
-      status.os_release = pretty.group(1).strip()
+      pretty_name = pretty.group(1).strip().strip('"')
+      status.os_release = pretty_name        # legacy text
+      status.os_pretty_name = pretty_name    # structured
+    os_id_m = re.search(r'^ID="?([^"\n]+)"?', os_text, flags=re.MULTILINE)
+    if os_id_m:
+      status.os_id = os_id_m.group(1).strip().strip('"')
+    os_ver_m = re.search(r'^VERSION_ID="?([^"\n]+)"?', os_text, flags=re.MULTILINE)
+    if os_ver_m:
+      status.os_version_id = os_ver_m.group(1).strip().strip('"')
 
     # Uptime: /proc/uptime -> "12345.67 9876.54"; first field is seconds
     up_text = sections.get("UPTIME", "")
@@ -340,17 +357,63 @@ def probe_node(node: NodeRecord, *, linked_keys: list[dict] | None = None) -> No
       except (ValueError, IndexError):
         pass
 
-    # Load avg from `uptime`
-    load_text = sections.get("LOAD", "")
-    m = re.search(r"load average[s]?:\s*([\d., ]+)", load_text)
-    if m:
-      status.load_avg = m.group(1).strip()
+    # Load avg — prefer /proc/loadavg ("0.05 0.12 0.08 1/123 4567") because
+    # it's the canonical source. Fall back to parsing `uptime` output.
+    loadavg_text = (sections.get("LOADAVG") or "").strip()
+    parsed_loadavg = False
+    if loadavg_text:
+      parts = loadavg_text.split()
+      if len(parts) >= 3:
+        try:
+          status.load_avg_1m = float(parts[0])
+          status.load_avg_5m = float(parts[1])
+          status.load_avg_15m = float(parts[2])
+          status.load_avg = f"{parts[0]}, {parts[1]}, {parts[2]}"
+          parsed_loadavg = True
+        except (ValueError, IndexError):
+          pass
+    if not parsed_loadavg:
+      load_text = sections.get("LOAD", "")
+      m = re.search(r"load average[s]?:\s*([\d., ]+)", load_text)
+      if m:
+        status.load_avg = m.group(1).strip()
+        # Best-effort structured parse from the comma-separated text
+        try:
+          nums = [float(x.strip()) for x in m.group(1).split(",")[:3]]
+          if len(nums) == 3:
+            status.load_avg_1m, status.load_avg_5m, status.load_avg_15m = nums
+        except ValueError:
+          pass
 
-    # Memory and disk pre-formatted in the script
+    # Memory: legacy formatted text + structured kilobytes
     if sections.get("MEM"):
       status.memory = sections["MEM"]
+    mem_kb_text = (sections.get("MEM_KB") or "").strip()
+    if mem_kb_text:
+      parts = mem_kb_text.split()
+      if len(parts) >= 4:
+        try:
+          status.memory_total_kb = int(parts[0])
+          status.memory_used_kb = int(parts[1])
+          status.memory_free_kb = int(parts[2])
+          status.memory_available_kb = int(parts[3])
+        except ValueError:
+          pass
+
+    # Disk (root mount): legacy formatted text + structured kilobytes
     if sections.get("DISK"):
       status.disk_usage = sections["DISK"]
+    disk_kb_text = (sections.get("DISK_KB") or "").strip()
+    if disk_kb_text:
+      parts = disk_kb_text.split()
+      if len(parts) >= 4:
+        try:
+          status.disk_root_total_kb = int(parts[0])
+          status.disk_root_used_kb = int(parts[1])
+          status.disk_root_avail_kb = int(parts[2])
+          status.disk_root_used_pct = int(parts[3])
+        except ValueError:
+          pass
 
     # Parse the unified ALL_CONTAINERS section (one per managed service
     # going forward). We derive the legacy `service_running` / `service_installed`

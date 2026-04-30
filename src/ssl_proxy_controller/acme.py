@@ -19,7 +19,23 @@ from .config import AppConfig
 from .db import CertificateRecord, Database
 
 
-IDENTICAL_CLOUDFLARE_RECORD_ERROR = "An identical record already exists."
+# Cloudflare returns one of these phrases when a TXT record with the same
+# (name, content) already exists for a zone. We don't want to depend on the
+# exact wording — partial match against any of these is enough to trigger
+# the cleanup-and-retry path. The PROACTIVE cleanup that always runs
+# before certbot makes hitting this recovery branch unlikely, but we keep
+# it as a safety net for races (e.g. a parallel renewal somewhere else).
+_CLOUDFLARE_RECORD_EXISTS_MARKERS: tuple[str, ...] = (
+  "An identical record already exists",
+  "Record already exists",
+  "DNS Validation Error",
+  "An A, AAAA, or CNAME record",  # rare interaction
+  "_acme-challenge",                # last-ditch — name is in the error
+)
+
+
+def _cloudflare_error_is_existing_record(details: str) -> bool:
+  return any(marker in details for marker in _CLOUDFLARE_RECORD_EXISTS_MARKERS)
 
 
 def ensure_dns_cloudflare_plugin(certbot_binary: str) -> None:
@@ -90,14 +106,35 @@ def _cleanup_cloudflare_acme_txt_records(zone_id: str, zone_token: str, domain: 
 
 
 def _run_certbot_with_cloudflare_recovery(command: list[str], zone_id: str, zone_token: str, domain: str) -> None:
+  # PROACTIVE cleanup: always purge any pre-existing _acme-challenge TXT
+  # records for this domain before invoking certbot. This is the user-
+  # facing fix for "if a DNS record already exists, validation fails on
+  # the second add". Stale records from a prior interrupted run, a
+  # parallel renewer, or a previously-cancelled certbot session no longer
+  # block us — we just delete them.
+  #
+  # Idempotent + safe: if there are no records, the cleanup is a no-op.
+  # If there are some, removing them only affects in-flight ACME validation,
+  # which we are about to recreate from scratch anyway.
+  try:
+    _cleanup_cloudflare_acme_txt_records(zone_id, zone_token, domain)
+  except Exception:  # pragma: no cover — logged + tolerated
+    # If the cleanup itself fails (e.g. transient network), don't abort
+    # the cert issuance — fall through to certbot which will surface the
+    # real error if any. The reactive recovery path below still catches
+    # the case where the records weren't deletable in time.
+    pass
+
   try:
     subprocess.run(command, check=True)
     return
   except subprocess.CalledProcessError as exc:
     details = " ".join(part for part in [str(exc), getattr(exc, "stderr", "") or "", getattr(exc, "stdout", "") or ""] if part)
-    if IDENTICAL_CLOUDFLARE_RECORD_ERROR not in details:
+    if not _cloudflare_error_is_existing_record(details):
       raise
 
+  # Reactive recovery: cleanup again (a record may have been re-created
+  # between our pre-cleanup and the certbot call by some race) and retry.
   _cleanup_cloudflare_acme_txt_records(zone_id, zone_token, domain)
   subprocess.run(command, check=True)
 

@@ -502,3 +502,30 @@ ALTER TABLE service_node_state ADD COLUMN IF NOT EXISTS container_image      TEX
 ALTER TABLE service_node_state ADD COLUMN IF NOT EXISTS container_started_at TIMESTAMPTZ;
 ALTER TABLE service_node_state ADD COLUMN IF NOT EXISTS healthcheck_ok       BOOLEAN;
 ALTER TABLE service_node_state ADD COLUMN IF NOT EXISTS last_observed_at     TIMESTAMPTZ;
+
+-- Structured probe metrics ----------------------------------------------
+-- The legacy node_status columns load_avg / memory / disk_usage / os_release
+-- store pre-formatted display strings. The columns below hold the same data
+-- in a properly typed shape so the UI / downstream tools can compute
+-- against them (sort by load, alarm on disk pct, group by OS, etc.) without
+-- regex-matching display text. The probe writes both — old text + new
+-- structured — every cycle, so both paths stay coherent.
+ALTER TABLE node_status ADD COLUMN IF NOT EXISTS load_avg_1m          DOUBLE PRECISION;
+ALTER TABLE node_status ADD COLUMN IF NOT EXISTS load_avg_5m          DOUBLE PRECISION;
+ALTER TABLE node_status ADD COLUMN IF NOT EXISTS load_avg_15m         DOUBLE PRECISION;
+ALTER TABLE node_status ADD COLUMN IF NOT EXISTS memory_total_kb      BIGINT;
+ALTER TABLE node_status ADD COLUMN IF NOT EXISTS memory_used_kb       BIGINT;
+ALTER TABLE node_status ADD COLUMN IF NOT EXISTS memory_free_kb       BIGINT;
+ALTER TABLE node_status ADD COLUMN IF NOT EXISTS memory_available_kb  BIGINT;
+ALTER TABLE node_status ADD COLUMN IF NOT EXISTS disk_root_total_kb   BIGINT;
+ALTER TABLE node_status ADD COLUMN IF NOT EXISTS disk_root_used_kb    BIGINT;
+ALTER TABLE node_status ADD COLUMN IF NOT EXISTS disk_root_avail_kb   BIGINT;
+ALTER TABLE node_status ADD COLUMN IF NOT EXISTS disk_root_used_pct   INTEGER CHECK (disk_root_used_pct IS NULL OR (disk_root_used_pct >= 0 AND disk_root_used_pct <= 100));
+ALTER TABLE node_status ADD COLUMN IF NOT EXISTS os_id                TEXT;
+ALTER TABLE node_status ADD COLUMN IF NOT EXISTS os_version_id        TEXT;
+ALTER TABLE node_status ADD COLUMN IF NOT EXISTS os_pretty_name       TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_node_status_disk_used_pct
+  ON node_status (disk_root_used_pct);
+CREATE INDEX IF NOT EXISTS idx_node_status_load_15m
+  ON node_status (load_avg_15m);

@@ -210,6 +210,9 @@ class NodeStatusRecord:
   service_mode: str | None
   service_version: str | None
   uptime_seconds: int | None
+  # Legacy display strings (kept populated for back-compat / sync. The
+  # admin UI prefers the structured fields below when present and uses
+  # these as a fallback only.)
   load_avg: str | None
   memory: str | None
   disk_usage: str | None
@@ -217,6 +220,24 @@ class NodeStatusRecord:
   last_probed_at: datetime | None
   last_probe_error: str | None
   raw_probe: dict | None = None
+  # Structured fields — populated by the probe alongside the legacy
+  # text columns. All are ``None`` when the source data wasn't parseable
+  # (e.g. an exotic distro that doesn't ship /etc/os-release in the
+  # standard form).
+  load_avg_1m: float | None = None
+  load_avg_5m: float | None = None
+  load_avg_15m: float | None = None
+  memory_total_kb: int | None = None
+  memory_used_kb: int | None = None
+  memory_free_kb: int | None = None
+  memory_available_kb: int | None = None
+  disk_root_total_kb: int | None = None
+  disk_root_used_kb: int | None = None
+  disk_root_avail_kb: int | None = None
+  disk_root_used_pct: int | None = None
+  os_id: str | None = None
+  os_version_id: str | None = None
+  os_pretty_name: str | None = None
 
 
 # Static IP registry --------------------------------------------------
@@ -900,6 +921,20 @@ class Database:
       last_probed_at=row.get("last_probed_at"),
       last_probe_error=row.get("last_probe_error"),
       raw_probe=row.get("raw_probe"),
+      load_avg_1m=row.get("load_avg_1m"),
+      load_avg_5m=row.get("load_avg_5m"),
+      load_avg_15m=row.get("load_avg_15m"),
+      memory_total_kb=row.get("memory_total_kb"),
+      memory_used_kb=row.get("memory_used_kb"),
+      memory_free_kb=row.get("memory_free_kb"),
+      memory_available_kb=row.get("memory_available_kb"),
+      disk_root_total_kb=row.get("disk_root_total_kb"),
+      disk_root_used_kb=row.get("disk_root_used_kb"),
+      disk_root_avail_kb=row.get("disk_root_avail_kb"),
+      disk_root_used_pct=row.get("disk_root_used_pct"),
+      os_id=row.get("os_id"),
+      os_version_id=row.get("os_version_id"),
+      os_pretty_name=row.get("os_pretty_name"),
     )
 
   def list_nodes(self) -> list[NodeRecord]:
@@ -1048,7 +1083,11 @@ class Database:
           SELECT node_name, reachable, service_installed, service_running,
                  service_mode, service_version, uptime_seconds, load_avg,
                  memory, disk_usage, os_release, last_probed_at,
-                 last_probe_error
+                 last_probe_error,
+                 load_avg_1m, load_avg_5m, load_avg_15m,
+                 memory_total_kb, memory_used_kb, memory_free_kb, memory_available_kb,
+                 disk_root_total_kb, disk_root_used_kb, disk_root_avail_kb, disk_root_used_pct,
+                 os_id, os_version_id, os_pretty_name
           FROM node_status
           """
         )
@@ -1063,11 +1102,19 @@ class Database:
           """
           INSERT INTO node_status (node_name, reachable, service_installed, service_running,
             service_mode, service_version, uptime_seconds, load_avg, memory, disk_usage,
-            os_release, last_probed_at, last_probe_error, raw_probe)
+            os_release, last_probed_at, last_probe_error, raw_probe,
+            load_avg_1m, load_avg_5m, load_avg_15m,
+            memory_total_kb, memory_used_kb, memory_free_kb, memory_available_kb,
+            disk_root_total_kb, disk_root_used_kb, disk_root_avail_kb, disk_root_used_pct,
+            os_id, os_version_id, os_pretty_name)
           VALUES (%(node_name)s, %(reachable)s, %(service_installed)s, %(service_running)s,
             %(service_mode)s, %(service_version)s, %(uptime_seconds)s, %(load_avg)s,
             %(memory)s, %(disk_usage)s, %(os_release)s, NOW(),
-            %(last_probe_error)s, %(raw_probe)s::jsonb)
+            %(last_probe_error)s, %(raw_probe)s::jsonb,
+            %(load_avg_1m)s, %(load_avg_5m)s, %(load_avg_15m)s,
+            %(memory_total_kb)s, %(memory_used_kb)s, %(memory_free_kb)s, %(memory_available_kb)s,
+            %(disk_root_total_kb)s, %(disk_root_used_kb)s, %(disk_root_avail_kb)s, %(disk_root_used_pct)s,
+            %(os_id)s, %(os_version_id)s, %(os_pretty_name)s)
           ON CONFLICT (node_name) DO UPDATE SET
             reachable = EXCLUDED.reachable,
             service_installed = EXCLUDED.service_installed,
@@ -1081,7 +1128,21 @@ class Database:
             os_release = EXCLUDED.os_release,
             last_probed_at = EXCLUDED.last_probed_at,
             last_probe_error = EXCLUDED.last_probe_error,
-            raw_probe = EXCLUDED.raw_probe
+            raw_probe = EXCLUDED.raw_probe,
+            load_avg_1m = EXCLUDED.load_avg_1m,
+            load_avg_5m = EXCLUDED.load_avg_5m,
+            load_avg_15m = EXCLUDED.load_avg_15m,
+            memory_total_kb = EXCLUDED.memory_total_kb,
+            memory_used_kb = EXCLUDED.memory_used_kb,
+            memory_free_kb = EXCLUDED.memory_free_kb,
+            memory_available_kb = EXCLUDED.memory_available_kb,
+            disk_root_total_kb = EXCLUDED.disk_root_total_kb,
+            disk_root_used_kb = EXCLUDED.disk_root_used_kb,
+            disk_root_avail_kb = EXCLUDED.disk_root_avail_kb,
+            disk_root_used_pct = EXCLUDED.disk_root_used_pct,
+            os_id = EXCLUDED.os_id,
+            os_version_id = EXCLUDED.os_version_id,
+            os_pretty_name = EXCLUDED.os_pretty_name
           RETURNING *
           """,
           {
@@ -1098,6 +1159,20 @@ class Database:
             "os_release": status.os_release,
             "last_probe_error": status.last_probe_error,
             "raw_probe": raw,
+            "load_avg_1m": status.load_avg_1m,
+            "load_avg_5m": status.load_avg_5m,
+            "load_avg_15m": status.load_avg_15m,
+            "memory_total_kb": status.memory_total_kb,
+            "memory_used_kb": status.memory_used_kb,
+            "memory_free_kb": status.memory_free_kb,
+            "memory_available_kb": status.memory_available_kb,
+            "disk_root_total_kb": status.disk_root_total_kb,
+            "disk_root_used_kb": status.disk_root_used_kb,
+            "disk_root_avail_kb": status.disk_root_avail_kb,
+            "disk_root_used_pct": status.disk_root_used_pct,
+            "os_id": status.os_id,
+            "os_version_id": status.os_version_id,
+            "os_pretty_name": status.os_pretty_name,
           },
         )
         row = cursor.fetchone()
