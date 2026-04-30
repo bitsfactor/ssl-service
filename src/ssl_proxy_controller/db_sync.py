@@ -22,6 +22,7 @@ source after sync.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Iterable
@@ -83,13 +84,49 @@ def _connect(dsn: str, *, timeout: float = 15.0) -> psycopg.Connection:
   return psycopg.connect(dsn, row_factory=dict_row, connect_timeout=int(timeout))
 
 
+# Matches `options=-csearch_path=foo` (plain) and the URL-encoded
+# `options=-csearch_path%3Dfoo` form that supabase / sqla typically emits.
+_SEARCH_PATH_RE = re.compile(r"-csearch_path(?:=|%3[Dd])([A-Za-z0-9_,]+)")
+
+
+def _schema_from_dsn(dsn: str) -> str | None:
+  """Extract the FIRST schema named in the DSN's
+  ``options=-csearch_path=...`` segment. Returns None if no search_path
+  is set (PG defaults to ``public``) or it explicitly is ``public``."""
+  if not dsn:
+    return None
+  m = _SEARCH_PATH_RE.search(dsn)
+  if not m:
+    return None
+  name = m.group(1).split(",", 1)[0].strip()
+  if not name or name.lower() == "public":
+    return None
+  # Reject anything that doesn't look like a plain unquoted identifier;
+  # we plug this directly into CREATE SCHEMA, so be paranoid.
+  if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+    return None
+  return name
+
+
 def apply_schema(dsn: str, schema_sql: str) -> dict[str, Any]:
   """Run ``schema.sql`` against the target. Idempotent — schema.sql
-  uses CREATE TABLE IF NOT EXISTS / ALTER TABLE IF NOT EXISTS guards."""
+  uses CREATE TABLE IF NOT EXISTS / ALTER TABLE IF NOT EXISTS guards.
+
+  If the DSN's ``search_path`` points at a schema that doesn't exist
+  yet, we ``CREATE SCHEMA IF NOT EXISTS`` first. This makes the
+  "merge into a fresh third schema" workflow one click instead of
+  requiring the user to run CREATE SCHEMA manually in psql / Supabase
+  SQL editor before bootstrapping."""
   if not schema_sql.strip():
     raise ValueError("schema_sql is empty")
+  schema_name = _schema_from_dsn(dsn)
   with _connect(dsn) as conn:
     with conn.cursor() as cur:
+      if schema_name:
+        # Schema name was already validated as a plain identifier in
+        # _schema_from_dsn so it's safe to interpolate (psycopg has no
+        # binding for identifiers).
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema_name}"')
       cur.execute(schema_sql)
     conn.commit()
   # Re-check what's there afterwards.
