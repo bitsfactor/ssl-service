@@ -50,6 +50,7 @@ from .db import (
 from . import nodes as nodes_mod
 from . import nodes_init as nodes_init_mod
 from . import db_sync as db_sync_mod
+from . import db_registry as db_registry_mod
 
 LOGGER = logging.getLogger("ssl_proxy_controller.admin")
 
@@ -3260,99 +3261,168 @@ def _build_router(ctx: AdminContext) -> _Router:
   def services_summary_handler(_request: _Request) -> _Response:
     return _json_response(HTTPStatus.OK, {"services": services_summary(ctx)})
 
-  # ---- Two-database sync ------------------------------------------------
-  # Database A is whatever the running admin connects to. Database B is
-  # configured at runtime via system_config.secondary_db_dsn. Sync is
-  # one-shot and bidirectional (user picks AtoB or BtoA). See db_sync.py.
+  # ---- Multi-database registry + cross-DB sync --------------------------
+  # The currently-connected DSN is always present in the registry
+  # (auto-bootstrapped). Users add more, pick any two for sync.
 
-  def _source_dsn() -> str:
+  def _current_dsn() -> str:
     return ctx.config.postgres.dsn
 
-  def _target_dsn_or_400() -> str:
-    cfg = ctx.database.get_system_config("secondary_db_dsn") or {}
-    dsn = (cfg.get("dsn") or "").strip()
+  def _resolve_dsn_or_400(db_id: str) -> str:
+    dsn = db_registry_mod.get_dsn(ctx.database, db_id)
     if not dsn:
-      raise HttpError(
-        HTTPStatus.BAD_REQUEST,
-        "Database B not configured — set secondary_db_dsn first",
-        code="b_not_configured",
-      )
+      raise HttpError(HTTPStatus.NOT_FOUND,
+                      f"database not registered: {db_id}",
+                      code="db_not_registered")
     return dsn
 
-  def sync_config_get_handler(_request: _Request) -> _Response:
-    cfg = ctx.database.get_system_config("secondary_db_dsn") or {}
+  def _validate_dsn_shape(dsn: str) -> None:
+    if "://" not in dsn:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "dsn must be a postgresql:// URI",
+                      code="invalid_dsn")
+
+  # ---- /api/databases (registry) ----------------------------------------
+
+  def databases_list_handler(_request: _Request) -> _Response:
+    cur = _current_dsn()
+    view = db_registry_mod.list_databases(ctx.database, cur)
     last = ctx.database.get_system_config("last_sync") or {}
-    return _json_response(HTTPStatus.OK, {
-      "secondary_dsn_masked": db_sync_mod.mask_dsn(cfg.get("dsn")),
-      "configured": bool(cfg.get("dsn")),
-      "last_sync": last or None,
-      "tables": [s.name for s in db_sync_mod.SYNC_TABLES],
-    })
+    # Mask all DSNs in the response.
+    for e in view["entries"]:
+      e["dsn_masked"] = db_sync_mod.mask_dsn(e.pop("dsn"))
+    view["current_dsn_masked"] = db_sync_mod.mask_dsn(cur)
+    view["last_sync"] = last or None
+    view["tables"] = [s.name for s in db_sync_mod.SYNC_TABLES]
+    return _json_response(HTTPStatus.OK, view)
 
-  def sync_config_put_handler(request: _Request) -> _Response:
+  def databases_create_handler(request: _Request) -> _Response:
     _require_readwrite(ctx)
     payload = request.json_body() or {}
+    label = (payload.get("label") or "").strip()
     dsn = (payload.get("dsn") or "").strip()
-    if dsn:
-      # Cheap validation — must look like postgres://… so we don't
-      # accidentally store a typo that crashes apply later.
-      if "://" not in dsn:
-        raise HttpError(HTTPStatus.BAD_REQUEST,
-                        "dsn must be a postgresql:// URI", code="invalid_dsn")
-    ctx.database.upsert_system_config("secondary_db_dsn", {"dsn": dsn})
-    return _json_response(HTTPStatus.OK, {
-      "configured": bool(dsn),
-      "secondary_dsn_masked": db_sync_mod.mask_dsn(dsn),
-    })
+    if not dsn:
+      raise HttpError(HTTPStatus.BAD_REQUEST, "dsn is required", code="dsn_required")
+    _validate_dsn_shape(dsn)
+    try:
+      entry = db_registry_mod.add_database(ctx.database, label=label, dsn=dsn)
+    except ValueError as exc:
+      raise HttpError(HTTPStatus.CONFLICT, str(exc), code="duplicate_dsn") from exc
+    out = dict(entry)
+    out["dsn_masked"] = db_sync_mod.mask_dsn(out.pop("dsn"))
+    return _json_response(HTTPStatus.CREATED, out)
 
-  def sync_test_handler(request: _Request) -> _Response:
+  def databases_patch_handler(request: _Request) -> _Response:
     _require_readwrite(ctx)
+    db_id = request.path_params["id"]
     payload = request.json_body() or {}
-    dsn = (payload.get("dsn") or "").strip() or _target_dsn_or_400()
+    label = payload.get("label")
+    dsn = payload.get("dsn")
+    if dsn is not None:
+      dsn = (dsn or "").strip()
+      if dsn:
+        _validate_dsn_shape(dsn)
+      else:
+        dsn = None  # treat empty as "don't change"
+    try:
+      e = db_registry_mod.update_database(
+        ctx.database, db_id, label=label, dsn=dsn,
+      )
+    except ValueError as exc:
+      raise HttpError(HTTPStatus.CONFLICT, str(exc), code="duplicate_dsn") from exc
+    if e is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, "database not registered",
+                      code="db_not_registered")
+    out = dict(e)
+    out["dsn_masked"] = db_sync_mod.mask_dsn(out.pop("dsn"))
+    return _json_response(HTTPStatus.OK, out)
+
+  def databases_delete_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    db_id = request.path_params["id"]
+    try:
+      ok = db_registry_mod.delete_database(
+        ctx.database, db_id, current_dsn=_current_dsn(),
+      )
+    except ValueError as exc:
+      raise HttpError(HTTPStatus.CONFLICT, str(exc), code="db_in_use") from exc
+    if not ok:
+      raise HttpError(HTTPStatus.NOT_FOUND, "database not registered",
+                      code="db_not_registered")
+    return _json_response(HTTPStatus.OK, {"id": db_id, "deleted": True})
+
+  def databases_test_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    db_id = request.path_params["id"]
+    dsn = _resolve_dsn_or_400(db_id)
     try:
       result = db_sync_mod.test_target_connection(dsn)
     except Exception as exc:  # noqa: BLE001
       raise HttpError(HTTPStatus.BAD_GATEWAY,
                       f"could not connect: {exc}",
-                      code="b_connect_failed") from exc
+                      code="connect_failed") from exc
     return _json_response(HTTPStatus.OK, result)
 
-  def _normalize_direction(payload: dict) -> str:
-    d = (payload.get("direction") or "").strip()
-    if d not in ("AtoB", "BtoA"):
+  def databases_set_primary_handler(request: _Request) -> _Response:
+    """Mark a database as 'use this on next admin restart'. The current
+    admin process keeps using whatever it booted against — this is just
+    a preference for the next start."""
+    _require_readwrite(ctx)
+    db_id = request.path_params["id"]
+    if not db_registry_mod.get_dsn(ctx.database, db_id):
+      raise HttpError(HTTPStatus.NOT_FOUND, "database not registered",
+                      code="db_not_registered")
+    db_registry_mod.set_primary_id(ctx.database, db_id)
+    return _json_response(HTTPStatus.OK, {
+      "primary_id": db_id,
+      "note": "Restart the admin server with config.yaml pointing at "
+              "this DSN to actually switch the live connection.",
+    })
+
+  # ---- /api/sync/* (now id-based) ---------------------------------------
+
+  def _resolve_from_to(payload: dict) -> tuple[str, str]:
+    from_id = (payload.get("from_id") or "").strip()
+    to_id = (payload.get("to_id") or "").strip()
+    if not from_id or not to_id:
       raise HttpError(HTTPStatus.BAD_REQUEST,
-                      "direction must be 'AtoB' or 'BtoA'",
-                      code="invalid_direction")
-    return d
+                      "from_id and to_id are both required",
+                      code="ids_required")
+    if from_id == to_id:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "from_id and to_id must differ",
+                      code="same_db")
+    return _resolve_dsn_or_400(from_id), _resolve_dsn_or_400(to_id)
 
   def sync_analyze_handler(request: _Request) -> _Response:
     _require_readwrite(ctx)
     payload = request.json_body() or {}
-    direction = _normalize_direction(payload)
-    target = _target_dsn_or_400()
+    src_dsn, tgt_dsn = _resolve_from_to(payload)
     try:
-      out = db_sync_mod.analyze_sync(_source_dsn(), target, direction)
+      out = db_sync_mod.analyze_sync(src_dsn, tgt_dsn, "AtoB")
     except Exception as exc:  # noqa: BLE001
       raise HttpError(HTTPStatus.BAD_GATEWAY,
                       f"sync analyze failed: {exc}",
                       code="sync_analyze_failed") from exc
+    out["from_id"] = payload.get("from_id")
+    out["to_id"] = payload.get("to_id")
     return _json_response(HTTPStatus.OK, out)
 
   def sync_apply_handler(request: _Request) -> _Response:
     _require_readwrite(ctx)
     payload = request.json_body() or {}
-    direction = _normalize_direction(payload)
-    target = _target_dsn_or_400()
+    src_dsn, tgt_dsn = _resolve_from_to(payload)
     try:
-      out = db_sync_mod.apply_sync(_source_dsn(), target, direction)
+      out = db_sync_mod.apply_sync(src_dsn, tgt_dsn, "AtoB")
     except Exception as exc:  # noqa: BLE001
       raise HttpError(HTTPStatus.BAD_GATEWAY,
                       f"sync apply failed: {exc}",
                       code="sync_apply_failed") from exc
-    # Persist last_sync into the SOURCE side's system_config so the
-    # source admin can show "last sync was 12 minutes ago".
+    out["from_id"] = payload.get("from_id")
+    out["to_id"] = payload.get("to_id")
     summary = {
-      "direction": direction,
+      "from_id": out["from_id"],
+      "to_id": out["to_id"],
       "at": out["at"],
       "tables_applied": [r["table"] for r in out["results"]
                           if r.get("rows_applied", 0) > 0],
@@ -3363,8 +3433,9 @@ def _build_router(ctx: AdminContext) -> _Router:
       ctx.database.upsert_system_config("last_sync", summary)
     except Exception:
       LOGGER.exception("sync: could not persist last_sync record")
-    LOGGER.info("sync.apply done direction=%s applied=%d errors=%d",
-                direction, summary["totals_applied"], len(summary["errors"]))
+    LOGGER.info("sync.apply from=%s to=%s applied=%d errors=%d",
+                summary["from_id"], summary["to_id"],
+                summary["totals_applied"], len(summary["errors"]))
     return _json_response(HTTPStatus.OK, out)
 
   def service_nodes_handler(request: _Request) -> _Response:
@@ -3378,11 +3449,14 @@ def _build_router(ctx: AdminContext) -> _Router:
                           refresh_service_nodes(ctx, request.path_params["name"]))
 
   router.add("GET", "/api/services-summary", with_auth(services_summary_handler))
-  router.add("GET", "/api/sync/config", with_auth(sync_config_get_handler))
-  router.add("PUT", "/api/sync/config", with_auth(sync_config_put_handler))
-  router.add("POST", "/api/sync/test", with_auth(sync_test_handler))
-  router.add("POST", "/api/sync/analyze", with_auth(sync_analyze_handler))
-  router.add("POST", "/api/sync/apply", with_auth(sync_apply_handler))
+  router.add("GET",    "/api/databases", with_auth(databases_list_handler))
+  router.add("POST",   "/api/databases", with_auth(databases_create_handler))
+  router.add("PATCH",  "/api/databases/{id}", with_auth(databases_patch_handler))
+  router.add("DELETE", "/api/databases/{id}", with_auth(databases_delete_handler))
+  router.add("POST",   "/api/databases/{id}/test", with_auth(databases_test_handler))
+  router.add("PUT",    "/api/databases/{id}/primary", with_auth(databases_set_primary_handler))
+  router.add("POST",   "/api/sync/analyze", with_auth(sync_analyze_handler))
+  router.add("POST",   "/api/sync/apply", with_auth(sync_apply_handler))
   router.add("GET", "/api/services/{name}/nodes", with_auth(service_nodes_handler))
   router.add("POST", "/api/services/{name}/refresh", with_auth(service_refresh_handler))
   router.add("GET", "/api/services", with_auth(services_list_handler))
