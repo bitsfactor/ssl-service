@@ -27,6 +27,7 @@ from datetime import UTC, datetime
 from typing import Any, Iterable
 
 import psycopg
+from psycopg import errors as pg_errors
 from psycopg.rows import dict_row
 
 LOGGER = logging.getLogger("ssl_proxy_controller.db_sync")
@@ -133,6 +134,28 @@ def _select_table(cur: psycopg.Cursor, spec: TableSpec) -> dict[tuple, dict]:
   return out
 
 
+def _select_table_or_missing(
+  conn: psycopg.Connection, spec: TableSpec,
+) -> tuple[dict[tuple, dict], bool]:
+  """Like ``_select_table`` but tolerates ``relation does not exist``
+  on this side. Returns ``(rows, exists)``; on UndefinedTable rolls
+  back the connection and returns ``({}, False)`` so the caller can
+  continue with the remaining tables.
+
+  This is the key piece that lets analyze handle the realistic case:
+  one DB has a strict subset of the sync tables (e.g. a fresh prod DB
+  that only got a partial migration applied)."""
+  try:
+    with conn.cursor() as cur:
+      return (_select_table(cur, spec), True)
+  except pg_errors.UndefinedTable:
+    try:
+      conn.rollback()
+    except Exception:
+      pass
+    return ({}, False)
+
+
 def _value_eq(a: Any, b: Any) -> bool:
   """Tolerant equality — handles datetime tz, None, and stringified
   numerics that round-trip through the DB."""
@@ -214,6 +237,16 @@ def analyze_sync(
 
   Convention: A is always the source_dsn argument, B is target_dsn.
   When direction is BtoA we just swap which side is the source.
+
+  Per-table status (in the response):
+    - ok:              both sides have the table; insert/overwrite/preserve are real
+    - source_missing:  source doesn't have this table; nothing to push;
+                       target keeps its rows untouched
+    - target_missing:  target doesn't have this table; would need to bootstrap
+                       schema there to actually sync; ``would_insert`` reports
+                       how many source rows ARE waiting
+    - both_missing:    table missing on both sides — ignored
+    - error:           unexpected DB error other than UndefinedTable
   """
   if direction not in ("AtoB", "BtoA"):
     raise ValueError(f"direction must be AtoB or BtoA, got {direction!r}")
@@ -221,32 +254,64 @@ def analyze_sync(
 
   per_table: list[dict] = []
   with _connect(src) as src_conn, _connect(tgt) as tgt_conn:
-    with src_conn.cursor() as src_cur, tgt_conn.cursor() as tgt_cur:
-      for spec in SYNC_TABLES:
-        try:
-          src_rows = _select_table(src_cur, spec)
-          tgt_rows = _select_table(tgt_cur, spec)
-          per_table.append(_diff_table(src_rows, tgt_rows, spec))
-        except Exception as exc:  # noqa: BLE001
-          LOGGER.exception("analyze: read failed for %s", spec.name)
-          per_table.append({
-            "table": spec.name, "error": str(exc),
-            "insert": 0, "overwrite": 0, "preserve_only_in_target": 0,
-            "sample_insert": [], "sample_overwrite": [],
-          })
+    for spec in SYNC_TABLES:
+      try:
+        src_rows, src_exists = _select_table_or_missing(src_conn, spec)
+        tgt_rows, tgt_exists = _select_table_or_missing(tgt_conn, spec)
+      except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("analyze: read failed for %s", spec.name)
+        per_table.append({
+          "table": spec.name, "status": "error", "error": str(exc),
+          "insert": 0, "overwrite": 0, "preserve_only_in_target": 0,
+          "sample_insert": [], "sample_overwrite": [],
+        })
+        continue
 
-  errored = [t for t in per_table if t.get("error")]
+      if not src_exists and not tgt_exists:
+        per_table.append({
+          "table": spec.name, "status": "both_missing",
+          "insert": 0, "overwrite": 0, "preserve_only_in_target": 0,
+          "sample_insert": [], "sample_overwrite": [],
+        })
+      elif not src_exists:
+        per_table.append({
+          "table": spec.name, "status": "source_missing",
+          "insert": 0, "overwrite": 0,
+          "preserve_only_in_target": len(tgt_rows),
+          "sample_insert": [], "sample_overwrite": [],
+        })
+      elif not tgt_exists:
+        per_table.append({
+          "table": spec.name, "status": "target_missing",
+          "insert": 0, "overwrite": 0, "preserve_only_in_target": 0,
+          "would_insert": len(src_rows),
+          "sample_insert": [], "sample_overwrite": [],
+        })
+      else:
+        diff = _diff_table(src_rows, tgt_rows, spec)
+        diff["status"] = "ok"
+        per_table.append(diff)
+
+  errored = [t for t in per_table if t.get("status") == "error"]
+  source_missing_tables = [t["table"] for t in per_table if t.get("status") == "source_missing"]
+  target_missing_tables = [t["table"] for t in per_table if t.get("status") == "target_missing"]
   totals = {
     "insert": sum(t.get("insert", 0) for t in per_table),
     "overwrite": sum(t.get("overwrite", 0) for t in per_table),
     "preserve_only_in_target": sum(t.get("preserve_only_in_target", 0) for t in per_table),
     "errored_tables": len(errored),
+    "source_missing_tables": len(source_missing_tables),
+    "target_missing_tables": len(target_missing_tables),
+    "would_insert_if_bootstrapped": sum(t.get("would_insert", 0) for t in per_table
+                                        if t.get("status") == "target_missing"),
   }
   return {
     "direction": direction,
     "tables": per_table,
     "totals": totals,
     "errors": [{"table": t["table"], "error": t["error"]} for t in errored],
+    "source_missing": source_missing_tables,
+    "target_missing": target_missing_tables,
     "at": datetime.now(tz=UTC).isoformat().replace("+00:00", "Z"),
   }
 
@@ -275,9 +340,16 @@ def _build_upsert_sql(table: str, cols: list[str], pk_cols: tuple[str, ...]) -> 
 def _apply_one_table(
   spec: TableSpec, src_conn: psycopg.Connection, tgt_conn: psycopg.Connection,
 ) -> dict[str, Any]:
-  """Sync ONE table source→target. Per-table transaction."""
-  with src_conn.cursor() as src_cur:
-    src_rows = _select_table(src_cur, spec)
+  """Sync ONE table source→target. Per-table transaction.
+
+  Either side missing the table is handled: source missing → nothing
+  to push, return 0 applied; target missing → can't apply without
+  bootstrapping the schema, return a clear error string.
+  """
+  src_rows, src_exists = _select_table_or_missing(src_conn, spec)
+  if not src_exists:
+    return {"table": spec.name, "rows_applied": 0, "child_rows_applied": 0,
+            "skipped": "source missing this table"}
   if not src_rows:
     return {"table": spec.name, "rows_applied": 0, "child_rows_applied": 0}
   cols = list(next(iter(src_rows.values())).keys())
@@ -330,6 +402,14 @@ def _apply_one_table(
         "table": spec.name,
         "rows_applied": len(src_rows),
         "child_rows_applied": child_rows_total,
+      }
+    except pg_errors.UndefinedTable:
+      tgt_conn.rollback()
+      LOGGER.warning("sync.apply: %s missing on target — skipping", spec.name)
+      return {
+        "table": spec.name,
+        "rows_applied": 0, "child_rows_applied": 0,
+        "error": "target missing this table — bootstrap target schema first",
       }
     except Exception as exc:  # noqa: BLE001
       tgt_conn.rollback()

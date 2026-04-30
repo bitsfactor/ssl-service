@@ -5389,36 +5389,44 @@
       analysisCard.style.display = "";
       const fromLabel = (view.entries.find(e => e.id === analysis.from_id) || {}).label || analysis.from_id;
       const toLabel = (view.entries.find(e => e.id === analysis.to_id) || {}).label || analysis.to_id;
-      const erroredCount = (analysis.totals.errored_tables || 0);
-      analysisStamp.textContent =
-        `${fromLabel} → ${toLabel} · ${analysis.totals.insert} insert · ${analysis.totals.overwrite} OVERWRITE · ${analysis.totals.preserve_only_in_target} preserved`
-        + (erroredCount ? ` · ${erroredCount} TABLE(S) ERRORED` : "");
+      const t = analysis.totals || {};
+      const erroredCount = t.errored_tables || 0;
+      const targetMissingCount = t.target_missing_tables || 0;
+      const sourceMissingCount = t.source_missing_tables || 0;
+      const wouldInsert = t.would_insert_if_bootstrapped || 0;
+
+      const stampParts = [
+        `${fromLabel} → ${toLabel}`,
+        `${t.insert || 0} insert`,
+        `${t.overwrite || 0} OVERWRITE`,
+        `${t.preserve_only_in_target || 0} preserved`,
+      ];
+      if (sourceMissingCount) stampParts.push(`${sourceMissingCount} source-missing`);
+      if (targetMissingCount) stampParts.push(`${targetMissingCount} target-missing`);
+      if (erroredCount) stampParts.push(`${erroredCount} ERRORED`);
+      analysisStamp.textContent = stampParts.join(" · ");
       analysisBody.innerHTML = "";
 
-      // If every table errored — almost certainly the target hasn't been
-      // bootstrapped (no schema yet). Show a clear, actionable state
-      // instead of misleading "Nothing to sync".
-      const allErrored = erroredCount > 0 && erroredCount === (analysis.tables || []).length;
-      if (allErrored) {
+      // Bootstrap-schema banner when the target is missing tables we
+      // could otherwise sync. Stops being a hard "schema not initialized"
+      // dead-end and becomes a one-click action that the user can take
+      // alongside the rest of the analysis.
+      if (targetMissingCount > 0) {
         const targetEntry = (view.entries || []).find(e => e.id === analysis.to_id);
-        analysisBody.appendChild(h("div", { class: "empty" },
-          h("div", { class: "title", style: "color: var(--danger)" },
-            "Target schema is not initialized"),
-          h("div", { class: "sub" },
-            `Every sync table failed to read from '${toLabel}'. Most likely it's a fresh database that hasn't run schema.sql yet.`),
-        ));
-        // Show first error for context
-        const firstErr = (analysis.errors || [])[0];
-        if (firstErr) {
-          analysisBody.appendChild(h("pre", {
-            class: "mono", style: "background: var(--surface-alt); padding: 8px 10px; border-radius: 4px; font-size: 11px; max-height: 120px; overflow: auto;",
-          }, `${firstErr.table}: ${firstErr.error}`));
-        }
-        if (targetEntry) {
-          analysisBody.appendChild(h("button", {
-            class: "btn btn-primary", style: "margin-top: 12px",
+        const banner = h("div", {
+          style: "background: var(--surface-alt); border-left: 4px solid var(--danger); padding: 10px 12px; margin-bottom: 14px;",
+        });
+        banner.appendChild(h("div", { style: "font-weight: 600; margin-bottom: 4px" },
+          `Target '${toLabel}' is missing ${targetMissingCount} table(s): `,
+          h("span", { class: "mono", style: "font-size: 11.5px" },
+            (analysis.target_missing || []).join(", "))));
+        banner.appendChild(h("div", { class: "muted", style: "font-size: 12px; margin-bottom: 8px" },
+          `If you bootstrap the target schema, ${wouldInsert} more rows would be inserted.`));
+        if (targetEntry && App.mode === "readwrite") {
+          banner.appendChild(h("button", {
+            class: "btn btn-sm btn-primary",
             onclick: async () => {
-              if (!confirm(`Run schema.sql against '${toLabel}'?\n\nThis creates all 8 sync tables (and their dependencies). Idempotent — safe even if the schema is partially there.`)) return;
+              if (!confirm(`Run schema.sql against '${toLabel}'?\n\nThis creates the missing sync tables. Idempotent — safe even if some tables already exist.`)) return;
               try {
                 const r = await api("POST",
                   `/api/databases/${encodeURIComponent(targetEntry.id)}/apply-schema`, {});
@@ -5427,25 +5435,23 @@
                   "Schema applied",
                   stillMissing === 0
                     ? "All sync tables present. Click Analyze again."
-                    : `${stillMissing} tables still missing — schema.sql may need adjustment.`);
+                    : `${stillMissing} tables still missing.`);
               } catch (err) {
                 toast("error", "Apply schema failed", err.message);
               }
             },
           }, `Bootstrap schema on ${toLabel}`));
         }
-        // Also surface any partial errors below.
-        return;
+        analysisBody.appendChild(banner);
       }
 
-      // Partial errors: render a warning banner + still show what we
-      // could analyze.
+      // Real DB errors get their own callout.
       if (erroredCount > 0) {
         const errBox = h("div", {
-          class: "muted", style: "background: var(--danger-bg, #fee); padding: 10px 12px; border-radius: 6px; margin-bottom: 14px; color: var(--danger);",
+          style: "background: var(--surface-alt); border-left: 4px solid var(--danger); padding: 10px 12px; margin-bottom: 14px; color: var(--danger);",
         });
         errBox.appendChild(h("div", { style: "font-weight: 600" },
-          `${erroredCount} table(s) could not be read on '${toLabel}'.`));
+          `${erroredCount} table(s) errored — see logs:`));
         for (const e of (analysis.errors || []).slice(0, 5)) {
           errBox.appendChild(h("div", { class: "mono", style: "font-size: 11px; margin-top: 4px;" },
             `${e.table}: ${(e.error || "").slice(0, 200)}`));
@@ -5453,7 +5459,11 @@
         analysisBody.appendChild(errBox);
       }
 
-      if (analysis.totals.overwrite === 0 && analysis.totals.insert === 0 && erroredCount === 0) {
+      // Empty-state: only if every table is `ok` AND has zero changes.
+      const okTables = (analysis.tables || []).filter(x => x.status === "ok");
+      if ((t.insert || 0) === 0 && (t.overwrite || 0) === 0
+          && erroredCount === 0 && targetMissingCount === 0
+          && okTables.length === (analysis.tables || []).length) {
         analysisBody.appendChild(h("div", { class: "empty" },
           h("div", { class: "title" }, "Nothing to sync"),
           h("div", { class: "sub" }, "Source and target are already identical for these tables.")));
@@ -5464,21 +5474,50 @@
       const summaryTbl = h("table", { class: "data" });
       summaryTbl.appendChild(h("thead", null, h("tr", null,
         h("th", null, "Table"),
+        h("th", null, "Status"),
         h("th", null, "Insert"),
         h("th", null, "Overwrite"),
         h("th", null, "Preserve (target-only)"),
       )));
       const stb = h("tbody");
-      for (const t of analysis.tables) {
+      const statusBadge = (row) => {
+        switch (row.status) {
+          case "ok":
+            return h("span", { class: "badge ok" }, "ok");
+          case "source_missing":
+            return h("span", { class: "badge",
+              title: "Source DB doesn't have this table — nothing to push" },
+              "source missing");
+          case "target_missing":
+            return h("span", { class: "badge warn",
+              title: "Target DB doesn't have this table — would be inserted after bootstrap" },
+              "target missing");
+          case "both_missing":
+            return h("span", { class: "muted" }, "—");
+          case "error":
+            return h("span", { class: "badge danger" }, "error");
+          default:
+            return h("span", { class: "muted" }, "?");
+        }
+      };
+      for (const r of analysis.tables) {
+        const insertCell = (() => {
+          if (r.status === "target_missing" && r.would_insert > 0) {
+            return h("span", { class: "badge warn",
+              title: "These rows are waiting on the source side; they'd be inserted once the target schema is bootstrapped" },
+              `${r.would_insert} pending`);
+          }
+          if (r.insert > 0) return h("span", { class: "badge ok" }, String(r.insert));
+          return h("span", { class: "muted" }, "0");
+        })();
         stb.appendChild(h("tr", null,
-          h("td", { class: "mono" }, t.table),
-          h("td", null, t.insert > 0
-            ? h("span", { class: "badge ok" }, String(t.insert))
+          h("td", { class: "mono" }, r.table),
+          h("td", null, statusBadge(r)),
+          h("td", null, insertCell),
+          h("td", null, r.overwrite > 0
+            ? h("span", { class: "badge danger" }, String(r.overwrite))
             : h("span", { class: "muted" }, "0")),
-          h("td", null, t.overwrite > 0
-            ? h("span", { class: "badge danger" }, String(t.overwrite))
-            : h("span", { class: "muted" }, "0")),
-          h("td", { class: "muted" }, String(t.preserve_only_in_target)),
+          h("td", { class: "muted" }, String(r.preserve_only_in_target || 0)),
         ));
       }
       summaryTbl.appendChild(stb);
