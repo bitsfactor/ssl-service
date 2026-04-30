@@ -3363,6 +3363,28 @@ def _build_router(ctx: AdminContext) -> _Router:
                       code="connect_failed") from exc
     return _json_response(HTTPStatus.OK, result)
 
+  def databases_apply_schema_handler(request: _Request) -> _Response:
+    """Bootstrap the target DB's schema from sql/schema.sql. Idempotent.
+    Used when the user adds a fresh DB that hasn't run the migrations yet."""
+    _require_readwrite(ctx)
+    db_id = request.path_params["id"]
+    dsn = _resolve_dsn_or_400(db_id)
+    schema_path = Path(__file__).resolve().parent.parent.parent / "sql" / "schema.sql"
+    if not schema_path.is_file():
+      raise HttpError(HTTPStatus.INTERNAL_SERVER_ERROR,
+                      "schema.sql not found on this admin's filesystem",
+                      code="schema_missing")
+    sql_text = schema_path.read_text()
+    try:
+      result = db_sync_mod.apply_schema(dsn, sql_text)
+    except Exception as exc:  # noqa: BLE001
+      raise HttpError(HTTPStatus.BAD_GATEWAY,
+                      f"apply schema failed: {exc}",
+                      code="apply_schema_failed") from exc
+    LOGGER.info("databases.apply_schema id=%s missing_after=%d",
+                db_id, len(result.get("missing_tables", [])))
+    return _json_response(HTTPStatus.OK, result)
+
   def databases_set_primary_handler(request: _Request) -> _Response:
     """Mark a database as 'use this on next admin restart'. The current
     admin process keeps using whatever it booted against — this is just
@@ -3454,6 +3476,7 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("PATCH",  "/api/databases/{id}", with_auth(databases_patch_handler))
   router.add("DELETE", "/api/databases/{id}", with_auth(databases_delete_handler))
   router.add("POST",   "/api/databases/{id}/test", with_auth(databases_test_handler))
+  router.add("POST",   "/api/databases/{id}/apply-schema", with_auth(databases_apply_schema_handler))
   router.add("PUT",    "/api/databases/{id}/primary", with_auth(databases_set_primary_handler))
   router.add("POST",   "/api/sync/analyze", with_auth(sync_analyze_handler))
   router.add("POST",   "/api/sync/apply", with_auth(sync_apply_handler))

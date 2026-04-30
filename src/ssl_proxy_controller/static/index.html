@@ -5389,11 +5389,71 @@
       analysisCard.style.display = "";
       const fromLabel = (view.entries.find(e => e.id === analysis.from_id) || {}).label || analysis.from_id;
       const toLabel = (view.entries.find(e => e.id === analysis.to_id) || {}).label || analysis.to_id;
+      const erroredCount = (analysis.totals.errored_tables || 0);
       analysisStamp.textContent =
-        `${fromLabel} → ${toLabel} · ${analysis.totals.insert} insert · ${analysis.totals.overwrite} OVERWRITE · ${analysis.totals.preserve_only_in_target} preserved`;
+        `${fromLabel} → ${toLabel} · ${analysis.totals.insert} insert · ${analysis.totals.overwrite} OVERWRITE · ${analysis.totals.preserve_only_in_target} preserved`
+        + (erroredCount ? ` · ${erroredCount} TABLE(S) ERRORED` : "");
       analysisBody.innerHTML = "";
 
-      if (analysis.totals.overwrite === 0 && analysis.totals.insert === 0) {
+      // If every table errored — almost certainly the target hasn't been
+      // bootstrapped (no schema yet). Show a clear, actionable state
+      // instead of misleading "Nothing to sync".
+      const allErrored = erroredCount > 0 && erroredCount === (analysis.tables || []).length;
+      if (allErrored) {
+        const targetEntry = (view.entries || []).find(e => e.id === analysis.to_id);
+        analysisBody.appendChild(h("div", { class: "empty" },
+          h("div", { class: "title", style: "color: var(--danger)" },
+            "Target schema is not initialized"),
+          h("div", { class: "sub" },
+            `Every sync table failed to read from '${toLabel}'. Most likely it's a fresh database that hasn't run schema.sql yet.`),
+        ));
+        // Show first error for context
+        const firstErr = (analysis.errors || [])[0];
+        if (firstErr) {
+          analysisBody.appendChild(h("pre", {
+            class: "mono", style: "background: var(--surface-alt); padding: 8px 10px; border-radius: 4px; font-size: 11px; max-height: 120px; overflow: auto;",
+          }, `${firstErr.table}: ${firstErr.error}`));
+        }
+        if (targetEntry) {
+          analysisBody.appendChild(h("button", {
+            class: "btn btn-primary", style: "margin-top: 12px",
+            onclick: async () => {
+              if (!confirm(`Run schema.sql against '${toLabel}'?\n\nThis creates all 8 sync tables (and their dependencies). Idempotent — safe even if the schema is partially there.`)) return;
+              try {
+                const r = await api("POST",
+                  `/api/databases/${encodeURIComponent(targetEntry.id)}/apply-schema`, {});
+                const stillMissing = (r.missing_tables || []).length;
+                toast(stillMissing === 0 ? "success" : "info",
+                  "Schema applied",
+                  stillMissing === 0
+                    ? "All sync tables present. Click Analyze again."
+                    : `${stillMissing} tables still missing — schema.sql may need adjustment.`);
+              } catch (err) {
+                toast("error", "Apply schema failed", err.message);
+              }
+            },
+          }, `Bootstrap schema on ${toLabel}`));
+        }
+        // Also surface any partial errors below.
+        return;
+      }
+
+      // Partial errors: render a warning banner + still show what we
+      // could analyze.
+      if (erroredCount > 0) {
+        const errBox = h("div", {
+          class: "muted", style: "background: var(--danger-bg, #fee); padding: 10px 12px; border-radius: 6px; margin-bottom: 14px; color: var(--danger);",
+        });
+        errBox.appendChild(h("div", { style: "font-weight: 600" },
+          `${erroredCount} table(s) could not be read on '${toLabel}'.`));
+        for (const e of (analysis.errors || []).slice(0, 5)) {
+          errBox.appendChild(h("div", { class: "mono", style: "font-size: 11px; margin-top: 4px;" },
+            `${e.table}: ${(e.error || "").slice(0, 200)}`));
+        }
+        analysisBody.appendChild(errBox);
+      }
+
+      if (analysis.totals.overwrite === 0 && analysis.totals.insert === 0 && erroredCount === 0) {
         analysisBody.appendChild(h("div", { class: "empty" },
           h("div", { class: "title" }, "Nothing to sync"),
           h("div", { class: "sub" }, "Source and target are already identical for these tables.")));

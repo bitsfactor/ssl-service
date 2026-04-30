@@ -82,6 +82,19 @@ def _connect(dsn: str, *, timeout: float = 15.0) -> psycopg.Connection:
   return psycopg.connect(dsn, row_factory=dict_row, connect_timeout=int(timeout))
 
 
+def apply_schema(dsn: str, schema_sql: str) -> dict[str, Any]:
+  """Run ``schema.sql`` against the target. Idempotent — schema.sql
+  uses CREATE TABLE IF NOT EXISTS / ALTER TABLE IF NOT EXISTS guards."""
+  if not schema_sql.strip():
+    raise ValueError("schema_sql is empty")
+  with _connect(dsn) as conn:
+    with conn.cursor() as cur:
+      cur.execute(schema_sql)
+    conn.commit()
+  # Re-check what's there afterwards.
+  return test_target_connection(dsn)
+
+
 def test_target_connection(dsn: str) -> dict[str, Any]:
   """Connect, run ``SELECT 1``, list tables we'll sync against. Used
   by the UI's "Test connection" button before saving."""
@@ -222,15 +235,18 @@ def analyze_sync(
             "sample_insert": [], "sample_overwrite": [],
           })
 
+  errored = [t for t in per_table if t.get("error")]
   totals = {
     "insert": sum(t.get("insert", 0) for t in per_table),
     "overwrite": sum(t.get("overwrite", 0) for t in per_table),
     "preserve_only_in_target": sum(t.get("preserve_only_in_target", 0) for t in per_table),
+    "errored_tables": len(errored),
   }
   return {
     "direction": direction,
     "tables": per_table,
     "totals": totals,
+    "errors": [{"table": t["table"], "error": t["error"]} for t in errored],
     "at": datetime.now(tz=UTC).isoformat().replace("+00:00", "Z"),
   }
 
