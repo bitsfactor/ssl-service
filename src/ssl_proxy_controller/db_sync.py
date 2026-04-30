@@ -30,6 +30,7 @@ from typing import Any, Iterable
 import psycopg
 from psycopg import errors as pg_errors
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 LOGGER = logging.getLogger("ssl_proxy_controller.db_sync")
 
@@ -53,20 +54,28 @@ class TableSpec:
 # service_node_state, ip_test_results — these are runtime state, not
 # logical config.
 SYNC_TABLES: tuple[TableSpec, ...] = (
+  # Order matters for FK satisfaction:
+  #   - routes  must come BEFORE certificates (certs.domain → routes.domain)
+  #   - independent tables can be anywhere
   TableSpec(
     "system_config", pk_cols=("key",),
-    filter_where="key NOT IN ('secondary_db_dsn', 'last_sync')",
+    filter_where="key NOT IN ('secondary_db_dsn', 'last_sync', 'databases', 'primary_db_id')",
   ),
   TableSpec("dns_zone_tokens", pk_cols=("zone_name",)),
   TableSpec("ssh_keys",        pk_cols=("id",)),
   TableSpec("nodes",           pk_cols=("name",)),
   TableSpec("services",        pk_cols=("name",)),
   TableSpec("static_ips",      pk_cols=("id",)),
-  TableSpec("certificates",    pk_cols=("domain",)),
+  # routes BEFORE certificates: certs has FK certificates_domain_fkey
+  # → routes(domain). Inserting a cert before its parent route exists
+  # in the target raises FK violation.
   TableSpec(
     "routes", pk_cols=("domain",),
-    child_table="route_upstreams", child_parent_col="route_domain",
+    # Child table is route_upstreams; the parent column is named
+    # `domain` (NOT `route_domain` — schema verified).
+    child_table="route_upstreams", child_parent_col="domain",
   ),
+  TableSpec("certificates",    pk_cols=("domain",)),
 )
 
 # Columns we ignore when comparing two rows for "did anything change".
@@ -358,6 +367,20 @@ def analyze_sync(
 # ---------------------------------------------------------------------------
 
 
+def _bind_value(v: Any) -> Any:
+  """Convert Python values into a form psycopg can bind for INSERT.
+
+  psycopg auto-adapts native scalars (str/int/datetime/bool) but does
+  NOT adapt ``dict`` / ``list`` to JSONB — they have to be wrapped in
+  ``Jsonb(...)``. Without this we hit
+  ``ProgrammingError: cannot adapt type 'dict' using placeholder '%s'``
+  on tables with jsonb columns (system_config.value, services.default_env,
+  static_ips.metadata, etc.)."""
+  if isinstance(v, (dict, list)):
+    return Jsonb(v)
+  return v
+
+
 def _build_upsert_sql(table: str, cols: list[str], pk_cols: tuple[str, ...]) -> str:
   pk_clause = ", ".join(pk_cols)
   set_clauses = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c not in pk_cols)
@@ -396,7 +419,7 @@ def _apply_one_table(
   with tgt_conn.cursor() as tcur:
     try:
       for row in src_rows.values():
-        tcur.execute(upsert_sql, [row.get(c) for c in cols])
+        tcur.execute(upsert_sql, [_bind_value(row.get(c)) for c in cols])
 
       if spec.child_table and spec.child_parent_col and spec.pk_cols:
         # Replace children for each parent we just touched.
@@ -425,7 +448,7 @@ def _apply_one_table(
             placeholders = ",".join([child_ph] * len(child_rows))
             flat: list = []
             for cr in child_rows:
-              flat.extend(cr[c] for c in child_cols)
+              flat.extend(_bind_value(cr[c]) for c in child_cols)
             tcur.execute(
               f"INSERT INTO {spec.child_table} "
               f"({','.join(child_cols)}) VALUES {placeholders}",
