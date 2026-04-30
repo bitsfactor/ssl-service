@@ -3480,6 +3480,18 @@
           stampEl.textContent = r.message;
           renderTable([]);
         } else {
+          // Per-node failures (SSH timeout, host down) come back in r.errors.
+          // Surface them so the user knows the refreshed numbers don't
+          // cover every node (review pass-3 R3.12).
+          if (r && Array.isArray(r.errors) && r.errors.length) {
+            const total = r.total || (r.refreshed + r.errors.length);
+            const sample = r.errors.slice(0, 3)
+              .map((e) => `${e.node || "?"}: ${e.error || "fail"}`).join(" · ");
+            const more = r.errors.length > 3 ? ` (+${r.errors.length - 3} more)` : "";
+            toast("error",
+              `${r.errors.length}/${total} nodes failed to refresh`,
+              sample + more);
+          }
           await loadFleet(false);
         }
       } catch (err) {
