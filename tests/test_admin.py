@@ -982,3 +982,59 @@ def test_read_host_ssh_key_returns_content(monkeypatch, tmp_path: Path) -> None:
   ctx = make_context()
   result = read_host_ssh_key(ctx, {"path": str(key_path)})
   assert result["content"] == body
+
+
+# ---------------------------------------------------------------------------
+# nodes._parse_containers — locks in the brittlest probe-output
+# parser (see review pass-2 R2.4).
+# ---------------------------------------------------------------------------
+
+def test_parse_containers_handles_normal_docker_json() -> None:
+  text = (
+    '{"Names":"ssl-service","State":"running","Image":"ssl-service:local",'
+    '"Status":"Up 5 minutes (healthy)","RunningFor":"5 minutes",'
+    '"CreatedAt":"2026-04-30 12:00:00 +0000 UTC"}\n'
+    '{"Names":"redis","State":"exited","Image":"redis:7",'
+    '"Status":"Exited (137) 1 hour ago"}\n'
+  )
+  out = nodes_mod._parse_containers(text)
+  assert len(out) == 2
+  ssl, redis = out
+  assert ssl["name"] == "ssl-service"
+  assert ssl["state"] == "running"
+  assert ssl["image"] == "ssl-service:local"
+  assert ssl["status_str"].endswith("(healthy)")
+  assert redis["state"] == "exited"
+
+
+def test_parse_containers_skips_junk_lines() -> None:
+  text = (
+    "this is not json\n"
+    "  \n"
+    '{"Names":"ok","State":"running"}\n'
+    '{"State":"running"}\n'                  # missing name → skipped
+    "{not json either\n"
+    '{"Names":"another","State":""}\n'
+  )
+  out = nodes_mod._parse_containers(text)
+  names = [c["name"] for c in out]
+  assert names == ["ok", "another"]
+  # State field missing/empty becomes empty string, not None — caller
+  # treats falsy as unknown.
+  assert out[1]["state"] == ""
+
+
+def test_parse_containers_resilient_to_pipes_in_status() -> None:
+  # Older parser was pipe-delimited; if Status text ever contained a
+  # pipe (e.g. via CMD output), it broke. JSON path handles it cleanly.
+  text = '{"Names":"weird","State":"running","Image":"x","Status":"Up | a | b"}'
+  out = nodes_mod._parse_containers(text)
+  assert out == [{
+    "name": "weird", "state": "running", "image": "x",
+    "status_str": "Up | a | b", "running_for": "", "created_at": "",
+  }]
+
+
+def test_parse_containers_empty_input() -> None:
+  assert nodes_mod._parse_containers("") == []
+  assert nodes_mod._parse_containers(None) == []  # type: ignore[arg-type]

@@ -1065,7 +1065,13 @@ def reconcile_node_services(
   if not to_upsert:
     return
   try:
-    ctx.database.bulk_upsert_service_node_liveness(to_upsert)
+    n = ctx.database.bulk_upsert_service_node_liveness(to_upsert)
+    LOGGER.info(
+      "reconcile node=%s observed=%d rows=%d (running=%d absent=%d)",
+      node_name, len(containers), n,
+      sum(1 for r in to_upsert if r["container_state"] == "running"),
+      sum(1 for r in to_upsert if r["container_state"] == "absent"),
+    )
   except Exception:
     LOGGER.exception("reconcile_node_services: bulk upsert failed node=%s rows=%d",
                      node_name, len(to_upsert))
@@ -1720,7 +1726,10 @@ def refresh_service_nodes(
       LOGGER.exception("refresh_service_nodes: probe failed for %s", node_name)
       return {"node": node_name, "ok": False, "error": str(exc)}
 
-  workers = min(8, max(1, len(node_names)))
+  # Cap at 6 workers (pool size 10 minus headroom for the foreground
+  # request handler + a possible /api/nodes call from another tab —
+  # see review pass-2 R2.1 on connection-pool exhaustion).
+  workers = min(6, max(1, len(node_names)))
   from concurrent.futures import ThreadPoolExecutor as _TPE
   with _TPE(max_workers=workers) as ex:
     results = list(ex.map(_one, node_names))
