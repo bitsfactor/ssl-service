@@ -416,6 +416,10 @@
         <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="5" cy="8" r="2.5"/><path d="M7.5 8h6M11.5 8v2M13.5 8v2"/></svg>
         SSH Keys
       </a>
+      <a href="#/sync" data-nav="sync">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 6a5 5 0 0 1 9-2l1-1v3h-3l1-1a3 3 0 0 0-6 1zM13 10a5 5 0 0 1-9 2l-1 1v-3h3l-1 1a3 3 0 0 0 6-1z"/></svg>
+        Sync
+      </a>
       <a href="#/logs" data-nav="logs">
         <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="12" height="12" rx="2"/><path d="M5 6h6M5 9h6M5 12h3"/></svg>
         Logs
@@ -5170,6 +5174,275 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Sync — push the logical config from this DB (A) to a configured
+  // secondary DB (B), or pull B → A. Shows an analyze-first preview
+  // so the operator can review what will be inserted vs overwritten
+  // before applying.
+  // ---------------------------------------------------------------------------
+  async function renderSyncView(root) {
+    setActiveNav("sync");
+    root.innerHTML = "";
+    root.appendChild(h("div", { class: "page-header" },
+      h("div", null,
+        h("h1", null, "Sync"),
+        h("p", { class: "lede" },
+          "Mirror the logical config (routes, services, nodes, ssh_keys, certs, dns zones, static IPs, settings) ",
+          "from this database (A) to a second one (B), or the other way around. ",
+          "Source-wins on conflicts; target-only rows are kept."),
+      ),
+    ));
+
+    // Section 1: configure DB B
+    const cfgCard = h("div", { class: "card" });
+    cfgCard.appendChild(h("div", { class: "card-header" },
+      h("h2", null, "Database B")));
+    const cfgBody = h("div", { class: "card-body" });
+    cfgCard.appendChild(cfgBody);
+    root.appendChild(cfgCard);
+
+    cfgBody.appendChild(h("div", { class: "muted", style: "padding: 8px 0;" },
+      "Loading configuration…"));
+
+    // Section 2: sync action
+    const actCard = h("div", { class: "card" });
+    actCard.appendChild(h("div", { class: "card-header" },
+      h("h2", null, "Run sync")));
+    const actBody = h("div", { class: "card-body", id: "sync-act-body" });
+    actCard.appendChild(actBody);
+    root.appendChild(actCard);
+
+    // Section 3: analysis preview lands here
+    const analysisCard = h("div", { class: "card", id: "sync-analysis-card",
+      style: "display: none" });
+    analysisCard.appendChild(h("div", { class: "card-header" },
+      h("h2", null, "Analysis"),
+      h("span", { class: "hint", id: "sync-analysis-stamp" }, "")));
+    const analysisBody = h("div", { class: "card-body" });
+    analysisCard.appendChild(analysisBody);
+    root.appendChild(analysisCard);
+
+    // Closure-held refs (avoid getElementById races between consecutive renders).
+    let lastAnalysis = null;
+
+    const renderConfig = (cfg) => {
+      cfgBody.innerHTML = "";
+      const dsnInput = h("input", {
+        class: "input mono", type: "text",
+        placeholder: "postgresql://user:password@host:5432/db?sslmode=require",
+        value: "",  // never echo current secret back
+      });
+      cfgBody.appendChild(h("div", { class: "field" },
+        h("label", null,
+          "Secondary DSN ",
+          cfg.configured
+            ? h("span", { class: "muted", style: "font-size: 11.5px" },
+                "currently: " + (cfg.secondary_dsn_masked || "—"))
+            : h("span", { class: "muted", style: "font-size: 11.5px" }, "(not yet configured)")),
+        dsnInput,
+      ));
+      const status = h("span", { class: "muted", style: "font-size: 12px" });
+      const row = h("div", { class: "row", style: "gap: 8px; align-items: center" },
+        h("button", { class: "btn", onclick: async () => {
+          const dsn = dsnInput.value.trim();
+          if (!dsn) { toast("error", "Empty DSN"); return; }
+          status.textContent = "Testing…";
+          try {
+            const r = await api("POST", "/api/sync/test", { dsn });
+            const missing = r.missing_tables || [];
+            status.textContent = missing.length
+              ? `connected, but missing tables: ${missing.join(", ")}`
+              : `connected; ${(r.checked_tables || []).length} sync tables present`;
+          } catch (err) {
+            status.textContent = "failed: " + (err.message || "");
+          }
+        } }, "Test"),
+        h("button", { class: "btn btn-primary", onclick: async () => {
+          const dsn = dsnInput.value.trim();
+          if (!dsn) { toast("error", "Empty DSN"); return; }
+          try {
+            const r = await api("PUT", "/api/sync/config", { dsn });
+            toast("success", "Saved",
+              r.secondary_dsn_masked || "B configured");
+            renderSyncView(root);
+          } catch (err) { toast("error", "Save failed", err.message); }
+        } }, "Save"),
+        cfg.configured
+          ? h("button", { class: "btn btn-danger", onclick: async () => {
+              if (!confirm("Forget B's DSN? Sync will be disabled until reconfigured.")) return;
+              try {
+                await api("PUT", "/api/sync/config", { dsn: "" });
+                toast("success", "B forgotten");
+                renderSyncView(root);
+              } catch (err) { toast("error", "Failed", err.message); }
+            } }, "Forget B")
+          : null,
+        status,
+      );
+      cfgBody.appendChild(row);
+
+      if (cfg.last_sync) {
+        const ls = cfg.last_sync;
+        cfgBody.appendChild(h("div", { class: "muted",
+          style: "padding: 12px 0 0 0; font-size: 12px" },
+          `Last sync: ${ls.direction || "?"} · ${ls.totals_applied || 0} rows · ${fmtRelative(ls.at)}`));
+      }
+    };
+
+    const renderActionPanel = (cfg) => {
+      actBody.innerHTML = "";
+      if (!cfg.configured) {
+        actBody.appendChild(h("div", { class: "muted", style: "padding: 8px 0" },
+          "Configure Database B above before running sync."));
+        return;
+      }
+      // Direction picker
+      const dirA2B = h("input", { type: "radio", name: "sync-dir", value: "AtoB", id: "sd-a2b", checked: true });
+      const dirB2A = h("input", { type: "radio", name: "sync-dir", value: "BtoA", id: "sd-b2a" });
+      const direction = () =>
+        (document.querySelector('input[name="sync-dir"]:checked') || dirA2B).value;
+      actBody.appendChild(h("div", { style: "margin-bottom: 12px" },
+        h("label", { style: "margin-right: 16px; cursor: pointer", for: "sd-a2b" },
+          dirA2B, " A → B  ",
+          h("span", { class: "muted", style: "font-size: 12px" },
+            "(this DB pushes to the secondary)")),
+        h("label", { style: "cursor: pointer", for: "sd-b2a" },
+          dirB2A, " B → A  ",
+          h("span", { class: "muted", style: "font-size: 12px" },
+            "(secondary pushes back to this DB)")),
+      ));
+
+      const buttons = h("div", { class: "row", style: "gap: 8px" });
+      const analyzeBtn = h("button", { class: "btn btn-primary", onclick: async () => {
+        analyzeBtn.disabled = true;
+        analyzeBtn.textContent = "Analyzing…";
+        try {
+          const r = await api("POST", "/api/sync/analyze", { direction: direction() });
+          lastAnalysis = r;
+          renderAnalysis(r);
+        } catch (err) {
+          toast("error", "Analyze failed", err.message);
+        } finally {
+          analyzeBtn.disabled = false;
+          analyzeBtn.textContent = "Analyze";
+        }
+      } }, "Analyze");
+      buttons.appendChild(analyzeBtn);
+      actBody.appendChild(buttons);
+    };
+
+    const renderAnalysis = (analysis) => {
+      analysisCard.style.display = "";
+      const stampEl = analysisCard.querySelector("#sync-analysis-stamp");
+      if (stampEl) {
+        stampEl.textContent = `${analysis.direction} · totals: ${analysis.totals.insert} insert · ${analysis.totals.overwrite} OVERWRITE · ${analysis.totals.preserve_only_in_target} preserved`;
+      }
+      analysisBody.innerHTML = "";
+
+      if (analysis.totals.overwrite === 0 && analysis.totals.insert === 0) {
+        analysisBody.appendChild(h("div", { class: "empty" },
+          h("div", { class: "title" }, "Nothing to sync"),
+          h("div", { class: "sub" }, "Source and target are already identical for these tables.")));
+        return;
+      }
+
+      const summaryTbl = h("table", { class: "data" });
+      summaryTbl.appendChild(h("thead", null, h("tr", null,
+        h("th", null, "Table"),
+        h("th", null, "Insert"),
+        h("th", null, "Overwrite"),
+        h("th", null, "Preserve (target-only)"),
+      )));
+      const stb = h("tbody");
+      for (const t of analysis.tables) {
+        const overrideCell = t.overwrite > 0
+          ? h("span", { class: "badge danger" }, String(t.overwrite))
+          : h("span", { class: "muted" }, "0");
+        stb.appendChild(h("tr", null,
+          h("td", { class: "mono" }, t.table),
+          h("td", null, t.insert > 0 ? h("span", { class: "badge ok" }, String(t.insert)) : h("span", { class: "muted" }, "0")),
+          h("td", null, overrideCell),
+          h("td", { class: "muted" }, String(t.preserve_only_in_target)),
+        ));
+      }
+      summaryTbl.appendChild(stb);
+      const wrap = h("div", { class: "table-wrap" });
+      wrap.appendChild(summaryTbl);
+      analysisBody.appendChild(wrap);
+
+      // Per-table overwrite samples (this is what the user asked for —
+      // "what will be overwritten").
+      for (const t of analysis.tables) {
+        if (!t.sample_overwrite || !t.sample_overwrite.length) continue;
+        analysisBody.appendChild(h("div", { style: "margin: 16px 0 6px; font-weight: 600" },
+          `${t.table} — will overwrite (showing ${t.sample_overwrite.length}/${t.overwrite}):`));
+        const tbl = h("table", { class: "data" });
+        tbl.appendChild(h("thead", null, h("tr", null,
+          h("th", null, "PK"),
+          h("th", null, "Changed fields"),
+          h("th", null, "Before (target)"),
+          h("th", null, "After (source)"),
+        )));
+        const tb = h("tbody");
+        for (const s of t.sample_overwrite) {
+          tb.appendChild(h("tr", null,
+            h("td", { class: "mono" }, Object.entries(s.pk).map(([k, v]) => `${k}=${v}`).join(" ")),
+            h("td", { class: "mono", style: "font-size: 11.5px" }, (s.changed_fields || []).join(", ")),
+            h("td", { class: "mono", style: "font-size: 11px; color: var(--danger)" },
+              Object.entries(s.before).map(([k, v]) => `${k}=${v}`).join("\n")),
+            h("td", { class: "mono", style: "font-size: 11px; color: var(--success, green)" },
+              Object.entries(s.after).map(([k, v]) => `${k}=${v}`).join("\n")),
+          ));
+        }
+        tbl.appendChild(tb);
+        const wrap2 = h("div", { class: "table-wrap" });
+        wrap2.appendChild(tbl);
+        analysisBody.appendChild(wrap2);
+      }
+
+      // Apply button
+      const apply = h("button", { class: "btn btn-danger", style: "margin-top: 16px",
+        onclick: async () => {
+          const dir = analysis.direction;
+          const msg =
+            `Apply this sync (${dir})?\n\n` +
+            `${analysis.totals.insert} new rows will be inserted.\n` +
+            `${analysis.totals.overwrite} EXISTING rows will be overwritten.\n` +
+            `${analysis.totals.preserve_only_in_target} target-only rows will be left alone.\n\n` +
+            `This is irreversible. Source = ${dir === "AtoB" ? "this DB (A)" : "secondary (B)"}.`;
+          if (!confirm(msg)) return;
+          apply.disabled = true; apply.textContent = "Applying…";
+          try {
+            const r = await api("POST", "/api/sync/apply", { direction: dir });
+            const ok = (r.results || []).reduce((a, b) => a + (b.rows_applied || 0), 0);
+            const fail = (r.errors || []).length;
+            toast(fail === 0 ? "success" : "info", "Sync complete",
+              `${ok} rows applied · ${fail} table(s) failed`);
+            // Refresh the whole view so last_sync timestamp updates.
+            renderSyncView(root);
+          } catch (err) {
+            toast("error", "Apply failed", err.message);
+          } finally {
+            apply.disabled = false; apply.textContent = "Apply sync";
+          }
+        } }, "Apply sync");
+      analysisBody.appendChild(apply);
+    };
+
+    // Initial load
+    try {
+      const cfg = await api("GET", "/api/sync/config");
+      renderConfig(cfg);
+      renderActionPanel(cfg);
+    } catch (err) {
+      cfgBody.innerHTML = "";
+      cfgBody.appendChild(h("div", { class: "muted", style: "color: var(--danger)" },
+        err.status === 404
+          ? "Sync endpoints not available — restart the admin server to pick up the new build."
+          : "Could not load sync config: " + err.message));
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Router
   // ---------------------------------------------------------------------------
 
@@ -5182,6 +5455,7 @@
     "#/services": renderServicesView,
     "#/static-ips": renderStaticIpsView,
     "#/ssh-keys": renderSshKeysView,
+    "#/sync": renderSyncView,
     "#/logs": renderLogsView,
     "#/settings": renderSettingsView,
   };
