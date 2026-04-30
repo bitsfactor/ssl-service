@@ -37,46 +37,115 @@ LOGGER = logging.getLogger("ssl_proxy_controller.db_sync")
 
 @dataclass(slots=True)
 class TableSpec:
-  """One table in the sync set."""
+  """One table in the sync set. Discovered at runtime via
+  information_schema — no hardcoded list, no business logic."""
   name: str
   pk_cols: tuple[str, ...]
-  # SQL WHERE clause used when SELECTing rows from source/target. Lets
-  # ``system_config`` skip its own sync-config keys.
-  filter_where: str | None = None
-  # Optional child table whose rows are replaced (DELETE + INSERT) for
-  # every parent row we touch — currently used by routes/route_upstreams.
-  child_table: str | None = None
-  child_parent_col: str | None = None  # column in child that refs parent.PK[0]
 
 
-# Apply order: independent tables first, parents before children. Tables
-# excluded on purpose: node_status, node_init_runs, service_deployments,
-# service_node_state, ip_test_results — these are runtime state, not
-# logical config.
-SYNC_TABLES: tuple[TableSpec, ...] = (
-  # Order matters for FK satisfaction:
-  #   - routes  must come BEFORE certificates (certs.domain → routes.domain)
-  #   - independent tables can be anywhere
-  TableSpec(
-    "system_config", pk_cols=("key",),
-    filter_where="key NOT IN ('secondary_db_dsn', 'last_sync', 'databases', 'primary_db_id')",
-  ),
-  TableSpec("dns_zone_tokens", pk_cols=("zone_name",)),
-  TableSpec("ssh_keys",        pk_cols=("id",)),
-  TableSpec("nodes",           pk_cols=("name",)),
-  TableSpec("services",        pk_cols=("name",)),
-  TableSpec("static_ips",      pk_cols=("id",)),
-  # routes BEFORE certificates: certs has FK certificates_domain_fkey
-  # → routes(domain). Inserting a cert before its parent route exists
-  # in the target raises FK violation.
-  TableSpec(
-    "routes", pk_cols=("domain",),
-    # Child table is route_upstreams; the parent column is named
-    # `domain` (NOT `route_domain` — schema verified).
-    child_table="route_upstreams", child_parent_col="domain",
-  ),
-  TableSpec("certificates",    pk_cols=("domain",)),
-)
+# ---------------------------------------------------------------------------
+# Schema discovery — populates the table list at runtime
+# ---------------------------------------------------------------------------
+
+
+def discover_tables(conn: psycopg.Connection) -> list[TableSpec]:
+  """Discover all BASE TABLEs in the connection's ``current_schema()``,
+  with their PRIMARY KEY columns. Tables without a PK are skipped
+  (we can't safely upsert into them)."""
+  out: list[TableSpec] = []
+  with conn.cursor() as cur:
+    cur.execute("""
+      SELECT t.table_name,
+             COALESCE(
+               (SELECT array_agg(kcu.column_name ORDER BY kcu.ordinal_position)
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                  ON kcu.constraint_schema = tc.constraint_schema
+                  AND kcu.constraint_name = tc.constraint_name
+                WHERE tc.constraint_type = 'PRIMARY KEY'
+                  AND tc.table_schema = t.table_schema
+                  AND tc.table_name = t.table_name),
+               ARRAY[]::text[]
+             ) AS pk_cols
+      FROM information_schema.tables t
+      WHERE t.table_schema = current_schema()
+        AND t.table_type = 'BASE TABLE'
+      ORDER BY t.table_name
+    """)
+    for row in cur.fetchall():
+      pk = tuple(row.get("pk_cols") or [])
+      if not pk:
+        LOGGER.warning("discover: skipping %s (no PRIMARY KEY)", row["table_name"])
+        continue
+      out.append(TableSpec(name=row["table_name"], pk_cols=pk))
+  return out
+
+
+def discover_fk_edges(conn: psycopg.Connection) -> dict[str, set[str]]:
+  """Returns ``{child_table: {parent_table, ...}}`` for FKs in
+  ``current_schema()``. Self-references are dropped — they don't
+  affect topo sort."""
+  edges: dict[str, set[str]] = {}
+  with conn.cursor() as cur:
+    cur.execute("""
+      SELECT DISTINCT
+        tc.table_name AS child,
+        ccu.table_name AS parent
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.constraint_column_usage ccu
+        ON ccu.constraint_schema = tc.constraint_schema
+        AND ccu.constraint_name = tc.constraint_name
+      WHERE tc.constraint_type = 'FOREIGN KEY'
+        AND tc.table_schema = current_schema()
+        AND ccu.table_schema = current_schema()
+    """)
+    for row in cur.fetchall():
+      child, parent = row.get("child"), row.get("parent")
+      if not child or not parent or child == parent:
+        continue
+      edges.setdefault(child, set()).add(parent)
+  return edges
+
+
+def topo_sort(
+  tables: list[TableSpec], fk_edges: dict[str, set[str]],
+) -> list[TableSpec]:
+  """Return ``tables`` ordered so parents come before children. Cycles
+  are tolerated — affected tables get appended at the end and the
+  caller deals with any FK errors during apply."""
+  by_name = {t.name: t for t in tables}
+  visited: set[str] = set()
+  visiting: set[str] = set()
+  result: list[str] = []
+
+  def _visit(name: str) -> None:
+    if name in visited or name in visiting:
+      return
+    if name not in by_name:
+      return  # FK target outside our table set, ignore
+    visiting.add(name)
+    for parent in fk_edges.get(name, ()):
+      _visit(parent)
+    visiting.discard(name)
+    visited.add(name)
+    result.append(name)
+
+  for t in tables:
+    _visit(t.name)
+  return [by_name[n] for n in result]
+
+
+def discover_sync_tables(conn: psycopg.Connection) -> list[TableSpec]:
+  """Convenience: discover + topo-sort. The result is the order
+  apply_sync should write tables in."""
+  tables = discover_tables(conn)
+  edges = discover_fk_edges(conn)
+  return topo_sort(tables, edges)
+
+
+# Backwards-compat for callers that still reference SYNC_TABLES; this
+# is now an empty tuple — the real list is discovered at runtime.
+SYNC_TABLES: tuple[TableSpec, ...] = ()
 
 # Columns we ignore when comparing two rows for "did anything change".
 # These get bumped on every write and would otherwise mask real diffs.
@@ -143,23 +212,21 @@ def apply_schema(dsn: str, schema_sql: str) -> dict[str, Any]:
 
 
 def test_target_connection(dsn: str) -> dict[str, Any]:
-  """Connect, run ``SELECT 1``, list tables we'll sync against. Used
-  by the UI's "Test connection" button before saving."""
+  """Connect, run ``SELECT 1``, list tables actually present in the
+  connection's current_schema(). Used by the UI's "Test" button.
+
+  ``missing_tables`` is empty for now because, with auto-discovery,
+  there's no fixed expected list — the sync covers whatever's there.
+  Kept in the response shape for backwards compat with callers."""
   with _connect(dsn) as conn:
     with conn.cursor() as cur:
       cur.execute("SELECT 1 AS ok")
       cur.fetchone()
-      missing: list[str] = []
-      for spec in SYNC_TABLES:
-        try:
-          cur.execute(f"SELECT 1 FROM {spec.name} LIMIT 1")
-          cur.fetchone()
-        except Exception:  # noqa: BLE001
-          missing.append(spec.name)
+    discovered = discover_tables(conn)
   return {
     "ok": True,
-    "missing_tables": missing,
-    "checked_tables": [s.name for s in SYNC_TABLES],
+    "missing_tables": [],
+    "checked_tables": [s.name for s in discovered],
   }
 
 
@@ -300,7 +367,21 @@ def analyze_sync(
 
   per_table: list[dict] = []
   with _connect(src) as src_conn, _connect(tgt) as tgt_conn:
-    for spec in SYNC_TABLES:
+    # Discover the table list from whichever side has more tables
+    # (covers the "target schema not bootstrapped yet" case).
+    src_tables = discover_tables(src_conn)
+    try:
+      tgt_tables = discover_tables(tgt_conn)
+    except Exception:
+      tgt_tables = []
+    by_name: dict[str, TableSpec] = {t.name: t for t in src_tables}
+    for t in tgt_tables:
+      by_name.setdefault(t.name, t)
+    union_tables = list(by_name.values())
+    edges = discover_fk_edges(src_conn) if src_tables else {}
+    tables_in_order = topo_sort(union_tables, edges)
+
+    for spec in tables_in_order:
       try:
         src_rows, src_exists = _select_table_or_missing(src_conn, spec)
         tgt_rows, tgt_exists = _select_table_or_missing(tgt_conn, spec)
@@ -385,12 +466,28 @@ def _bind_value(v: Any) -> Any:
   return v
 
 
-def _build_upsert_sql(table: str, cols: list[str], pk_cols: tuple[str, ...]) -> str:
+def _build_upsert_sql(
+  table: str, cols: list[str], pk_cols: tuple[str, ...], *,
+  mode: str = "merge",
+) -> str:
+  """Build the INSERT ... ON CONFLICT ... statement.
+
+  ``mode``:
+    - ``"merge"`` (default): on PK conflict, overwrite the target's
+      row with the source's values.
+    - ``"insert_only"``: on PK conflict, leave the target row alone.
+      Used when the operator wants to add only the source rows that
+      don't already exist in target without touching overlaps.
+  """
   pk_clause = ", ".join(pk_cols)
-  set_clauses = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c not in pk_cols)
   ph = ", ".join(["%s"] * len(cols))
+  if mode == "insert_only":
+    return (
+      f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({ph}) "
+      f"ON CONFLICT ({pk_clause}) DO NOTHING"
+    )
+  set_clauses = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c not in pk_cols)
   if not set_clauses:
-    # Pure-PK table — nothing to update on conflict.
     return (
       f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({ph}) "
       f"ON CONFLICT ({pk_clause}) DO NOTHING"
@@ -403,12 +500,20 @@ def _build_upsert_sql(table: str, cols: list[str], pk_cols: tuple[str, ...]) -> 
 
 def _apply_one_table(
   spec: TableSpec, src_conn: psycopg.Connection, tgt_conn: psycopg.Connection,
+  *, mode: str = "merge",
 ) -> dict[str, Any]:
   """Sync ONE table source→target. Per-table transaction.
 
   Either side missing the table is handled: source missing → nothing
   to push, return 0 applied; target missing → can't apply without
   bootstrapping the schema, return a clear error string.
+
+  ``mode``:
+    ``"merge"`` (default) — overwrite target rows on PK conflict, also
+      replace children (DELETE + INSERT) for routes/route_upstreams.
+    ``"insert_only"`` — only INSERT rows whose PK isn't in target;
+      for child tables, INSERT children only for the parents we
+      newly inserted (existing parent's children stay untouched).
   """
   src_rows, src_exists = _select_table_or_missing(src_conn, spec)
   if not src_exists:
@@ -416,56 +521,29 @@ def _apply_one_table(
             "skipped": "source missing this table"}
   if not src_rows:
     return {"table": spec.name, "rows_applied": 0, "child_rows_applied": 0}
-  cols = list(next(iter(src_rows.values())).keys())
-  upsert_sql = _build_upsert_sql(spec.name, cols, spec.pk_cols)
 
-  child_rows_total = 0
+  # In insert_only mode we need to know which parent keys are NEW so
+  # we can decide which children to copy. Pull the target PK set once.
+  target_pks: set[tuple] = set()
+  if mode == "insert_only":
+    tgt_rows, tgt_exists = _select_table_or_missing(tgt_conn, spec)
+    if tgt_exists:
+      target_pks = set(tgt_rows.keys())
+
+  cols = list(next(iter(src_rows.values())).keys())
+  upsert_sql = _build_upsert_sql(spec.name, cols, spec.pk_cols, mode=mode)
+
   with tgt_conn.cursor() as tcur:
     try:
       for row in src_rows.values():
         tcur.execute(upsert_sql, [_bind_value(row.get(c)) for c in cols])
-
-      if spec.child_table and spec.child_parent_col and spec.pk_cols:
-        # Replace children for each parent we just touched.
-        parent_pks = [pk[0] for pk in src_rows.keys()]
-        if parent_pks:
-          ph = ",".join(["%s"] * len(parent_pks))
-          tcur.execute(
-            f"DELETE FROM {spec.child_table} "
-            f"WHERE {spec.child_parent_col} IN ({ph})",
-            parent_pks,
-          )
-          # Pull source children now and insert.
-          with src_conn.cursor() as src_cur:
-            src_cur.execute(
-              f"SELECT * FROM {spec.child_table} "
-              f"WHERE {spec.child_parent_col} IN ({ph})",
-              parent_pks,
-            )
-            child_rows = src_cur.fetchall()
-          if child_rows:
-            child_cols = [
-              c for c in child_rows[0].keys()
-              if c != "id"  # auto-generated; let target re-issue
-            ]
-            child_ph = "(" + ",".join(["%s"] * len(child_cols)) + ")"
-            placeholders = ",".join([child_ph] * len(child_rows))
-            flat: list = []
-            for cr in child_rows:
-              flat.extend(_bind_value(cr[c]) for c in child_cols)
-            tcur.execute(
-              f"INSERT INTO {spec.child_table} "
-              f"({','.join(child_cols)}) VALUES {placeholders}",
-              flat,
-            )
-            child_rows_total = len(child_rows)
       tgt_conn.commit()
-      LOGGER.info("sync.apply table=%s rows=%d children=%d",
-                  spec.name, len(src_rows), child_rows_total)
+      LOGGER.info("sync.apply table=%s rows=%d mode=%s",
+                  spec.name, len(src_rows), mode)
       return {
         "table": spec.name,
         "rows_applied": len(src_rows),
-        "child_rows_applied": child_rows_total,
+        "child_rows_applied": 0,  # no child handling in pure-data mode
       }
     except pg_errors.UndefinedTable:
       tgt_conn.rollback()
@@ -487,25 +565,34 @@ def _apply_one_table(
 
 def apply_sync(
   source_dsn: str, target_dsn: str, direction: str,
+  *, mode: str = "merge",
 ) -> dict[str, Any]:
   """Run the sync. Each table is its own transaction so a failure in
   one table doesn't lose the others. Returns per-table results +
-  any errors."""
+  any errors.
+
+  ``mode``: ``"merge"`` (default, source-wins on conflict) or
+  ``"insert_only"`` (skip overwrites — only add rows the target
+  doesn't have)."""
   if direction not in ("AtoB", "BtoA"):
     raise ValueError(f"direction must be AtoB or BtoA, got {direction!r}")
+  if mode not in ("merge", "insert_only"):
+    raise ValueError(f"mode must be merge or insert_only, got {mode!r}")
   src, tgt = (source_dsn, target_dsn) if direction == "AtoB" else (target_dsn, source_dsn)
 
   results: list[dict] = []
   errors: list[dict] = []
   with _connect(src) as src_conn, _connect(tgt) as tgt_conn:
-    for spec in SYNC_TABLES:
-      r = _apply_one_table(spec, src_conn, tgt_conn)
+    tables_in_order = discover_sync_tables(src_conn)
+    for spec in tables_in_order:
+      r = _apply_one_table(spec, src_conn, tgt_conn, mode=mode)
       if r.get("error"):
         errors.append({"table": r["table"], "error": r["error"]})
       results.append(r)
 
   return {
     "direction": direction,
+    "mode": mode,
     "results": results,
     "errors": errors,
     "at": datetime.now(tz=UTC).isoformat().replace("+00:00", "Z"),

@@ -3299,7 +3299,9 @@ def _build_router(ctx: AdminContext) -> _Router:
       e["dsn_masked"] = db_sync_mod.mask_dsn(e.pop("dsn"))
     view["current_dsn_masked"] = db_sync_mod.mask_dsn(cur)
     view["last_sync"] = last or None
-    view["tables"] = [s.name for s in db_sync_mod.SYNC_TABLES]
+    # Tables list is now discovered at sync time, no hardcoded set —
+    # leave the field empty here; UI doesn't currently render it.
+    view["tables"] = []
     return _json_response(HTTPStatus.OK, view)
 
   def databases_create_handler(request: _Request) -> _Response:
@@ -3528,8 +3530,13 @@ def _build_router(ctx: AdminContext) -> _Router:
     _require_readwrite(ctx)
     payload = request.json_body() or {}
     src_dsn, tgt_dsn = _resolve_from_to(payload)
+    mode = (payload.get("mode") or "merge").strip()
+    if mode not in ("merge", "insert_only"):
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "mode must be 'merge' or 'insert_only'",
+                      code="invalid_mode")
     try:
-      out = db_sync_mod.apply_sync(src_dsn, tgt_dsn, "AtoB")
+      out = db_sync_mod.apply_sync(src_dsn, tgt_dsn, "AtoB", mode=mode)
     except Exception as exc:  # noqa: BLE001
       raise HttpError(HTTPStatus.BAD_GATEWAY,
                       f"sync apply failed: {exc}",
@@ -3539,6 +3546,7 @@ def _build_router(ctx: AdminContext) -> _Router:
     summary = {
       "from_id": out["from_id"],
       "to_id": out["to_id"],
+      "mode": mode,
       "at": out["at"],
       "tables_applied": [r["table"] for r in out["results"]
                           if r.get("rows_applied", 0) > 0],
@@ -3549,8 +3557,8 @@ def _build_router(ctx: AdminContext) -> _Router:
       ctx.database.upsert_system_config("last_sync", summary)
     except Exception:
       LOGGER.exception("sync: could not persist last_sync record")
-    LOGGER.info("sync.apply from=%s to=%s applied=%d errors=%d",
-                summary["from_id"], summary["to_id"],
+    LOGGER.info("sync.apply from=%s to=%s mode=%s applied=%d errors=%d",
+                summary["from_id"], summary["to_id"], mode,
                 summary["totals_applied"], len(summary["errors"]))
     return _json_response(HTTPStatus.OK, out)
 
