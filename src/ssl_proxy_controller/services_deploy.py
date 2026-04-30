@@ -44,6 +44,9 @@ class DeployManifest:
   depends_on: list[str] = field(default_factory=list)
   hooks: dict[str, str] = field(default_factory=dict)
   volumes: list[str] = field(default_factory=list)
+  # config_schema — list of {key, label, type, default, help, validate, options, init_only}
+  # entries that drive the per-(service, node) visual config form.
+  config_schema: list[dict[str, Any]] = field(default_factory=list)
 
   def install_dir(self) -> str:
     return self.install_dir_template.replace("{name}", self.service)
@@ -138,6 +141,48 @@ def parse_deploy_yaml(text: str) -> DeployManifest:
   vols = data.get("volumes") or []
   if isinstance(vols, list):
     manifest.volumes = [str(x).strip() for x in vols if str(x).strip()]
+
+  # config_schema — declarative form definition for the admin UI.
+  # We accept a list of dicts; missing/invalid entries are dropped so a
+  # malformed entry can't take down the whole manifest fetch.
+  schema_raw = data.get("config_schema") or []
+  if isinstance(schema_raw, list):
+    cleaned_schema: list[dict[str, Any]] = []
+    valid_types = {"string", "integer", "boolean", "enum", "textarea", "password"}
+    for entry in schema_raw:
+      if not isinstance(entry, dict):
+        continue
+      key = str(entry.get("key") or "").strip()
+      if not key or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+        continue
+      kind = (entry.get("type") or "string").strip().lower()
+      if kind not in valid_types:
+        kind = "string"
+      cleaned: dict[str, Any] = {
+        "key": key,
+        "type": kind,
+        "label": str(entry.get("label") or key).strip(),
+      }
+      if entry.get("default") is not None:
+        cleaned["default"] = _stringify(entry["default"])
+      for opt in ("help", "validate"):
+        v = entry.get(opt)
+        if v is not None:
+          cleaned[opt] = str(v).strip()
+      if "min" in entry:
+        try: cleaned["min"] = int(entry["min"])
+        except (TypeError, ValueError): pass
+      if "max" in entry:
+        try: cleaned["max"] = int(entry["max"])
+        except (TypeError, ValueError): pass
+      if isinstance(entry.get("options"), list):
+        cleaned["options"] = [str(o) for o in entry["options"]]
+      if entry.get("required"):
+        cleaned["required"] = True
+      if entry.get("init_only"):
+        cleaned["init_only"] = True
+      cleaned_schema.append(cleaned)
+    manifest.config_schema = cleaned_schema
 
   return manifest
 

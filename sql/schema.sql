@@ -529,3 +529,34 @@ CREATE INDEX IF NOT EXISTS idx_node_status_disk_used_pct
   ON node_status (disk_root_used_pct);
 CREATE INDEX IF NOT EXISTS idx_node_status_load_15m
   ON node_status (load_avg_15m);
+
+-- Per-service visual config framework -----------------------------------
+-- A service's `.deploy.yaml` declares a ``config_schema`` (a list of
+-- {key, label, type, default, help, validate, options, init_only}
+-- entries). The admin renders a form from that schema. Per-(service,
+-- node) values live in service_node_config; on save we update the row
+-- and re-deploy the service with the new env, restarting the container
+-- so it picks them up.
+ALTER TABLE services
+  ADD COLUMN IF NOT EXISTS config_schema JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+CREATE TABLE IF NOT EXISTS service_node_config (
+  service_name TEXT NOT NULL REFERENCES services(name) ON DELETE CASCADE ON UPDATE CASCADE,
+  node_name    TEXT NOT NULL REFERENCES nodes(name)    ON DELETE CASCADE ON UPDATE CASCADE,
+  -- {env_key: value} — matches keys in services.config_schema. Strings,
+  -- numbers, booleans pass through; the admin's deploy step renders this
+  -- as a .env file on the target node.
+  values     JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_by TEXT,
+  PRIMARY KEY (service_name, node_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_service_node_config_service
+  ON service_node_config (service_name);
+
+DROP TRIGGER IF EXISTS service_node_config_touch_updated_at ON service_node_config;
+CREATE TRIGGER service_node_config_touch_updated_at
+BEFORE UPDATE ON service_node_config
+FOR EACH ROW
+EXECUTE FUNCTION touch_updated_at();

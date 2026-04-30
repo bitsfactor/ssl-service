@@ -1282,6 +1282,7 @@ def _service_to_dict(service: ServiceRecord) -> dict[str, Any]:
     "deploy_yaml": service.deploy_yaml,
     "deploy_yaml_fetched_at": _to_jsonable(service.deploy_yaml_fetched_at),
     "has_manifest": bool(service.deploy_yaml),
+    "config_schema": list(service.config_schema or []),
   }
 
 
@@ -1438,6 +1439,7 @@ def fetch_service_manifest(
       "exposed_ports": manifest.exposed_ports,
       "compose_file": manifest.compose_file,
       "install_dir_template": manifest.install_dir_template,
+      "config_schema": manifest.config_schema,
     })
     s = ctx.database.get_service(name)
 
@@ -1540,22 +1542,39 @@ def deploy_service_to_nodes(
 
   revision = (payload.get("revision") or s.default_branch or "main").strip()
   triggered_by = (payload.get("triggered_by") or "admin").strip()
-  env_file = services_deploy_mod.render_env_file(env)
-  deploy_script = services_deploy_mod.render_deploy_script(
-    manifest=manifest,
-    service_repo_url=s.github_repo_url,
-    service_branch=s.default_branch or "main",
-    revision=revision,
-    env_file_content=env_file,
-  )
-  hc_script = services_deploy_mod.render_healthcheck_script(manifest, env)
 
   from concurrent.futures import ThreadPoolExecutor
 
+  def _env_for_node(n: NodeRecord) -> dict:
+    """Merge per-(service, node) values from service_node_config on top
+    of the shared base env. Per-node config wins over service defaults
+    but loses to the explicit payload.env that the operator typed for
+    this specific deploy call."""
+    per_node_cfg = ctx.database.get_service_node_config(s.name, n.name) or {}
+    if not per_node_cfg:
+      return env
+    merged = dict(env)
+    # Per-node config slots in BEFORE payload.env precedence-wise: the
+    # base ``env`` already had payload.env applied, so we must re-apply
+    # payload.env after merging per-node config to preserve that order.
+    merged.update({k: str(v) for k, v in per_node_cfg.items()
+                   if k not in per_deploy_env_clean})
+    return merged
+
   def _deploy_one(n: NodeRecord) -> dict[str, Any]:
+    node_env = _env_for_node(n)
+    env_file = services_deploy_mod.render_env_file(node_env)
+    deploy_script = services_deploy_mod.render_deploy_script(
+      manifest=manifest,
+      service_repo_url=s.github_repo_url,
+      service_branch=s.default_branch or "main",
+      revision=revision,
+      env_file_content=env_file,
+    )
+    hc_script = services_deploy_mod.render_healthcheck_script(manifest, node_env)
     dep = ctx.database.insert_service_deployment(
       service_name=s.name, node_name=n.name,
-      revision=revision, env_snapshot=env, triggered_by=triggered_by,
+      revision=revision, env_snapshot=node_env, triggered_by=triggered_by,
     )
     try:
       r = nodes_mod.deploy_service_with_manifest(
@@ -3367,6 +3386,151 @@ def _build_router(ctx: AdminContext) -> _Router:
     return _json_response(HTTPStatus.OK,
                           fetch_service_manifest(ctx, request.path_params["name"], save=save))
 
+  def service_node_config_get_handler(request: _Request) -> _Response:
+    """Return the current per-(service, node) config plus the
+    service's config_schema so the UI can render the form."""
+    service_name = _normalize_service_name(request.path_params["name"])
+    node_name = _normalize_node_name(request.path_params["node_name"])
+    s = ctx.database.get_service(service_name)
+    if s is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"service not found: {service_name}",
+                      code="service_not_found")
+    n = ctx.database.get_node(node_name)
+    if n is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {node_name}",
+                      code="node_not_found")
+    values = ctx.database.get_service_node_config(service_name, node_name)
+    # Build effective values: schema defaults overlaid by service.default_env
+    # overlaid by saved per-node values. The form shows whichever is "live".
+    effective: dict[str, str] = {}
+    for entry in (s.config_schema or []):
+      if "default" in entry:
+        effective[entry["key"]] = str(entry["default"])
+    for k, v in (s.default_env or {}).items():
+      effective[k] = str(v)
+    for k, v in (values or {}).items():
+      effective[k] = "" if v is None else str(v)
+    return _json_response(HTTPStatus.OK, {
+      "service": service_name,
+      "node": node_name,
+      "config_schema": list(s.config_schema or []),
+      "values": values,
+      "effective": effective,
+    })
+
+  def service_node_config_put_handler(request: _Request) -> _Response:
+    """Save per-(service, node) config. Validates each value against the
+    service's config_schema entry (type / regex / min-max). Optionally
+    triggers a re-deploy with the new env so the running container
+    actually picks up the change."""
+    _require_readwrite(ctx)
+    service_name = _normalize_service_name(request.path_params["name"])
+    node_name = _normalize_node_name(request.path_params["node_name"])
+    s = ctx.database.get_service(service_name)
+    if s is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"service not found: {service_name}",
+                      code="service_not_found")
+    n = ctx.database.get_node(node_name)
+    if n is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {node_name}",
+                      code="node_not_found")
+    payload = request.json_body() or {}
+    raw_values = payload.get("values") or {}
+    if not isinstance(raw_values, dict):
+      raise HttpError(HTTPStatus.BAD_REQUEST, "values must be an object",
+                      code="invalid_values")
+    redeploy = bool(payload.get("redeploy", False))
+
+    schema = {entry["key"]: entry for entry in (s.config_schema or [])
+              if isinstance(entry, dict) and entry.get("key")}
+    cleaned: dict[str, str] = {}
+    errors: list[str] = []
+    for key, raw in raw_values.items():
+      key = str(key).strip()
+      if key not in schema:
+        # Allow unknown keys in case a manifest has been updated since
+        # the form was rendered, but skip type validation for them.
+        cleaned[key] = "" if raw is None else str(raw)
+        continue
+      entry = schema[key]
+      val = "" if raw is None else str(raw)
+      kind = entry.get("type", "string")
+      if kind == "integer":
+        if val == "" and not entry.get("required"):
+          continue
+        try:
+          ival = int(val)
+        except (TypeError, ValueError):
+          errors.append(f"{key}: must be an integer")
+          continue
+        if "min" in entry and ival < entry["min"]:
+          errors.append(f"{key}: must be >= {entry['min']}")
+          continue
+        if "max" in entry and ival > entry["max"]:
+          errors.append(f"{key}: must be <= {entry['max']}")
+          continue
+        cleaned[key] = str(ival)
+      elif kind == "boolean":
+        cleaned[key] = "true" if str(val).lower() in ("1","true","yes","on") else "false"
+      elif kind == "enum":
+        opts = entry.get("options") or []
+        if val == "" and not entry.get("required"):
+          continue
+        if opts and val not in opts:
+          errors.append(f"{key}: must be one of {opts}")
+          continue
+        cleaned[key] = val
+      else:  # string, password, textarea
+        if entry.get("required") and not val:
+          errors.append(f"{key}: required")
+          continue
+        rx = entry.get("validate")
+        if val and rx:
+          try:
+            if not re.match(rx, val):
+              errors.append(f"{key}: does not match pattern {rx}")
+              continue
+          except re.error:
+            pass  # bad regex in manifest — don't block
+        cleaned[key] = val
+
+    # Required-but-missing pass.
+    for entry in schema.values():
+      if entry.get("required") and entry["key"] not in cleaned:
+        # Allow if effective value (default/service default) covers it.
+        has_default = "default" in entry or entry["key"] in (s.default_env or {})
+        if not has_default:
+          errors.append(f"{entry['key']}: required")
+
+    if errors:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "; ".join(errors),
+                      code="invalid_values")
+
+    saved = ctx.database.upsert_service_node_config(
+      service_name, node_name, cleaned, updated_by="admin",
+    )
+
+    response: dict[str, Any] = {
+      "service": service_name,
+      "node": node_name,
+      "values": saved,
+      "redeploy_requested": redeploy,
+    }
+
+    if redeploy:
+      # Reuse the existing multi-node deploy path with this single node.
+      try:
+        deploy_result = deploy_service_to_nodes(ctx, service_name, {
+          "nodes": [node_name],
+          "triggered_by": "config_save",
+        })
+        response["redeploy"] = deploy_result
+      except HttpError as exc:
+        response["redeploy_error"] = exc.message
+
+    return _json_response(HTTPStatus.OK, response)
+
   def service_deploy_handler(request: _Request) -> _Response:
     return _json_response(
       HTTPStatus.OK,
@@ -3782,6 +3946,10 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("DELETE", "/api/services/{name}", with_auth(service_delete_handler))
   router.add("POST", "/api/services/{name}/manifest", with_auth(service_manifest_handler))
   router.add("POST", "/api/services/{name}/deploy", with_auth(service_deploy_handler))
+  router.add("GET",  "/api/services/{name}/nodes/{node_name}/config",
+             with_auth(service_node_config_get_handler))
+  router.add("PUT",  "/api/services/{name}/nodes/{node_name}/config",
+             with_auth(service_node_config_put_handler))
   router.add("GET", "/api/services/{name}/deployments", with_auth(service_deployments_handler))
 
   # Static IP endpoints ---------------------------------------------

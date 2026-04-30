@@ -3471,15 +3471,19 @@
           h("td", { class: "muted", style: "font-size: 12px" },
             st.status ? `${st.status}${st.revision ? " · " + st.revision.slice(0, 7) : ""}` : "—"),
           h("td", null,
-            h("button", { class: "btn btn-sm", title: "Probe just this node",
-              onclick: async (e) => {
-                e.preventDefault();
-                e.target.disabled = true;
-                e.target.textContent = "Probing…";
-                try { await probeNode(st.node_name); await loadFleet(false); }
-                catch (err) { toast("error", "Probe failed", err.message); }
-                finally { /* row replaced */ }
-              } }, "Probe"),
+            h("div", { class: "row", style: "gap: 4px" },
+              h("button", { class: "btn btn-sm", title: "Probe just this node",
+                onclick: async (e) => {
+                  e.preventDefault();
+                  e.target.disabled = true;
+                  e.target.textContent = "Probing…";
+                  try { await probeNode(st.node_name); await loadFleet(false); }
+                  catch (err) { toast("error", "Probe failed", err.message); }
+                } }, "Probe"),
+              h("button", { class: "btn btn-sm", title: "Edit per-node config",
+                onclick: () => openServiceNodeConfigModal(serviceName, st.node_name) },
+                "Configure"),
+            ),
           ),
         ));
       }
@@ -3564,6 +3568,171 @@
       ),
     });
     loadFleet(true);
+  }
+
+
+  // ---------------------------------------------------------------------------
+  // Service-per-node config modal — renders a form from service.config_schema,
+  // populated by service_node_config values. On Save, PUTs back; if the user
+  // ticks "redeploy", the same call triggers a re-deploy of just this node so
+  // the running container picks up the change.
+  // ---------------------------------------------------------------------------
+  async function openServiceNodeConfigModal(serviceName, nodeName) {
+    const body = h("div");
+    const title = `Configure ${serviceName} on ${nodeName}`;
+    body.appendChild(h("div", { class: "muted", style: "padding: 16px;" },
+      "Loading config…"));
+    Modal.open({ title, body });
+
+    let payload;
+    try {
+      payload = await api("GET",
+        `/api/services/${encodeURIComponent(serviceName)}/nodes/${encodeURIComponent(nodeName)}/config`);
+    } catch (err) {
+      body.innerHTML = "";
+      body.appendChild(h("div", { class: "muted", style: "color: var(--danger)" },
+        "Load failed: " + (err.message || "")));
+      return;
+    }
+
+    const schema = payload.config_schema || [];
+    const values = payload.values || {};
+    const effective = payload.effective || {};
+
+    body.innerHTML = "";
+    if (!schema.length) {
+      body.appendChild(h("div", { class: "empty" },
+        h("div", { class: "title" }, "No config schema"),
+        h("div", { class: "sub" },
+          "This service's .deploy.yaml hasn't declared a config_schema. ",
+          "Add one and re-fetch the manifest to enable visual config.")));
+      Modal.open({
+        title, body,
+        footer: h("div", { class: "row" },
+          h("div", { style: "flex: 1" }),
+          h("button", { class: "btn btn-primary", onclick: () => Modal.close() }, "Close"),
+        ),
+      });
+      return;
+    }
+
+    const form = h("form", { onsubmit: (e) => e.preventDefault() });
+    const inputs = {};
+    for (const entry of schema) {
+      const key = entry.key;
+      const live = effective[key] != null ? String(effective[key]) : "";
+      const saved = values[key] != null ? String(values[key]) : "";
+      const isOverridden = key in values;
+
+      const row = h("div", { class: "form-row", style: "margin-bottom: 12px;" });
+      const labelText = entry.label || key;
+      const labelEl = h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px;" },
+        labelText,
+        entry.required ? h("span", { style: "color: var(--danger); margin-left: 4px;" }, "*") : null,
+        h("span", { class: "muted", style: "font-weight: normal; margin-left: 8px; font-size: 11px;" },
+          key, entry.init_only ? " · init-only" : ""),
+      );
+      row.appendChild(labelEl);
+
+      let input;
+      const initialValue = isOverridden ? saved : live;
+      if (entry.type === "enum" && Array.isArray(entry.options) && entry.options.length) {
+        input = h("select", { name: key });
+        for (const opt of entry.options) {
+          const o = h("option", { value: opt }, opt);
+          if (opt === initialValue) o.selected = true;
+          input.appendChild(o);
+        }
+      } else if (entry.type === "boolean") {
+        input = h("input", { type: "checkbox", name: key });
+        input.checked = (initialValue === "true" || initialValue === "1");
+      } else if (entry.type === "textarea") {
+        input = h("textarea", { name: key, rows: 4, style: "width: 100%; font-family: monospace; font-size: 12px;" });
+        input.value = initialValue;
+      } else if (entry.type === "password") {
+        input = h("input", { type: "password", name: key, style: "width: 100%;" });
+        input.value = initialValue;
+      } else if (entry.type === "integer") {
+        input = h("input", { type: "number", name: key, style: "width: 100%;" });
+        if ("min" in entry) input.min = entry.min;
+        if ("max" in entry) input.max = entry.max;
+        input.value = initialValue;
+      } else {
+        input = h("input", { type: "text", name: key, style: "width: 100%;" });
+        if (entry.validate) input.pattern = entry.validate;
+        input.value = initialValue;
+      }
+      input.style.padding = "6px 8px";
+      input.style.border = "1px solid var(--border)";
+      input.style.borderRadius = "4px";
+      inputs[key] = { entry, input };
+      row.appendChild(input);
+
+      if (entry.help) {
+        row.appendChild(h("div", { class: "muted", style: "font-size: 11px; margin-top: 3px;" },
+          entry.help));
+      }
+      const liveLine = h("div", { class: "muted", style: "font-size: 11px; margin-top: 2px;" });
+      if (isOverridden) {
+        liveLine.appendChild(h("span", { style: "color: var(--accent)" },
+          "saved override · "));
+      } else if (live) {
+        liveLine.appendChild(h("span", null, "default · current effective: "));
+        liveLine.appendChild(h("span", { class: "mono" }, live));
+      }
+      if (liveLine.children.length) row.appendChild(liveLine);
+      form.appendChild(row);
+    }
+    body.appendChild(form);
+
+    const errorEl = h("div", { class: "muted", style: "color: var(--danger); margin-top: 8px;" });
+    body.appendChild(errorEl);
+
+    const redeployCheck = h("input", { type: "checkbox", id: "snc-redeploy", checked: true });
+    const footer = h("div", { class: "row", style: "gap: 8px; align-items: center;" },
+      h("label", { for: "snc-redeploy", style: "font-size: 13px; display: flex; align-items: center; gap: 6px;" },
+        redeployCheck, "Re-deploy after save (restart container with new env)"),
+      h("div", { style: "flex: 1" }),
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { class: "btn btn-primary",
+        onclick: async (e) => {
+          e.preventDefault();
+          errorEl.textContent = "";
+          const out = {};
+          for (const [key, { entry, input }] of Object.entries(inputs)) {
+            if (entry.type === "boolean") {
+              out[key] = input.checked ? "true" : "false";
+            } else {
+              const v = input.value;
+              if (v == null || v === "") {
+                // Skip empty values so they fall back to defaults rather
+                // than persisting "" (which would block first-deploy
+                // env-vs-default semantics).
+                continue;
+              }
+              out[key] = v;
+            }
+          }
+          e.target.disabled = true;
+          e.target.textContent = "Saving…";
+          try {
+            const r = await api("PUT",
+              `/api/services/${encodeURIComponent(serviceName)}/nodes/${encodeURIComponent(nodeName)}/config`,
+              { values: out, redeploy: redeployCheck.checked });
+            const msg = redeployCheck.checked
+              ? `Saved + ${r.redeploy && r.redeploy.success ? "redeployed" : "redeploy failed"}`
+              : "Saved";
+            toast("success", msg, "");
+            Modal.close();
+          } catch (err) {
+            errorEl.textContent = err.message || "save failed";
+            e.target.disabled = false;
+            e.target.textContent = "Save";
+          }
+        } }, "Save"),
+    );
+
+    Modal.open({ title, body, footer });
   }
 
 

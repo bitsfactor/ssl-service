@@ -143,6 +143,10 @@ class ServiceRecord:
   exposed_ports: list[int] = None  # type: ignore[assignment]
   deploy_yaml: str | None = None
   deploy_yaml_fetched_at: datetime | None = None
+  # config_schema — list of {key, label, type, default, help, validate, options, init_only}
+  # entries that the admin renders as a per-(service, node) form. Empty list
+  # means "this service has no per-instance config" and the form is hidden.
+  config_schema: list[dict] = None  # type: ignore[assignment]
 
   def __post_init__(self) -> None:
     if self.required_env is None:
@@ -153,6 +157,8 @@ class ServiceRecord:
       self.depends_on = []
     if self.exposed_ports is None:
       self.exposed_ports = []
+    if self.config_schema is None:
+      self.config_schema = []
 
 
 @dataclass(slots=True)
@@ -1190,7 +1196,8 @@ class Database:
     "COALESCE(healthcheck, '{}'::jsonb) AS healthcheck, "
     "COALESCE(depends_on, ARRAY[]::TEXT[]) AS depends_on, "
     "COALESCE(exposed_ports, ARRAY[]::INTEGER[]) AS exposed_ports, "
-    "deploy_yaml, deploy_yaml_fetched_at"
+    "deploy_yaml, deploy_yaml_fetched_at, "
+    "COALESCE(config_schema, '[]'::jsonb) AS config_schema"
   )
 
   @staticmethod
@@ -1221,6 +1228,7 @@ class Database:
       exposed_ports=[int(p) for p in (row.get("exposed_ports") or [])],
       deploy_yaml=row.get("deploy_yaml"),
       deploy_yaml_fetched_at=row.get("deploy_yaml_fetched_at"),
+      config_schema=list(row.get("config_schema") or []),
     )
 
   def list_services(self) -> list[ServiceRecord]:
@@ -1286,7 +1294,8 @@ class Database:
                "compose_template", "config_files",
                # Manifest fields written by the deploy machinery.
                "required_env", "healthcheck", "depends_on", "exposed_ports",
-               "deploy_yaml", "deploy_yaml_fetched_at"}
+               "deploy_yaml", "deploy_yaml_fetched_at",
+               "config_schema"}
     sets = []
     params: dict = {"name": name}
     for k, v in fields.items():
@@ -1295,6 +1304,9 @@ class Database:
       if k in ("default_env", "config_files", "healthcheck"):
         sets.append(f"{k} = %({k})s::jsonb")
         params[k] = _json.dumps(v or {})
+      elif k == "config_schema":
+        sets.append(f"{k} = %({k})s::jsonb")
+        params[k] = _json.dumps(v or [])
       elif k in ("required_env", "depends_on"):
         sets.append(f"{k} = %({k})s")
         params[k] = list(v or [])
@@ -2035,6 +2047,71 @@ class Database:
     "private_key", "public_key", "fingerprint_sha256", "key_type", "bits",
     "source",
   })
+
+  # ---------- Per-(service, node) config (the visual config framework) ----
+
+  def get_service_node_config(self, service_name: str, node_name: str) -> dict:
+    """Return the saved {env_key: value} dict for this (service, node).
+    Empty dict if no row exists yet — the deploy step will fall back to
+    service.default_env / manifest.defaults in that case."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          "SELECT values FROM service_node_config WHERE service_name = %s AND node_name = %s",
+          (service_name, node_name),
+        )
+        row = cursor.fetchone()
+        if row is None:
+          return {}
+        return dict(row.get("values") or {})
+
+  def upsert_service_node_config(
+    self, service_name: str, node_name: str, values: dict, *,
+    updated_by: str | None = None,
+  ) -> dict:
+    """Replace the row's values with the supplied dict. Caller is
+    responsible for validating keys against the service's config_schema."""
+    import json as _json
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          INSERT INTO service_node_config (service_name, node_name, values, updated_at, updated_by)
+          VALUES (%s, %s, %s::jsonb, NOW(), %s)
+          ON CONFLICT (service_name, node_name) DO UPDATE SET
+            values = EXCLUDED.values,
+            updated_at = NOW(),
+            updated_by = EXCLUDED.updated_by
+          RETURNING values
+          """,
+          (service_name, node_name, _json.dumps(values or {}), updated_by),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    return dict((row or {}).get("values") or {})
+
+  def list_service_node_configs(self, service_name: str) -> list[dict]:
+    """All saved per-node configs for a single service. Used by the
+    Service detail page to show 'configured nodes' alongside the
+    rendered form."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """SELECT service_name, node_name, values, updated_at, updated_by
+             FROM service_node_config WHERE service_name = %s
+             ORDER BY node_name ASC""",
+          (service_name,),
+        )
+        return [
+          {
+            "service_name": r["service_name"],
+            "node_name": r["node_name"],
+            "values": dict(r.get("values") or {}),
+            "updated_at": r.get("updated_at"),
+            "updated_by": r.get("updated_by"),
+          }
+          for r in cursor.fetchall()
+        ]
 
   def _row_to_ssh_key(self, row: dict) -> SshKeyRecord:
     return SshKeyRecord(
