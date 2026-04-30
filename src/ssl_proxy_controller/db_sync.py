@@ -370,13 +370,17 @@ def analyze_sync(
 def _bind_value(v: Any) -> Any:
   """Convert Python values into a form psycopg can bind for INSERT.
 
-  psycopg auto-adapts native scalars (str/int/datetime/bool) but does
-  NOT adapt ``dict`` / ``list`` to JSONB — they have to be wrapped in
-  ``Jsonb(...)``. Without this we hit
-  ``ProgrammingError: cannot adapt type 'dict' using placeholder '%s'``
-  on tables with jsonb columns (system_config.value, services.default_env,
-  static_ips.metadata, etc.)."""
-  if isinstance(v, (dict, list)):
+  Only ``dict`` gets wrapped in ``Jsonb(...)``. psycopg auto-adapts:
+    - scalars (str/int/datetime/bool) → native PG types
+    - list → text[] / PG array (our list columns: ssh_keys.tags,
+            nodes.tags, services.required_env are all text[])
+  Wrapping a list in Jsonb would store it as JSONB and fail on text[]
+  columns with ``DatatypeMismatch: column ... is of type text[] but
+  expression is of type jsonb``.
+
+  If we ever need a JSONB column that holds a list value, we'd handle
+  that per-column rather than globally."""
+  if isinstance(v, dict):
     return Jsonb(v)
   return v
 
