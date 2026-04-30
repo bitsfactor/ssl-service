@@ -670,8 +670,58 @@
       `${(c.certificates_expiring_soon ?? 0)} expiring · ${(c.certificates_expired ?? 0)} expired`,
       (c.certificates_expired ?? 0) > 0 ? "danger" : (c.certificates_expiring_soon ?? 0) > 0 ? "warn" : null));
     stats.appendChild(statCard("DNS zones", c.zones_total ?? "—", "Cloudflare tokens"));
+    // Services across the fleet — populated async from /api/services-summary.
+    // Wraps the card in a link that takes the user to the Services tab.
+    const servicesCard = statCard("Services", "—", "loading…");
+    servicesCard.style.cursor = "pointer";
+    servicesCard.onclick = () => { location.hash = "#/services"; };
+    servicesCard.id = "stat-services";
+    stats.appendChild(servicesCard);
     stats.appendChild(statCard("Mode", (o.mode || "—").toUpperCase(), (o.acme_email ? `ACME: ${o.acme_email}` : "readonly node")));
     root.appendChild(stats);
+
+    // Async fill the Services card so the Dashboard renders without
+    // blocking on the summary query.
+    api("GET", "/api/services-summary").then((sr) => {
+      const card = document.getElementById("stat-services");
+      if (!card) return;
+      const arr = sr.services || [];
+      const totalServices = arr.length;
+      const totalRunning = arr.reduce((a, b) => a + (b.running || 0), 0);
+      const totalUnhealthy = arr.reduce((a, b) => a + (b.unhealthy || 0), 0);
+      const totalDeployed = arr.reduce((a, b) => a + (b.total || 0), 0);
+      const valEl = card.querySelector(".value");
+      const subEl = card.querySelector(".sub");
+      if (valEl) {
+        // 0 services in catalog → "—". Catalog has services but none deployed →
+        // show service count (avoids the misleading "0/0" reading).
+        if (totalServices === 0) {
+          valEl.textContent = "—";
+        } else if (totalDeployed === 0) {
+          valEl.textContent = String(totalServices);
+        } else {
+          valEl.textContent = `${totalRunning}/${totalDeployed}`;
+        }
+        if (totalUnhealthy > 0) valEl.className = "value danger";
+      }
+      if (subEl) {
+        if (totalServices === 0) {
+          subEl.textContent = "no services registered";
+        } else if (totalDeployed === 0) {
+          subEl.textContent = `${totalServices} service${totalServices === 1 ? "" : "s"} · none deployed yet`;
+        } else {
+          const parts = [`${totalServices} service${totalServices === 1 ? "" : "s"}`];
+          if (totalUnhealthy > 0) parts.push(`${totalUnhealthy} unhealthy`);
+          subEl.textContent = parts.join(" · ");
+        }
+      }
+    }).catch((err) => {
+      // Old admin without the endpoint — show a friendly fallback.
+      const card = document.getElementById("stat-services");
+      if (!card) return;
+      const subEl = card.querySelector(".sub");
+      if (subEl) subEl.textContent = err.status === 404 ? "(restart admin)" : "(load failed)";
+    });
 
     // Recent routes card
     const routesCard = h("div", { class: "card" });
@@ -1677,15 +1727,16 @@
       }
     }));
 
-    // Poll every 4s. Stop when all terminal (completed/failed).
+    // Poll every 4s. Stop when all terminal (success/failed).
     const succeeded = [];
-    const terminal = (s) => s === "completed" || s === "failed" || s === "failed_to_start";
+    const terminal = (s) => s === "completed" || s === "success" || s === "failed" || s === "failed_to_start";
+    const isOk = (s) => s === "completed" || s === "success";
     const poll = async () => {
       const pending = initNodes.filter((n) => !terminal(stateByNode[n].status));
       if (!pending.length) {
         // All done — gather successes and chain into deploy.
         for (const n of initNodes) {
-          if (stateByNode[n].status === "completed") succeeded.push(n);
+          if (isOk(stateByNode[n].status)) succeeded.push(n);
         }
         Modal.close();
         if (succeeded.length) {
@@ -1922,6 +1973,63 @@
     } else {
       body.appendChild(h("div", { class: "muted", style: "padding: 8px 0;" }, "Not yet probed."));
     }
+
+    // Services on this node — managed (matched against registered services)
+    // and unmanaged (other containers visible on the box).
+    const hasContainerData = !!(status && status.raw_probe
+      && status.raw_probe.containers !== undefined);
+    const containers = hasContainerData ? (status.raw_probe.containers || []) : [];
+    const servicesWrap = h("div", { style: "margin-bottom: 14px;" });
+    servicesWrap.appendChild(h("div", { style: "font-weight: 600; margin: 6px 0 4px 0;" },
+      hasContainerData
+        ? `Services on this node (${containers.length} container${containers.length === 1 ? "" : "s"})`
+        : "Services on this node"));
+    if (!hasContainerData) {
+      // Old probe data (or never probed). Don't claim "0 containers".
+      servicesWrap.appendChild(h("div", { class: "muted", style: "padding: 4px 0;" },
+        "Probe this node to enumerate containers."));
+    } else if (!containers.length) {
+      servicesWrap.appendChild(h("div", { class: "muted", style: "padding: 4px 0;" },
+        "No containers on this node."));
+    } else {
+      try {
+        const sresp = await api("GET", "/api/services").catch(() => ({ services: [] }));
+        const known = new Set((sresp.services || []).map((s) => s.name));
+        const managed = containers.filter((c) => known.has(c.name));
+        const unmanaged = containers.filter((c) => !known.has(c.name));
+        if (managed.length) {
+          const tbl = h("table", { class: "data" });
+          const tb = h("tbody");
+          for (const c of managed) {
+            tb.appendChild(h("tr", null,
+              h("td", { class: "mono" }, c.name),
+              h("td", null, c.state === "running"
+                ? h("span", { class: "badge ok" }, h("span", { class: "dot" }), "running")
+                : h("span", { class: "badge warn" }, c.state || "?")),
+              h("td", { class: "mono", style: "font-size: 11.5px" }, c.image),
+              h("td", { class: "muted", style: "font-size: 11.5px" }, c.status_str),
+            ));
+          }
+          tbl.appendChild(tb);
+          servicesWrap.appendChild(h("div", { class: "muted", style: "font-size: 11.5px; margin-top: 6px;" },
+            `Managed (${managed.length})`));
+          servicesWrap.appendChild(tbl);
+        }
+        if (unmanaged.length) {
+          servicesWrap.appendChild(h("div", { class: "muted", style: "font-size: 11.5px; margin-top: 10px;" },
+            `Unmanaged (${unmanaged.length}) — not registered as services`));
+          servicesWrap.appendChild(h("div", { class: "mono muted", style: "font-size: 11.5px;" },
+            unmanaged.map((c) => `${c.name} (${c.state})`).join(", ")));
+        }
+        if (!managed.length && !unmanaged.length) {
+          servicesWrap.appendChild(h("div", { class: "muted", style: "padding: 4px 0;" }, "—"));
+        }
+      } catch (_) {
+        servicesWrap.appendChild(h("div", { class: "muted", style: "padding: 4px 0;" },
+          containers.map((c) => `${c.name} (${c.state})`).join(", ")));
+      }
+    }
+    body.appendChild(servicesWrap);
 
     body.appendChild(section("Initialization defaults", [
       ["Desired SSH port", node.init_desired_ssh_port],
@@ -2915,15 +3023,27 @@
     card.appendChild(body);
     root.appendChild(card);
     try {
-      const resp = await api("GET", "/api/services");
+      // Pull catalog + summary in parallel — summary is the new
+      // /api/services-summary that joins service_node_state to give
+      // per-service running/absent/unhealthy counts. Fall back to
+      // catalog-only on older backends that don't have the endpoint.
+      const [resp, summaryResp] = await Promise.all([
+        api("GET", "/api/services"),
+        api("GET", "/api/services-summary").catch((err) => {
+          if (err.status === 404) return { services: [] };
+          throw err;
+        }),
+      ]);
       const rows = resp.services || [];
+      const summaryByName = {};
+      for (const s of (summaryResp.services || [])) summaryByName[s.name] = s;
       document.getElementById("services-count").textContent = `${rows.length} service${rows.length === 1 ? "" : "s"}`;
       if (!rows.length) {
         body.appendChild(h("div", { class: "empty" },
           h("div", { class: "title" }, "No services registered"),
           h("div", { class: "sub" }, App.mode === "readwrite" ? "Add your first service to make it deployable from the Nodes page." : "Read-only admin.")));
       } else {
-        body.appendChild(renderServicesTable(rows));
+        body.appendChild(renderServicesTable(rows, summaryByName));
       }
     } catch (err) {
       if (err.status === 401) showLogin();
@@ -2931,13 +3051,15 @@
     }
   }
 
-  function renderServicesTable(services) {
+  function renderServicesTable(services, summaryByName) {
+    summaryByName = summaryByName || {};
     const table = h("table", { class: "data" });
     table.appendChild(h("thead", null,
       h("tr", null,
         h("th", null, "Name"),
         h("th", null, "Repo"),
         h("th", null, "Manifest"),
+        h("th", null, "Per-node status"),
         h("th", null, "Branch"),
         h("th", null, "Updated"),
         h("th", null, ""),
@@ -2986,11 +3108,34 @@
       } else {
         manifestCell.appendChild(h("span", { class: "badge warn" }, "not synced"));
       }
+      const summary = summaryByName[s.name] || { running: 0, unhealthy: 0, absent: 0, total: 0, other: 0 };
+      const fleetCell = h("td", { style: "cursor: pointer", title: "Click to view per-node status",
+        onclick: () => openServiceFleetModal(s.name) });
+      if (summary.total === 0) {
+        fleetCell.appendChild(h("span", { class: "muted", style: "font-size: 12px" }, "no nodes yet"));
+      } else {
+        if (summary.running) {
+          fleetCell.appendChild(h("span", { class: "badge ok" },
+            h("span", { class: "dot" }), `${summary.running} running`));
+        }
+        if (summary.unhealthy) {
+          fleetCell.appendChild(h("span", { class: "badge danger", style: "margin-left: 4px" },
+            h("span", { class: "dot" }), `${summary.unhealthy} unhealthy`));
+        }
+        if (summary.absent) {
+          fleetCell.appendChild(h("span", { class: "badge", style: "margin-left: 4px" },
+            `${summary.absent} absent`));
+        }
+        if (!summary.running && !summary.unhealthy && !summary.absent && summary.other) {
+          fleetCell.appendChild(h("span", { class: "badge warn" }, `${summary.other} other`));
+        }
+      }
       tbody.appendChild(h("tr", null,
         h("td", { class: "domain" }, s.name,
           s.description ? h("div", { class: "muted", style: "font-size: 11px; margin-top: 2px" }, s.description) : null),
         h("td", { class: "mono", style: "font-size: 12px" }, s.github_repo_url),
         manifestCell,
+        fleetCell,
         h("td", { class: "mono", style: "font-size: 12px" }, s.default_branch),
         h("td", { class: "muted" }, fmtRelative(s.updated_at)),
         actions,
@@ -3215,6 +3360,153 @@
       h("button", { class: "btn", onclick: () => Modal.close() }, "Close"));
     Modal.open({ title: "Deploy report", body, footer });
   }
+
+  // Per-service "Fleet" modal: live container state per node, with a
+  // Refresh button that fans out probes to all nodes that have a row
+  // for this service. Generic — works for ssl-service, api-gateway, etc.
+  //
+  // All DOM refs are kept in closure (NOT looked up via getElementById)
+  // so two modals opened in quick succession can't write into each
+  // other's elements (review R12.1).
+  async function openServiceFleetModal(serviceName) {
+    const body = h("div");
+    const stampEl = h("div", { class: "muted", style: "flex: 1; font-size: 12px;" }, "Loading…");
+    const refreshBtn = h("button", { class: "btn btn-sm",
+      onclick: () => refreshFleet() }, "Refresh");
+    const header = h("div", { class: "row",
+      style: "gap: 8px; align-items: center; margin-bottom: 12px;" },
+      stampEl, refreshBtn);
+    body.appendChild(header);
+    const tableWrap = h("div", null,
+      h("div", { class: "muted", style: "padding: 16px; text-align: center" }, "Loading…"));
+    body.appendChild(tableWrap);
+
+    const renderTable = (states) => {
+      tableWrap.innerHTML = "";
+      if (!states || !states.length) {
+        tableWrap.appendChild(h("div", { class: "empty" },
+          h("div", { class: "title" }, "No node state yet"),
+          h("div", { class: "sub" }, "Deploy this service to a node to see it appear here.")));
+        return;
+      }
+      const tbl = h("table", { class: "data" });
+      tbl.appendChild(h("thead", null, h("tr", null,
+        h("th", null, "Node"),
+        h("th", null, "Container"),
+        h("th", null, "Image"),
+        h("th", null, "Health"),
+        h("th", null, "Last seen"),
+        h("th", null, "Last deploy"),
+        h("th", null, ""),
+      )));
+      const tb = h("tbody");
+      const stateBadge = (s) => {
+        const t = (s || "").toLowerCase();
+        if (t === "running") return h("span", { class: "badge ok" }, h("span", { class: "dot" }), "running");
+        if (t === "absent") return h("span", { class: "badge" }, "absent");
+        if (t === "exited" || t === "dead") return h("span", { class: "badge danger" }, h("span", { class: "dot" }), t);
+        if (t === "restarting" || t === "created" || t === "paused") return h("span", { class: "badge warn" }, h("span", { class: "dot" }), t);
+        return h("span", { class: "badge muted" }, t || "unknown");
+      };
+      const healthBadge = (ok) => {
+        if (ok === true) return h("span", { class: "badge ok" }, "✓");
+        if (ok === false) return h("span", { class: "badge danger" }, "✗");
+        return h("span", { class: "muted" }, "—");
+      };
+      for (const st of states) {
+        tb.appendChild(h("tr", null,
+          h("td", { class: "mono" }, st.node_name),
+          h("td", null, stateBadge(st.container_state)),
+          h("td", { class: "mono", style: "font-size: 11.5px" }, st.container_image || "—"),
+          h("td", null, healthBadge(st.healthcheck_ok)),
+          h("td", { class: "muted", style: "font-size: 12px" },
+            st.last_observed_at ? fmtRelative(st.last_observed_at) : "never"),
+          h("td", { class: "muted", style: "font-size: 12px" },
+            st.status ? `${st.status}${st.revision ? " · " + st.revision.slice(0, 7) : ""}` : "—"),
+          h("td", null,
+            h("button", { class: "btn btn-sm", title: "Probe just this node",
+              onclick: async (e) => {
+                e.preventDefault();
+                e.target.disabled = true;
+                e.target.textContent = "Probing…";
+                try { await probeNode(st.node_name); await loadFleet(false); }
+                catch (err) { toast("error", "Probe failed", err.message); }
+                finally { /* row replaced */ }
+              } }, "Probe"),
+          ),
+        ));
+      }
+      tbl.appendChild(tb);
+      const wrap = h("div", { class: "table-wrap" });
+      wrap.appendChild(tbl);
+      tableWrap.appendChild(wrap);
+    };
+
+    const loadFleet = async (showSpinner = true) => {
+      if (showSpinner) {
+        tableWrap.innerHTML = "";
+        tableWrap.appendChild(h("div", { class: "muted", style: "padding: 16px; text-align: center" }, "Loading…"));
+      }
+      try {
+        const r = await api("GET", `/api/services/${encodeURIComponent(serviceName)}/nodes`);
+        renderTable(r.states || []);
+        const newest = (r.states || []).reduce((a, b) =>
+          (a && a.last_observed_at && (!b.last_observed_at || a.last_observed_at > b.last_observed_at)) ? a : b, null);
+        if (newest && newest.last_observed_at) {
+          stampEl.textContent = `Last observed: ${fmtRelative(newest.last_observed_at)}`;
+        } else {
+          stampEl.textContent = "Never observed";
+        }
+      } catch (err) {
+        if (err.code === "service_not_found") {
+          toast("error", "Service not registered", `${serviceName} isn't in the catalog`);
+          Modal.close();
+          return;
+        }
+        tableWrap.innerHTML = "";
+        tableWrap.appendChild(h("div", { class: "muted", style: "padding: 16px; color: var(--danger)" },
+          "Load failed: " + (err.message || "")));
+      }
+    };
+
+    const refreshFleet = async () => {
+      refreshBtn.disabled = true;
+      refreshBtn.textContent = "Refreshing…";
+      stampEl.textContent = "Probing all nodes…";
+      try {
+        const r = await api("POST", `/api/services/${encodeURIComponent(serviceName)}/refresh`, {});
+        if (r && r.message) {
+          // Backend signaled "no node has a state row yet — deploy first".
+          stampEl.textContent = r.message;
+          renderTable([]);
+        } else {
+          await loadFleet(false);
+        }
+      } catch (err) {
+        if (err.code === "service_not_found") {
+          toast("error", "Service not registered", `${serviceName} isn't in the catalog`);
+          Modal.close();
+          return;
+        }
+        toast("error", "Refresh failed", err.message);
+      } finally {
+        refreshBtn.disabled = false;
+        refreshBtn.textContent = "Refresh";
+      }
+    };
+
+    Modal.open({
+      title: `${serviceName} · Per-node status`,
+      body,
+      footer: h("div", { class: "row" },
+        h("button", { class: "btn", onclick: () => openServiceHistoryModal(serviceName) }, "Deploy history"),
+        h("div", { style: "flex: 1" }),
+        h("button", { class: "btn btn-primary", onclick: () => Modal.close() }, "Close"),
+      ),
+    });
+    loadFleet(true);
+  }
+
 
   async function openServiceHistoryModal(serviceName) {
     let r;

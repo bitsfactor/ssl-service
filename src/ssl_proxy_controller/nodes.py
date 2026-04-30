@@ -235,9 +235,44 @@ emit SERVICE_VERSION 'cat /opt/ssl-service/VERSION 2>/dev/null || cat /root/ssl-
 emit SERVICE_INSTALLED 'test -d /opt/ssl-service && echo yes; test -d /root/ssl-service && echo yes; command -v ssl-service >/dev/null 2>&1 && echo yes; true'
 emit SERVICE_MODE 'grep -E "^\s*mode:" /opt/ssl-service/config.yaml /root/ssl-service/config.yaml /etc/ssl-service/config.yaml 2>/dev/null | head -1 | awk -F: "{print \$3}" | tr -d " " '
 emit SERVICE_GIT 'cd /opt/ssl-service 2>/dev/null && git rev-parse --short HEAD; cd /root/ssl-service 2>/dev/null && git rev-parse --short HEAD; true'
-emit SERVICE_CONTAINER 'docker inspect -f "{{.State.Status}}" ssl-service 2>/dev/null || echo none'
 emit DOCKER_INSTALLED 'command -v docker >/dev/null 2>&1 && echo yes || echo no'
+emit ALL_CONTAINERS 'command -v docker >/dev/null 2>&1 && docker ps -a --no-trunc --format "{{json .}}" 2>/dev/null || true'
 """
+
+
+def _parse_containers(text: str) -> list[dict[str, str]]:
+  """Parse the ALL_CONTAINERS section into a list of normalized dicts.
+
+  Each line is one ``docker ps --format '{{json .}}'`` object, e.g.
+  ``{"Names":"ssl-service","State":"running","Image":"ssl-service:local",
+     "Status":"Up 5 minutes (healthy)","RunningFor":"5 minutes","CreatedAt":"..."}``
+
+  We pick out a stable subset, lowercase the state, and skip any line
+  that isn't valid JSON or is missing a name (defensive — shells can
+  inject leading warnings or older docker versions can omit fields).
+  """
+  import json as _json
+  out: list[dict[str, str]] = []
+  for line in (text or "").splitlines():
+    line = line.strip()
+    if not line or not line.startswith("{"):
+      continue
+    try:
+      obj = _json.loads(line)
+    except Exception:  # noqa: BLE001
+      continue
+    name = (obj.get("Names") or obj.get("Name") or "").strip()
+    if not name:
+      continue
+    out.append({
+      "name": name,
+      "state": (obj.get("State") or "").strip().lower(),
+      "image": (obj.get("Image") or "").strip(),
+      "status_str": (obj.get("Status") or "").strip(),
+      "running_for": (obj.get("RunningFor") or "").strip(),
+      "created_at": (obj.get("CreatedAt") or "").strip(),
+    })
+  return out
 
 
 def _parse_probe_output(text: str) -> dict[str, str]:
@@ -317,17 +352,18 @@ def probe_node(node: NodeRecord, *, linked_keys: list[dict] | None = None) -> No
     if sections.get("DISK"):
       status.disk_usage = sections["DISK"]
 
-    # Container state (preferred — this is the standardized deploy path)
-    container_state = sections.get("SERVICE_CONTAINER", "").strip().splitlines()
-    container_running = False
-    container_present = False
-    if container_state:
-      first = container_state[0].strip().lower()
-      if first == "running":
-        container_running = True
-        container_present = True
-      elif first in ("created", "restarting", "paused", "exited", "dead", "removing"):
-        container_present = True
+    # Parse the unified ALL_CONTAINERS section (one per managed service
+    # going forward). We derive the legacy `service_running` / `service_installed`
+    # for "ssl-service" specifically so the existing Nodes-page badge keeps
+    # working until we migrate the column.
+    containers = _parse_containers(sections.get("ALL_CONTAINERS", ""))
+    status.raw_probe = {
+      **(status.raw_probe or {}),
+      "containers": containers,
+    }
+    ssl = next((c for c in containers if c["name"] == "ssl-service"), None)
+    container_running = bool(ssl and ssl["state"] == "running")
+    container_present = ssl is not None
 
     # systemd active flag (legacy install path)
     systemd_running = False
@@ -351,7 +387,7 @@ def probe_node(node: NodeRecord, *, linked_keys: list[dict] | None = None) -> No
     inst_text = sections.get("SERVICE_INSTALLED", "")
     if container_present or "yes" in inst_text:
       status.service_installed = True
-    elif inst_text == "" and not container_state:
+    elif inst_text == "" and not containers:
       status.service_installed = None
     else:
       status.service_installed = False

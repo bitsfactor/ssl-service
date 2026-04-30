@@ -983,8 +983,92 @@ def probe_node_action(ctx: AdminContext, name: str) -> dict[str, Any]:
     raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {name}", code="node_not_found")
   status = nodes_mod.probe_node(node, linked_keys=_ssh_credentials_for_node(ctx, node.name))
   ctx.database.upsert_node_status(status)
+  reconcile_node_services(ctx, node.name, status)
   LOGGER.info("admin.probe_node name=%s reachable=%s err=%s", name, status.reachable, status.last_probe_error or "")
   return _node_status_to_dict(status) or {}
+
+
+def reconcile_node_services(
+  ctx: AdminContext, node_name: str, status: NodeStatusRecord,
+  *, services: list | None = None,
+) -> None:
+  """Match every container we just observed on ``node_name`` against the
+  registered services list and update the (service, node) liveness row.
+
+  Rules (intentionally conservative — see review R6.1):
+
+  - container present  → upsert with the observed state/image/health.
+    A new row is materialized on first sight.
+  - container missing AND a row already exists for this (svc, node)
+    pair → update it to ``absent``.
+  - container missing AND no prior row → do nothing. We don't generate
+    rows out of thin air, otherwise every newly-registered service
+    would instantly show up as "absent" on every probed node.
+
+  Untracked containers (no matching registered service) are *not*
+  persisted — the Node detail view surfaces them from raw_probe.
+
+  ``services`` lets callers (e.g. the parallel refresh path) hand in a
+  pre-fetched catalog so we don't issue one ``list_services()`` per
+  probed node.
+  """
+  if not status.reachable:
+    return
+  containers = []
+  if status.raw_probe and isinstance(status.raw_probe, dict):
+    containers = status.raw_probe.get("containers") or []
+  by_name: dict[str, dict] = {c["name"]: c for c in containers if c.get("name")}
+  observed_at = datetime.now(tz=UTC)
+  if services is None:
+    try:
+      services = ctx.database.list_services()
+    except Exception:
+      LOGGER.exception("reconcile_node_services: list_services failed")
+      return
+
+  # Existing rows for this node tell us which absent rows are
+  # legitimate to update vs. which new rows we must NOT create.
+  try:
+    existing_for_node = ctx.database.list_service_node_states_for_node(node_name)
+  except Exception:
+    LOGGER.exception("reconcile_node_services: list_for_node failed")
+    return
+  existing_svc_names: set[str] = {r.service_name for r in existing_for_node}
+
+  to_upsert: list[dict] = []
+  for svc in services:
+    c = by_name.get(svc.name)
+    if c is None:
+      if svc.name not in existing_svc_names:
+        continue                     # don't manufacture an absent row
+      to_upsert.append({
+        "service_name": svc.name, "node_name": node_name,
+        "container_state": "absent", "container_image": None,
+        "container_started_at": None, "healthcheck_ok": None,
+        "observed_at": observed_at,
+      })
+      continue
+    state = (c.get("state") or "").lower() or None
+    healthy = None
+    sstr = (c.get("status_str") or "").lower()
+    if "unhealthy" in sstr:
+      healthy = False
+    elif "healthy" in sstr:
+      healthy = True
+    to_upsert.append({
+      "service_name": svc.name, "node_name": node_name,
+      "container_state": state, "container_image": c.get("image"),
+      "container_started_at": None, "healthcheck_ok": healthy,
+      "observed_at": observed_at,
+    })
+
+  if not to_upsert:
+    return
+  try:
+    ctx.database.bulk_upsert_service_node_liveness(to_upsert)
+  except Exception:
+    LOGGER.exception("reconcile_node_services: bulk upsert failed node=%s rows=%d",
+                     node_name, len(to_upsert))
 
 
 def deploy_node_service(ctx: AdminContext, node_name: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1523,17 +1607,131 @@ def list_service_node_states(
   ctx: AdminContext, *, service_name: str | None = None,
 ) -> list[dict[str, Any]]:
   rows = ctx.database.list_service_node_states(service_name=service_name)
-  return [
-    {
-      "service_name": r.service_name,
-      "node_name": r.node_name,
-      "revision": r.revision,
-      "status": r.status,
-      "last_deployment_id": r.last_deployment_id,
-      "updated_at": _to_jsonable(r.updated_at),
+  return [_service_node_state_to_dict(r) for r in rows]
+
+
+def _service_node_state_to_dict(r) -> dict[str, Any]:
+  return {
+    "service_name": r.service_name,
+    "node_name": r.node_name,
+    "revision": r.revision,
+    "status": r.status,
+    "last_deployment_id": r.last_deployment_id,
+    "updated_at": _to_jsonable(r.updated_at),
+    "container_state": r.container_state,
+    "container_image": r.container_image,
+    "container_started_at": _to_jsonable(r.container_started_at),
+    "healthcheck_ok": r.healthcheck_ok,
+    "last_observed_at": _to_jsonable(r.last_observed_at),
+  }
+
+
+def services_summary(ctx: AdminContext) -> list[dict[str, Any]]:
+  """One row per registered service: counts of nodes by container_state.
+  Used by the Dashboard stat card and the Services list page."""
+  by_service: dict[str, dict[str, int]] = {}
+  states = ctx.database.list_service_node_states()
+  for r in states:
+    bucket = by_service.setdefault(r.service_name, {
+      "running": 0, "absent": 0, "unhealthy": 0, "other": 0, "total": 0,
+    })
+    bucket["total"] += 1
+    state = (r.container_state or "absent").lower()
+    if state == "running":
+      if r.healthcheck_ok is False:
+        bucket["unhealthy"] += 1
+      else:
+        bucket["running"] += 1
+    elif state == "absent":
+      bucket["absent"] += 1
+    elif state in ("exited", "dead", "restarting", "created", "paused", "removing"):
+      bucket["unhealthy"] += 1
+    else:
+      bucket["other"] += 1
+
+  out: list[dict[str, Any]] = []
+  for svc in ctx.database.list_services():
+    counts = by_service.get(svc.name, {
+      "running": 0, "absent": 0, "unhealthy": 0, "other": 0, "total": 0,
+    })
+    out.append({
+      "name": svc.name,
+      "github_repo_url": svc.github_repo_url,
+      "has_manifest": bool(svc.deploy_yaml),
+      "running": counts["running"],
+      "unhealthy": counts["unhealthy"],
+      "absent": counts["absent"],
+      "other": counts["other"],
+      "total": counts["total"],
+    })
+  return out
+
+
+def list_service_node_status(
+  ctx: AdminContext, name: str,
+) -> list[dict[str, Any]]:
+  """All node rows for a single service. Used by the per-service detail
+  view's "Per-node status" table. 404 on unknown service so typos in
+  the URL surface."""
+  name = _normalize_service_name(name)
+  if ctx.database.get_service(name) is None:
+    raise HttpError(HTTPStatus.NOT_FOUND, f"service not found: {name}", code="service_not_found")
+  return list_service_node_states(ctx, service_name=name)
+
+
+def refresh_service_nodes(
+  ctx: AdminContext, name: str,
+) -> dict[str, Any]:
+  """Probe every node that already has a service_node_state row for this
+  service (in parallel) and reconcile. Used by the per-service detail
+  page's "Refresh" button.
+
+  - 404 if the service is not registered (so typos surface).
+  - Empty payload if no node has a state row yet (instead of a silent
+    "0 refreshed").
+  - Pre-fetches the services catalog once and hands it to each
+    reconcile call so we don't fan out N catalog queries.
+  """
+  name = _normalize_service_name(name)
+  if ctx.database.get_service(name) is None:
+    raise HttpError(HTTPStatus.NOT_FOUND, f"service not found: {name}", code="service_not_found")
+  states = ctx.database.list_service_node_states(service_name=name)
+  node_names = sorted({s.node_name for s in states})
+  if not node_names:
+    return {
+      "service": name, "refreshed": 0, "total": 0,
+      "errors": [],
+      "message": "No nodes have a state row yet — deploy this service first.",
+      "at": _to_jsonable(datetime.now(tz=UTC)),
     }
-    for r in rows
-  ]
+  services = ctx.database.list_services()
+  results: list[dict[str, Any]] = []
+
+  def _one(node_name: str) -> dict[str, Any]:
+    n = ctx.database.get_node(node_name)
+    if n is None:
+      return {"node": node_name, "ok": False, "error": "node not found"}
+    try:
+      st = nodes_mod.probe_node(n, linked_keys=_ssh_credentials_for_node(ctx, n.name))
+      ctx.database.upsert_node_status(st)
+      reconcile_node_services(ctx, n.name, st, services=services)
+      return {"node": node_name, "ok": True, "reachable": st.reachable}
+    except Exception as exc:  # noqa: BLE001
+      LOGGER.exception("refresh_service_nodes: probe failed for %s", node_name)
+      return {"node": node_name, "ok": False, "error": str(exc)}
+
+  workers = min(8, max(1, len(node_names)))
+  from concurrent.futures import ThreadPoolExecutor as _TPE
+  with _TPE(max_workers=workers) as ex:
+    results = list(ex.map(_one, node_names))
+  ok = sum(1 for r in results if r["ok"])
+  return {
+    "service": name,
+    "refreshed": ok,
+    "total": len(results),
+    "errors": [r for r in results if not r["ok"]],
+    "at": _to_jsonable(datetime.now(tz=UTC)),
+  }
 
 
 # ---------------------------------------------------------------------------
@@ -1605,11 +1803,13 @@ def init_status_bulk(ctx: AdminContext, names: list[str]) -> dict[str, dict[str,
   the bulk-deploy frontend can decide which nodes need init first.
 
   A node is considered "initialized" iff its latest init run is
-  ``status == 'completed'``. ``never`` means no init run on record
-  (i.e. the node has never been bootstrapped through this admin).
+  ``status == 'success'`` (the value nodes_init writes). ``never`` means
+  no init run on record (i.e. the node has never been bootstrapped
+  through this admin).
   """
   cleaned = [_normalize_node_name(n) for n in names if n]
   latest = ctx.database.latest_init_run_per_node(cleaned)
+  _SUCCESS_STATUSES = {"success", "completed"}
   out: dict[str, dict[str, Any]] = {}
   for name in cleaned:
     run = latest.get(name)
@@ -1623,7 +1823,7 @@ def init_status_bulk(ctx: AdminContext, names: list[str]) -> dict[str, dict[str,
       }
     else:
       out[name] = {
-        "initialized": run.status == "completed",
+        "initialized": run.status in _SUCCESS_STATUSES,
         "last_run_status": run.status,
         "last_run_id": run.id,
         "last_run_step": run.current_step,
@@ -3047,6 +3247,22 @@ def _build_router(ctx: AdminContext) -> _Router:
       "states": list_service_node_states(ctx, service_name=request.path_params["name"]),
     })
 
+  def services_summary_handler(_request: _Request) -> _Response:
+    return _json_response(HTTPStatus.OK, {"services": services_summary(ctx)})
+
+  def service_nodes_handler(request: _Request) -> _Response:
+    return _json_response(HTTPStatus.OK, {
+      "service": request.path_params["name"],
+      "states": list_service_node_status(ctx, request.path_params["name"]),
+    })
+
+  def service_refresh_handler(request: _Request) -> _Response:
+    return _json_response(HTTPStatus.OK,
+                          refresh_service_nodes(ctx, request.path_params["name"]))
+
+  router.add("GET", "/api/services-summary", with_auth(services_summary_handler))
+  router.add("GET", "/api/services/{name}/nodes", with_auth(service_nodes_handler))
+  router.add("POST", "/api/services/{name}/refresh", with_auth(service_refresh_handler))
   router.add("GET", "/api/services", with_auth(services_list_handler))
   router.add("POST", "/api/services", with_auth(service_create_handler))
   router.add("GET", "/api/services/{name}", with_auth(service_get_handler))

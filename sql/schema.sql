@@ -492,3 +492,13 @@ CREATE TRIGGER service_node_state_touch_updated_at
 BEFORE UPDATE ON service_node_state
 FOR EACH ROW
 EXECUTE FUNCTION touch_updated_at();
+
+-- Liveness columns — populated by `reconcile_node_services()` after each
+-- node probe. They reflect *current container state*, not deploy history.
+-- The pre-existing `status` column keeps deploy-history semantics
+-- (deployed | failed | rolling_back).
+ALTER TABLE service_node_state ADD COLUMN IF NOT EXISTS container_state      TEXT;
+ALTER TABLE service_node_state ADD COLUMN IF NOT EXISTS container_image      TEXT;
+ALTER TABLE service_node_state ADD COLUMN IF NOT EXISTS container_started_at TIMESTAMPTZ;
+ALTER TABLE service_node_state ADD COLUMN IF NOT EXISTS healthcheck_ok       BOOLEAN;
+ALTER TABLE service_node_state ADD COLUMN IF NOT EXISTS last_observed_at     TIMESTAMPTZ;

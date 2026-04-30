@@ -177,9 +177,15 @@ class ServiceNodeStateRecord:
   service_name: str
   node_name: str
   revision: str | None
-  status: str | None
+  status: str | None                      # last deploy outcome (history)
   last_deployment_id: int | None
   updated_at: datetime
+  # liveness — refreshed by reconcile_node_services after each probe
+  container_state: str | None = None      # running | exited | restarting | absent | unhealthy
+  container_image: str | None = None
+  container_started_at: datetime | None = None
+  healthcheck_ok: bool | None = None
+  last_observed_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -1719,6 +1725,29 @@ class Database:
         )
       connection.commit()
 
+  _SERVICE_NODE_STATE_COLUMNS = (
+    "service_name, node_name, revision, status, last_deployment_id, updated_at, "
+    "container_state, container_image, container_started_at, healthcheck_ok, "
+    "last_observed_at"
+  )
+
+  @staticmethod
+  def _row_to_service_node_state(r: dict) -> ServiceNodeStateRecord:
+    return ServiceNodeStateRecord(
+      service_name=r["service_name"],
+      node_name=r["node_name"],
+      revision=r.get("revision"),
+      status=r.get("status"),
+      last_deployment_id=(int(r["last_deployment_id"])
+                           if r.get("last_deployment_id") is not None else None),
+      updated_at=r["updated_at"],
+      container_state=r.get("container_state"),
+      container_image=r.get("container_image"),
+      container_started_at=r.get("container_started_at"),
+      healthcheck_ok=r.get("healthcheck_ok"),
+      last_observed_at=r.get("last_observed_at"),
+    )
+
   def list_service_node_states(
     self, *, service_name: str | None = None,
   ) -> list[ServiceNodeStateRecord]:
@@ -1730,24 +1759,102 @@ class Database:
     with self.connect() as connection:
       with connection.cursor() as cursor:
         cursor.execute(
-          f"""SELECT service_name, node_name, revision, status,
-                     last_deployment_id, updated_at
+          f"""SELECT {self._SERVICE_NODE_STATE_COLUMNS}
               FROM service_node_state {where}
               ORDER BY service_name, node_name""",
           params,
         )
-        return [
-          ServiceNodeStateRecord(
-            service_name=r["service_name"],
-            node_name=r["node_name"],
-            revision=r.get("revision"),
-            status=r.get("status"),
-            last_deployment_id=(int(r["last_deployment_id"])
-                                 if r.get("last_deployment_id") is not None else None),
-            updated_at=r["updated_at"],
-          )
-          for r in cursor.fetchall()
-        ]
+        return [self._row_to_service_node_state(r) for r in cursor.fetchall()]
+
+  def list_service_node_states_for_node(
+    self, node_name: str,
+  ) -> list[ServiceNodeStateRecord]:
+    """All (service, this-node) liveness rows. Used by reconcile to
+    decide which services already have history on this node — only
+    those get an `absent` mark when the container is missing."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"""SELECT {self._SERVICE_NODE_STATE_COLUMNS}
+              FROM service_node_state WHERE node_name = %s""",
+          (node_name,),
+        )
+        return [self._row_to_service_node_state(r) for r in cursor.fetchall()]
+
+  def bulk_upsert_service_node_liveness(
+    self, rows: list[dict],
+  ) -> int:
+    """Many-row variant for the per-probe reconciler. Single round-trip
+    to the DB. Each ``rows[i]`` must have keys:
+    ``service_name, node_name, container_state, container_image,
+    container_started_at, healthcheck_ok, observed_at``.
+    Returns the number of rows touched."""
+    if not rows:
+      return 0
+    values: list[tuple] = []
+    for r in rows:
+      values.append((
+        r["service_name"], r["node_name"],
+        r.get("container_state"), r.get("container_image"),
+        r.get("container_started_at"), r.get("healthcheck_ok"),
+        r.get("observed_at"),
+      ))
+    placeholder = "(%s, %s, %s, %s, %s, %s, COALESCE(%s, NOW()), NOW())"
+    args_str = ",".join([placeholder] * len(rows))
+    flat: list = []
+    for v in values:
+      flat.extend(v)
+    sql = f"""
+      INSERT INTO service_node_state
+        (service_name, node_name,
+         container_state, container_image, container_started_at,
+         healthcheck_ok, last_observed_at, updated_at)
+      VALUES {args_str}
+      ON CONFLICT (service_name, node_name) DO UPDATE SET
+        container_state      = EXCLUDED.container_state,
+        container_image      = EXCLUDED.container_image,
+        container_started_at = EXCLUDED.container_started_at,
+        healthcheck_ok       = EXCLUDED.healthcheck_ok,
+        last_observed_at     = EXCLUDED.last_observed_at
+    """
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(sql, flat)
+      connection.commit()
+    return len(rows)
+
+  def upsert_service_node_liveness(
+    self, *, service_name: str, node_name: str,
+    container_state: str | None,
+    container_image: str | None = None,
+    container_started_at: datetime | None = None,
+    healthcheck_ok: bool | None = None,
+    observed_at: datetime | None = None,
+  ) -> None:
+    """Insert-or-update only the liveness columns. Leaves deploy
+    history fields (revision/status/last_deployment_id) untouched if
+    the row already exists. Creates a stub row if it doesn't."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          INSERT INTO service_node_state
+            (service_name, node_name,
+             container_state, container_image, container_started_at,
+             healthcheck_ok, last_observed_at, updated_at)
+          VALUES (%s, %s, %s, %s, %s, %s, COALESCE(%s, NOW()), NOW())
+          ON CONFLICT (service_name, node_name) DO UPDATE SET
+            container_state      = EXCLUDED.container_state,
+            container_image      = EXCLUDED.container_image,
+            container_started_at = EXCLUDED.container_started_at,
+            healthcheck_ok       = EXCLUDED.healthcheck_ok,
+            last_observed_at     = EXCLUDED.last_observed_at
+          """,
+          (service_name, node_name,
+           container_state, container_image, container_started_at,
+           healthcheck_ok, observed_at),
+        )
+      connection.commit()
 
   # ssh_keys --------------------------------------------------------
   _SSH_KEY_COLUMNS = """
