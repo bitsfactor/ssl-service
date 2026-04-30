@@ -560,3 +560,37 @@ CREATE TRIGGER service_node_config_touch_updated_at
 BEFORE UPDATE ON service_node_config
 FOR EACH ROW
 EXECUTE FUNCTION touch_updated_at();
+
+-- Sequence re-sync ------------------------------------------------------
+-- After cross-database sync (online→one or primary→one), BIGSERIAL columns
+-- can have rows with explicit id values that outrun the local sequence's
+-- nextval. The next plain INSERT then trips on a duplicate-key violation.
+-- Bump every PK sequence to ``MAX(id) + 1`` so subsequent inserts land
+-- after existing rows. Idempotent + cheap; safe to re-run.
+DO $$
+DECLARE
+  rec RECORD;
+  max_id BIGINT;
+BEGIN
+  FOR rec IN
+    SELECT
+      pg_class_seq.relname AS seq_name,
+      pg_class_tab.relname AS table_name,
+      pg_attribute.attname AS column_name
+    FROM pg_class pg_class_seq
+    JOIN pg_depend ON pg_depend.objid = pg_class_seq.oid
+    JOIN pg_class pg_class_tab ON pg_class_tab.oid = pg_depend.refobjid
+    JOIN pg_attribute ON pg_attribute.attrelid = pg_class_tab.oid
+                     AND pg_attribute.attnum = pg_depend.refobjsubid
+    JOIN pg_namespace ON pg_namespace.oid = pg_class_seq.relnamespace
+    WHERE pg_class_seq.relkind = 'S'
+      AND pg_namespace.nspname = current_schema()
+  LOOP
+    EXECUTE format('SELECT COALESCE(MAX(%I), 0) FROM %I', rec.column_name, rec.table_name)
+      INTO max_id;
+    -- setval's first argument is regclass; rec.seq_name is type ``name``,
+    -- which doesn't auto-cast — go through text first.
+    PERFORM setval(rec.seq_name::text::regclass, GREATEST(max_id, 1), max_id > 0);
+  END LOOP;
+END;
+$$;

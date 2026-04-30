@@ -1389,6 +1389,38 @@ def update_service(ctx: AdminContext, name: str, payload: dict[str, Any]) -> dic
     patch["default_env"] = _normalize_env_dict(payload["default_env"])
   if "config_files" in payload:
     patch["config_files"] = _normalize_config_files(payload["config_files"])
+  # Manifest-source fields. Normally written by the GitHub manifest fetch,
+  # but we also allow direct PATCH for cases where the source repo is
+  # private and the platform can't reach raw.githubusercontent.com.
+  if "deploy_yaml" in payload:
+    patch["deploy_yaml"] = str(payload["deploy_yaml"] or "") or None
+    patch["deploy_yaml_fetched_at"] = datetime.now(tz=UTC)
+  if "required_env" in payload:
+    raw_req = payload["required_env"] or []
+    patch["required_env"] = [str(x).strip() for x in raw_req if str(x).strip()] \
+      if isinstance(raw_req, list) else []
+  if "exposed_ports" in payload:
+    raw_ports = payload["exposed_ports"] or []
+    if isinstance(raw_ports, list):
+      out: list[int] = []
+      for p in raw_ports:
+        try:
+          n = int(p)
+        except (TypeError, ValueError):
+          continue
+        if 0 < n < 65536:
+          out.append(n)
+      patch["exposed_ports"] = out
+  if "healthcheck" in payload and isinstance(payload["healthcheck"], dict):
+    patch["healthcheck"] = payload["healthcheck"]
+  if "depends_on" in payload:
+    raw_dep = payload["depends_on"] or []
+    patch["depends_on"] = [str(x).strip() for x in raw_dep if str(x).strip()] \
+      if isinstance(raw_dep, list) else []
+  if "config_schema" in payload:
+    raw_schema = payload["config_schema"] or []
+    if isinstance(raw_schema, list):
+      patch["config_schema"] = [s for s in raw_schema if isinstance(s, dict) and s.get("key")]
   updated = ctx.database.update_service(name, patch)
   if updated is None:
     raise HttpError(HTTPStatus.NOT_FOUND, f"service not found: {name}", code="service_not_found")
