@@ -3386,19 +3386,56 @@ def _build_router(ctx: AdminContext) -> _Router:
     return _json_response(HTTPStatus.OK, result)
 
   def databases_set_primary_handler(request: _Request) -> _Response:
-    """Mark a database as 'use this on next admin restart'. The current
-    admin process keeps using whatever it booted against — this is just
-    a preference for the next start."""
+    """Backwards-compat: 'set primary' is now an alias for 'activate'.
+    Both update the persistent registry's active_id AND swap the live
+    connection pool — no restart needed."""
+    return databases_activate_handler(request)
+
+  def databases_activate_handler(request: _Request) -> _Response:
+    """Switch the live admin process to a different database.
+
+    Two side-effects:
+      1. ~/.ssl-service/databases.yaml's ``active_id`` is updated so
+         the next admin start uses this DB even if it was launched
+         from a stale .command script.
+      2. ctx.database swaps its connection pool to the new DSN. The
+         old pool is drained in the background after a 5s grace
+         period.
+    """
     _require_readwrite(ctx)
     db_id = request.path_params["id"]
-    if not db_registry_mod.get_dsn(ctx.database, db_id):
+    new_dsn = db_registry_mod.get_dsn(ctx.database, db_id)
+    if not new_dsn:
       raise HttpError(HTTPStatus.NOT_FOUND, "database not registered",
                       code="db_not_registered")
-    db_registry_mod.set_primary_id(ctx.database, db_id)
+    # Update file FIRST (cheap, must persist even if pool swap fails)
+    try:
+      db_registry_mod.set_active(ctx.database, db_id)
+    except Exception as exc:  # noqa: BLE001
+      raise HttpError(HTTPStatus.INTERNAL_SERVER_ERROR,
+                      f"could not persist active_id: {exc}",
+                      code="registry_write_failed") from exc
+
+    # Live swap the connection pool. If this fails, the file is
+    # already updated — the next restart will pick up the new DSN
+    # cleanly even if the live swap couldn't.
+    try:
+      ctx.database.swap_to(new_dsn)
+    except Exception as exc:  # noqa: BLE001
+      LOGGER.exception("databases.activate: live swap failed for id=%s", db_id)
+      return _json_response(HTTPStatus.OK, {
+        "active_id": db_id,
+        "live_swap": False,
+        "error": str(exc),
+        "note": "Active DSN saved to registry but live swap failed; "
+                "restart admin to pick it up.",
+      })
+    LOGGER.info("databases.activate: id=%s swapped live", db_id)
     return _json_response(HTTPStatus.OK, {
-      "primary_id": db_id,
-      "note": "Restart the admin server with config.yaml pointing at "
-              "this DSN to actually switch the live connection.",
+      "active_id": db_id,
+      "live_swap": True,
+      "note": "Live connection swapped. The registry file has the new "
+              "active_id so future restarts will use this DB too.",
     })
 
   # ---- /api/sync/* (now id-based) ---------------------------------------
@@ -3478,6 +3515,7 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("POST",   "/api/databases/{id}/test", with_auth(databases_test_handler))
   router.add("POST",   "/api/databases/{id}/apply-schema", with_auth(databases_apply_schema_handler))
   router.add("PUT",    "/api/databases/{id}/primary", with_auth(databases_set_primary_handler))
+  router.add("PUT",    "/api/databases/{id}/activate", with_auth(databases_activate_handler))
   router.add("POST",   "/api/sync/analyze", with_auth(sync_analyze_handler))
   router.add("POST",   "/api/sync/apply", with_auth(sync_apply_handler))
   router.add("GET", "/api/services/{name}/nodes", with_auth(service_nodes_handler))

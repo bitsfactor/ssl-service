@@ -278,6 +278,25 @@ class IpTestResultRecord:
   created_at: datetime
 
 
+def _redact_dsn(dsn: str | None) -> str:
+  """Same trick as db_sync.mask_dsn but local — avoid circular import."""
+  if not dsn:
+    return ""
+  try:
+    if "://" not in dsn:
+      return "***"
+    scheme, rest = dsn.split("://", 1)
+    if "@" not in rest:
+      return f"{scheme}://{rest}"
+    creds, host = rest.split("@", 1)
+    if ":" in creds:
+      user, _ = creds.split(":", 1)
+      return f"{scheme}://{user}:****@{host}"
+    return f"{scheme}://{creds}@{host}"
+  except Exception:
+    return "***"
+
+
 class Database:
   def __init__(
     self,
@@ -322,6 +341,73 @@ class Database:
         self._pool.close()
       finally:
         self._pool = None
+
+  def swap_to(
+    self, new_dsn: str, *,
+    pool_min_size: int = 3,
+    pool_max_size: int = 10,
+    pool_timeout: float = 30.0,
+  ) -> None:
+    """Live-swap the connection pool to a new DSN.
+
+    Used by the "Activate database" admin endpoint so the operator
+    can flip which Postgres the running admin process talks to
+    without restarting it. Steps:
+
+      1. Open a new pool to the new DSN
+      2. Verify it works (SELECT 1)
+      3. Atomically swap ``self._pool`` to the new pool + update
+         ``self._dsn``
+      4. Schedule the OLD pool to close after a short grace period
+         so any in-flight requests get to finish on their existing
+         connection.
+
+    If step 1 or 2 fails, the old pool stays in place and the
+    exception is re-raised.
+    """
+    if ConnectionPool is None:
+      raise RuntimeError("connection pooling is not available")
+    new_pool = ConnectionPool(
+      new_dsn,
+      min_size=pool_min_size,
+      max_size=pool_max_size,
+      timeout=pool_timeout,
+      open=True,
+      kwargs={"row_factory": dict_row},
+    )
+    try:
+      new_pool.wait(timeout=pool_timeout)
+      with new_pool.connection() as conn:
+        with conn.cursor() as cur:
+          cur.execute("SELECT 1")
+          cur.fetchone()
+    except Exception:
+      try:
+        new_pool.close()
+      except Exception:
+        pass
+      raise
+
+    old_pool = self._pool
+    old_dsn = self._dsn
+    self._pool = new_pool
+    self._dsn = new_dsn
+    LOGGER.info("Database.swap_to: pool swapped from %s to %s",
+                _redact_dsn(old_dsn), _redact_dsn(new_dsn))
+
+    # Drain the old pool in a daemon thread so we don't block the
+    # current request handler. 5s is plenty for the typical
+    # < 500ms admin requests.
+    if old_pool is not None:
+      def _drain_old():
+        try:
+          import time as _time
+          _time.sleep(5)
+          old_pool.close()
+        except Exception:
+          LOGGER.exception("Database.swap_to: old pool close failed")
+      import threading as _th
+      _th.Thread(target=_drain_old, daemon=True, name="db-old-pool-drain").start()
 
   @contextmanager
   def connect(self) -> Iterator[psycopg.Connection]:

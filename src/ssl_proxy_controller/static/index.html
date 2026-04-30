@@ -5261,10 +5261,14 @@
           badges.appendChild(h("span", { class: "badge ok",
             title: "The admin process is currently connected here" },
             h("span", { class: "dot" }), "in use"));
-        if (e.is_primary)
+        if (e.is_active && !e.is_current)
+          badges.appendChild(h("span", { class: "badge warn",
+            title: "Active in registry but live connection still on the old DSN — restart admin or activate again" },
+            "active (registry)"));
+        if (e.is_active && e.is_current)
           badges.appendChild(h("span", { class: "badge",
-            title: "Marked as primary on next restart" }, "primary"));
-        if (!e.is_current && !e.is_primary)
+            title: "Saved as active in the persistent registry" }, "active"));
+        if (!e.is_current && !e.is_active)
           badges.appendChild(h("span", { class: "muted" }, "—"));
 
         const actions = h("td", { class: "actions" });
@@ -5274,10 +5278,10 @@
         if (App.mode === "readwrite") {
           actions.appendChild(h("button", { class: "btn btn-sm",
             onclick: () => openEditDbModal(e) }, "Edit"));
-          if (!e.is_primary) {
-            actions.appendChild(h("button", { class: "btn btn-sm",
-              title: "Mark as preferred for next admin restart",
-              onclick: () => setPrimary(e.id) }, "Set primary"));
+          if (!e.is_current) {
+            actions.appendChild(h("button", { class: "btn btn-sm btn-primary",
+              title: "Switch the admin's live connection to this DB now",
+              onclick: () => activateDb(e) }, "Activate"));
           }
           if (!e.is_current) {
             actions.appendChild(h("button", { class: "btn btn-sm btn-danger",
@@ -5637,11 +5641,24 @@
     };
 
     const setPrimary = async (id) => {
+      // Backwards-compat name; the underlying endpoint is now Activate.
+      return activateDb({ id });
+    };
+
+    const activateDb = async (entry) => {
+      const msg = `Switch the admin's live connection to '${entry.label || entry.id}'?\n\nThe currently-running admin will close its old DB pool and open a new one to this DSN. In-flight requests get a 5s grace period.`;
+      if (!confirm(msg)) return;
       try {
-        const r = await api("PUT", `/api/databases/${encodeURIComponent(id)}/primary`, {});
-        toast("success", "Primary set", r.note || "");
+        const r = await api("PUT", `/api/databases/${encodeURIComponent(entry.id)}/activate`, {});
+        if (r.live_swap === false) {
+          toast("error", "Activated (registry only)",
+            r.error || "Live swap failed — restart admin to apply.");
+        } else {
+          toast("success", "Switched live connection",
+            `'${entry.label || entry.id}' is now in use.`);
+        }
         await refresh();
-      } catch (err) { toast("error", "Failed", err.message); }
+      } catch (err) { toast("error", "Activate failed", err.message); }
     };
 
     const deleteDb = async (entry) => {
