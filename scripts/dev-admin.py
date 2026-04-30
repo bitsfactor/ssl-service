@@ -328,6 +328,19 @@ class FakeDatabase:
       key=lambda r: r.started_at, reverse=True,
     )[:limit]
 
+  def latest_init_run_per_node(self, node_names):
+    """In-memory parity with the bulk DB method used by the
+    pre-deploy init-status check."""
+    out = {}
+    for name in (node_names or []):
+      runs = sorted(
+        [r for r in self.init_runs.values() if r.node_name == name],
+        key=lambda r: r.started_at, reverse=True,
+      )
+      if runs:
+        out[name] = runs[0]
+    return out
+
   def update_init_run(self, run_id: int, *, status=None, current_step=None,
                       append_log=None, exit_code=None, finished=False) -> None:
     rec = self.init_runs.get(int(run_id))
@@ -615,10 +628,17 @@ class FakeDatabase:
                                  revision, status, last_deployment_id):
     if not hasattr(self, "_service_node_state"):
       self._service_node_state = {}
+    existing = self._service_node_state.get((service_name, node_name))
     self._service_node_state[(service_name, node_name)] = ServiceNodeStateRecord(
       service_name=service_name, node_name=node_name, revision=revision,
       status=status, last_deployment_id=last_deployment_id,
       updated_at=datetime.now(tz=UTC),
+      # Preserve liveness fields if a prior probe wrote them.
+      container_state=getattr(existing, "container_state", None) if existing else None,
+      container_image=getattr(existing, "container_image", None) if existing else None,
+      container_started_at=getattr(existing, "container_started_at", None) if existing else None,
+      healthcheck_ok=getattr(existing, "healthcheck_ok", None) if existing else None,
+      last_observed_at=getattr(existing, "last_observed_at", None) if existing else None,
     )
 
   def list_service_node_states(self, *, service_name=None):
@@ -626,6 +646,43 @@ class FakeDatabase:
     if service_name: items = [r for r in items if r.service_name == service_name]
     items.sort(key=lambda r: (r.service_name, r.node_name))
     return items
+
+  def list_service_node_states_for_node(self, node_name):
+    """Match the DB version: all (svc, this-node) rows."""
+    items = [r for r in getattr(self, "_service_node_state", {}).values()
+             if r.node_name == node_name]
+    items.sort(key=lambda r: r.service_name)
+    return items
+
+  def upsert_service_node_liveness(self, *, service_name, node_name,
+                                    container_state, container_image=None,
+                                    container_started_at=None,
+                                    healthcheck_ok=None, observed_at=None):
+    if not hasattr(self, "_service_node_state"):
+      self._service_node_state = {}
+    key = (service_name, node_name)
+    existing = self._service_node_state.get(key)
+    if existing is None:
+      existing = ServiceNodeStateRecord(
+        service_name=service_name, node_name=node_name,
+        revision=None, status=None, last_deployment_id=None,
+        updated_at=datetime.now(tz=UTC),
+      )
+    existing.container_state = container_state
+    existing.container_image = container_image
+    existing.container_started_at = container_started_at
+    existing.healthcheck_ok = healthcheck_ok
+    existing.last_observed_at = observed_at or datetime.now(tz=UTC)
+    existing.updated_at = datetime.now(tz=UTC)
+    self._service_node_state[key] = existing
+
+  def bulk_upsert_service_node_liveness(self, rows):
+    """Apply each row through the single-row variant."""
+    n = 0
+    for r in (rows or []):
+      self.upsert_service_node_liveness(**r)
+      n += 1
+    return n
 
   def attach_ssh_key_to_node(self, node_name, private_key, passphrase):
     n = self.nodes.get(node_name)
