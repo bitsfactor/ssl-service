@@ -408,6 +408,14 @@
         <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4l6-2 6 2v8l-6 2-6-2V4z"/><path d="M2 4l6 2 6-2M8 6v8"/></svg>
         Services
       </a>
+      <a href="#/static-ips" data-nav="static-ips">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c1.5 2 2.2 4 2.2 6S9.5 12 8 14M8 2c-1.5 2-2.2 4-2.2 6S6.5 12 8 14"/></svg>
+        Static IPs
+      </a>
+      <a href="#/ssh-keys" data-nav="ssh-keys">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="5" cy="8" r="2.5"/><path d="M7.5 8h6M11.5 8v2M13.5 8v2"/></svg>
+        SSH Keys
+      </a>
       <a href="#/logs" data-nav="logs">
         <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="12" height="12" rx="2"/><path d="M5 6h6M5 9h6M5 12h3"/></svg>
         Logs
@@ -1291,9 +1299,9 @@
         h("p", { class: "lede" }, "Remote machines this admin manages over SSH. Probe to refresh health, deploy or update the ssl-service install."),
       ),
       h("div", { class: "row" },
-        h("button", { class: "btn", onclick: () => renderNodesView(root) }, "Refresh"),
+        h("button", { class: "btn", onclick: () => loadNodesIntoBody() }, "Refresh"),
         App.mode === "readwrite"
-          ? h("button", { class: "btn btn-primary", onclick: () => openNodeModal(null, () => renderNodesView(root)) }, "+ Add node")
+          ? h("button", { class: "btn btn-primary", onclick: () => openNodeModal(null, () => loadNodesIntoBody()) }, "+ Add node")
           : null,
       ),
     ));
@@ -1303,25 +1311,90 @@
       h("h2", null, "All nodes"),
       h("span", { class: "hint", id: "nodes-count" }, ""),
     ));
+    // Bulk action bar — shows up only after rows have been selected.
+    if (App.mode === "readwrite") {
+      const bar = h("div", { id: "nodes-bulk-bar",
+        style: "display: none; gap: 8px; align-items: center; padding: 8px 16px; background: var(--surface-alt); border-bottom: 1px solid var(--border); font-size: 13px;" });
+      bar.appendChild(h("span", { id: "nodes-bulk-count", class: "muted" }, "0 selected"));
+      bar.appendChild(h("div", { style: "flex: 1" }));
+      bar.appendChild(h("button", { class: "btn btn-sm",
+        onclick: () => bulkProbeSelected() }, "Probe selected"));
+      bar.appendChild(h("button", { class: "btn btn-sm btn-primary",
+        onclick: () => bulkDeploySslService() }, "Deploy ssl-service to selected"));
+      bar.appendChild(h("button", { class: "btn btn-sm",
+        onclick: () => bulkClearSelection() }, "Clear"));
+      card.appendChild(bar);
+    }
     const body = h("div", { class: "card-body tight", id: "nodes-body" });
+    // Render the page shell with a non-blocking skeleton so the user sees
+    // the page structure instantly. Data loads asynchronously below.
+    body.appendChild(h("div", { class: "muted", style: "padding: 24px; text-align: center" }, "Loading nodes…"));
     card.appendChild(body);
     root.appendChild(card);
 
+    // Kick off the actual data load (does not await — keeps the page reactive).
+    loadNodesIntoBody();
+  }
+
+  // Re-fetch the node list and render it into the existing #nodes-body
+  // container. Fires the (cheap) /api/nodes call and the (slower)
+  // /api/node-statuses call in parallel — rows render the moment node
+  // metadata arrives, then status badges fill in when statuses arrive.
+  async function loadNodesIntoBody() {
+    const body = document.getElementById("nodes-body");
+    if (!body) return;
+    const nodesPromise = api("GET", "/api/nodes");
+    const statusesPromise = api("GET", "/api/node-statuses").catch((err) => {
+      // Backend may be on the old build that doesn't have this endpoint.
+      // Fall back to legacy behaviour: ask /api/nodes?with_status=1.
+      if (err.status === 404) {
+        return api("GET", "/api/nodes?with_status=1").then((r) => {
+          const map = {};
+          for (const n of (r.nodes || [])) {
+            if (n.status) map[n.name] = n.status;
+          }
+          return { statuses: map, _legacy_nodes: r.nodes };
+        });
+      }
+      throw err;
+    });
     try {
-      const resp = await api("GET", "/api/nodes");
-      const nodes = resp.nodes || [];
-      document.getElementById("nodes-count").textContent = `${nodes.length} node${nodes.length === 1 ? "" : "s"}`;
+      const resp = await nodesPromise;
+      let nodes = resp.nodes || [];
+      const counter = document.getElementById("nodes-count");
+      if (counter) counter.textContent = `${nodes.length} node${nodes.length === 1 ? "" : "s"}`;
+      body.innerHTML = "";
       if (!nodes.length) {
         body.appendChild(h("div", { class: "empty" },
           h("div", { class: "title" }, "No nodes registered"),
           h("div", { class: "sub" }, App.mode === "readwrite" ? "Add your first node above." : "This is a read-only admin."),
         ));
-      } else {
-        body.appendChild(renderNodesTable(nodes));
+        return;
       }
+      // Render rows immediately with whatever status info /api/nodes
+      // happened to return (none, on the new fast path).
+      body.appendChild(renderNodesTable(nodes));
+      // When statuses arrive, patch each row in place — no full re-render.
+      statusesPromise.then((sresp) => {
+        const statusMap = (sresp && sresp.statuses) || {};
+        // Legacy shim: if the fallback came back, refresh the node list too.
+        const legacyNodes = sresp && sresp._legacy_nodes;
+        const nodeList = legacyNodes || nodes;
+        for (const n of nodeList) {
+          const status = statusMap[n.name] || null;
+          const merged = Object.assign({}, n, { status });
+          const tbody = findNodeTbody(n.name);
+          if (tbody) tbody.replaceWith(renderNodeRow(merged));
+        }
+      }).catch((err) => {
+        // Show a small inline note rather than blocking the whole view.
+        toast("error", "Statuses unavailable", err.message || "");
+      });
     } catch (err) {
+      body.innerHTML = "";
+      body.appendChild(h("div", { class: "muted", style: "padding: 16px; color: var(--danger)" },
+        "Failed to load nodes: " + (err.message || "unknown error")));
       if (err.status === 401) showLogin();
-      else toast("error", "Failed to load nodes", err.message);
     }
   }
 
@@ -1352,14 +1425,26 @@
 
     // Group: Inspect
     pop.appendChild(h("div", { class: "group-label" }, "Inspect"));
-    pop.appendChild(h("button", { onclick: () => { closeMenu(); openNodeModal(n, () => renderNodesView(document.getElementById("view-root"))); } }, "Edit details"));
+    pop.appendChild(h("button", { onclick: () => { closeMenu(); openNodeFullInfoModal(n.name); } }, "View full info"));
+    pop.appendChild(h("button", { onclick: () => {
+      closeMenu();
+      openNodeModal(n, async (info) => {
+        if (info && info.isEdit) {
+          try { await refreshNodeRow(info.name, info.oldName); }
+          catch (err) { toast("error", "Refresh failed", err.message); }
+        } else {
+          // Newly added node — fall back to full list refresh.
+          loadNodesIntoBody();
+        }
+      });
+    } }, "Edit details"));
     pop.appendChild(h("button", { onclick: () => { closeMenu(); openInitHistoryModal(n); } }, "Init history"));
     pop.appendChild(h("hr"));
 
     // Group: Lifecycle (readwrite only)
     if (App.mode === "readwrite") {
       pop.appendChild(h("div", { class: "group-label" }, "Lifecycle"));
-      pop.appendChild(h("button", { onclick: () => { closeMenu(); openInitializeWizard(n, () => renderNodesView(document.getElementById("view-root"))); } }, "Initialize…"));
+      pop.appendChild(h("button", { onclick: () => { closeMenu(); openInitializeWizard(n, () => refreshNodeRow(n.name).catch(() => {})); } }, "Initialize…"));
       pop.appendChild(h("button", { onclick: () => { closeMenu(); openDeployServiceModal(n); } }, "Deploy service…"));
       pop.appendChild(h("button", { onclick: () => { closeMenu(); openNodeRunModal(n, "deploy"); } }, "Run free-form deploy…"));
       pop.appendChild(h("button", { onclick: () => { closeMenu(); openNodeRunModal(n, "update"); } }, "Run free-form update…"));
@@ -1373,9 +1458,20 @@
   }
 
   function renderNodesTable(nodes) {
-    const table = h("table", { class: "data" });
+    const table = h("table", { class: "data", id: "nodes-table" });
+    const masterCheckbox = h("input", {
+      type: "checkbox", id: "node-select-all", title: "Select all",
+      onchange: (e) => {
+        const checked = e.target.checked;
+        document.querySelectorAll('input[data-bulk-node]').forEach((cb) => {
+          cb.checked = checked;
+        });
+        updateBulkBar();
+      },
+    });
     table.appendChild(h("thead", null,
       h("tr", null,
+        App.mode === "readwrite" ? h("th", { style: "width: 28px" }, masterCheckbox) : null,
         h("th", null, "Node"),
         h("th", null, "Host"),
         h("th", null, "Reachability"),
@@ -1385,59 +1481,476 @@
         h("th", null, ""),
       ),
     ));
-    const tbody = h("tbody");
     for (const n of nodes) {
-      const status = n.status || null;
-      const actions = h("td", { class: "actions" });
-      // Single primary action stays inline (Probe — most frequent).
-      actions.appendChild(h("button", { class: "btn btn-sm",
-        onclick: async (e) => { e.preventDefault(); await probeNode(n.name); }
-      }, "Probe"));
-      actions.appendChild(buildNodeActionMenu(n));
-      const tr = h("tr", { "data-node": n.name },
-        h("td", { class: "domain" }, n.name,
-          n.description ? h("div", { class: "muted", style: "font-size: 11px; margin-top: 2px" }, n.description) : null),
-        h("td", { class: "mono" }, `${n.ssh_user}@${n.host}:${n.ssh_port}`,
-          h("div", { class: "muted", style: "font-size: 11px; margin-top: 2px" }, `auth: ${n.auth_method}`)),
-        h("td", null, nodeReachBadge(status)),
-        h("td", null, nodeServiceBadge(status),
-          status && status.service_version ? h("span", { class: "muted mono", style: "margin-left:6px; font-size:11px" }, status.service_version) : null),
-        h("td", { class: "muted" }, status ? fmtUptime(status.uptime_seconds) : "—"),
-        h("td", { class: "muted" }, status && status.last_probed_at ? fmtRelative(status.last_probed_at) : "never"),
-        actions,
-      );
-      tbody.appendChild(tr);
-      // Detail row: load avg / mem / disk / OS / probe error
-      if (status) {
-        const cells = [];
-        if (status.os_release) cells.push(`OS: ${status.os_release}`);
-        if (status.load_avg) cells.push(`load: ${status.load_avg}`);
-        if (status.memory) cells.push(`mem: ${status.memory}`);
-        if (status.disk_usage) cells.push(`disk: ${status.disk_usage}`);
-        if (cells.length) {
-          tbody.appendChild(h("tr", { style: "background: var(--surface-alt)" },
-            h("td", { colspan: "7", class: "muted mono", style: "font-size: 11.5px; padding: 6px 16px" }, cells.join("  ·  "))));
-        }
-        if (status.last_probe_error) {
-          tbody.appendChild(h("tr", { style: "background: var(--danger-bg)" },
-            h("td", { colspan: "7", class: "mono", style: "color: var(--danger); font-size: 11.5px; padding: 6px 16px" }, status.last_probe_error)));
-        }
-      }
+      table.appendChild(renderNodeRow(n));
     }
-    table.appendChild(tbody);
     const wrap = h("div", { class: "table-wrap" });
     wrap.appendChild(table);
     return wrap;
   }
 
+  function updateBulkBar() {
+    const checked = document.querySelectorAll('input[data-bulk-node]:checked');
+    const count = checked.length;
+    const bar = document.getElementById("nodes-bulk-bar");
+    const countEl = document.getElementById("nodes-bulk-count");
+    if (countEl) countEl.textContent = `${count} selected`;
+    if (bar) bar.style.display = count > 0 ? "flex" : "none";
+    // Sync master checkbox state.
+    const all = document.querySelectorAll('input[data-bulk-node]');
+    const master = document.getElementById("node-select-all");
+    if (master) {
+      master.checked = all.length > 0 && count === all.length;
+      master.indeterminate = count > 0 && count < all.length;
+    }
+  }
+  function getBulkSelected() {
+    return Array.from(document.querySelectorAll('input[data-bulk-node]:checked'))
+      .map((cb) => cb.getAttribute("data-bulk-node"));
+  }
+  function bulkClearSelection() {
+    document.querySelectorAll('input[data-bulk-node]').forEach((cb) => { cb.checked = false; });
+    updateBulkBar();
+  }
+  async function bulkProbeSelected() {
+    const names = getBulkSelected();
+    if (!names.length) return;
+    toast("info", "Probing", `${names.length} node${names.length === 1 ? "" : "s"}…`);
+    // Run probes in parallel and let probeNode patch each row in place.
+    await Promise.all(names.map((n) => probeNode(n).catch(() => {})));
+  }
+  async function bulkDeploySslService() {
+    const names = getBulkSelected();
+    if (!names.length) return;
+
+    // Step 1: ask backend which selected nodes have actually been initialised
+    // (= bfs.sh setup run, docker installed, etc.). Falls back to "treat all
+    // as ready" on old admin builds that don't have this endpoint.
+    let statusMap = {};
+    try {
+      const r = await api("POST", "/api/nodes/init-status-bulk", { nodes: names });
+      statusMap = (r && r.status) || {};
+    } catch (err) {
+      if (err.status !== 404) {
+        toast("error", "Pre-deploy check failed", err.message);
+        return;
+      }
+      // Old backend — treat everyone as ready and rely on the legacy confirm.
+      for (const n of names) statusMap[n] = { initialized: true, last_run_status: "unknown" };
+    }
+
+    const ready = names.filter((n) => statusMap[n] && statusMap[n].initialized);
+    const needInit = names.filter((n) => !statusMap[n] || !statusMap[n].initialized);
+
+    // Common: actually fire the deploy + handle the response.
+    const runDeploy = async (targetNames) => {
+      if (!targetNames.length) return;
+      const bar = document.getElementById("nodes-bulk-bar");
+      if (bar) bar.querySelectorAll("button").forEach((b) => b.setAttribute("disabled", "true"));
+      try {
+        const r = await api("POST", "/api/services/ssl-service/deploy", { nodes: targetNames });
+        toast(r.fail === 0 ? "success" : "info", "Deploy complete",
+          `${r.success}/${r.total} ok · ${r.fail} failed`);
+        openDeployResultModal(r);
+        targetNames.forEach((n) => refreshNodeRow(n).catch(() => {}));
+        bulkClearSelection();
+      } catch (err) {
+        if (err.code === "service_not_found") {
+          toast("error", "ssl-service not registered",
+            "Add it in Services tab first (or run scripts/register-ssl-service.sh)");
+        } else if (err.code === "manifest_missing") {
+          toast("error", "Manifest not synced", "Services → ssl-service → Sync manifest");
+        } else {
+          toast("error", "Deploy failed", err.message);
+        }
+      } finally {
+        if (bar) bar.querySelectorAll("button").forEach((b) => b.removeAttribute("disabled"));
+      }
+    };
+
+    // Fast path: everyone is already initialised — go straight to deploy.
+    if (!needInit.length) {
+      if (!confirm(`Deploy ssl-service to ${names.length} node(s)?\n\n${names.join(", ")}\n\nEach will git pull, docker compose up -d --build, then healthcheck.`)) return;
+      return runDeploy(names);
+    }
+
+    // Slow path: open a pre-deploy modal that lays out ready vs needs-init.
+    openPreDeployInitModal({ ready, needInit, statusMap, runDeploy });
+  }
+
+  // Modal that appears when some selected nodes haven't been initialised
+  // yet. Offers three paths: init-then-deploy / deploy-ready-only / cancel.
+  function openPreDeployInitModal({ ready, needInit, statusMap, runDeploy }) {
+    const body = h("div");
+    body.appendChild(h("p", { class: "muted" },
+      "Some selected nodes haven't been bootstrapped yet (no successful init run on record). ",
+      "Initialising installs docker, git, python, etc. before the service deploy can succeed."));
+
+    if (needInit.length) {
+      body.appendChild(h("div", { style: "font-weight: 600; margin: 14px 0 4px" },
+        `Need init (${needInit.length})`));
+      const tbl = h("table", { class: "data" });
+      const tb = h("tbody");
+      for (const n of needInit) {
+        const s = statusMap[n] || {};
+        const last = s.last_run_status || "never";
+        tb.appendChild(h("tr", null,
+          h("td", { class: "mono" }, n),
+          h("td", { class: "muted" }, last === "never" ? "never initialised" : `last run: ${last}`),
+        ));
+      }
+      tbl.appendChild(tb);
+      body.appendChild(tbl);
+    }
+
+    if (ready.length) {
+      body.appendChild(h("div", { style: "font-weight: 600; margin: 14px 0 4px" },
+        `Ready to deploy (${ready.length})`));
+      body.appendChild(h("div", { class: "mono muted", style: "font-size: 12.5px" },
+        ready.join(", ")));
+    }
+
+    const footer = h("div", { class: "row", style: "gap: 8px" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("div", { style: "flex: 1" }),
+      ready.length
+        ? h("button", { class: "btn",
+            onclick: () => { Modal.close(); runDeploy(ready); } },
+            `Deploy ${ready.length} ready only`)
+        : null,
+      h("button", { class: "btn btn-primary",
+        onclick: () => {
+          Modal.close();
+          openInitProgressModal({
+            initNodes: needInit,
+            onAllDone: (initSucceeded) => runDeploy([...ready, ...initSucceeded]),
+          });
+        } }, `Init ${needInit.length} then deploy`),
+    );
+
+    Modal.open({ title: "Pre-deploy check", body, footer });
+  }
+
+  // Modal that kicks off init on the supplied nodes, polls each one's
+  // latest run, and calls onAllDone with the names that finished
+  // successfully once everything settles.
+  async function openInitProgressModal({ initNodes, onAllDone }) {
+    const body = h("div");
+    body.appendChild(h("p", { class: "muted" },
+      "Each node uses its stored init defaults (Edit details → Initialization defaults). ",
+      "This installs docker + base toolchain and may take a few minutes per node."));
+    const list = h("table", { class: "data" });
+    const lt = h("tbody");
+    list.appendChild(lt);
+    body.appendChild(list);
+
+    // Per-node UI rows + state.
+    const stateByNode = {};   // name → {status, runId, stepText, logTail}
+    const rowByNode = {};
+    for (const n of initNodes) {
+      const tr = h("tr", null,
+        h("td", { class: "mono", style: "width: 140px" }, n),
+        h("td", { "data-status": "1" }, "queued"),
+        h("td", { class: "muted mono", style: "font-size: 11.5px", "data-step": "1" }, ""),
+      );
+      rowByNode[n] = tr;
+      lt.appendChild(tr);
+      stateByNode[n] = { status: "queued", runId: null, step: "" };
+    }
+
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Run in background"),
+    );
+    Modal.open({ title: "Initializing nodes…", body, footer });
+
+    // Kick off init for each node concurrently.
+    await Promise.all(initNodes.map(async (n) => {
+      try {
+        const r = await api("POST", `/api/nodes/${encodeURIComponent(n)}/init/start`, {});
+        stateByNode[n].runId = r.id;
+        stateByNode[n].status = r.status || "running";
+        rowByNode[n].querySelector('[data-status]').textContent = r.status || "running";
+      } catch (err) {
+        stateByNode[n].status = "failed_to_start";
+        rowByNode[n].querySelector('[data-status]').textContent = "start failed";
+        rowByNode[n].querySelector('[data-step]').textContent = err.message || "";
+      }
+    }));
+
+    // Poll every 4s. Stop when all terminal (completed/failed).
+    const succeeded = [];
+    const terminal = (s) => s === "completed" || s === "failed" || s === "failed_to_start";
+    const poll = async () => {
+      const pending = initNodes.filter((n) => !terminal(stateByNode[n].status));
+      if (!pending.length) {
+        // All done — gather successes and chain into deploy.
+        for (const n of initNodes) {
+          if (stateByNode[n].status === "completed") succeeded.push(n);
+        }
+        Modal.close();
+        if (succeeded.length) {
+          toast("success", "Init complete",
+            `${succeeded.length}/${initNodes.length} nodes ready`);
+        }
+        const failed = initNodes.length - succeeded.length;
+        if (failed) toast("error", "Init failed", `${failed} node(s); skipping their deploy`);
+        if (onAllDone) onAllDone(succeeded);
+        return;
+      }
+      await Promise.all(pending.map(async (n) => {
+        const runId = stateByNode[n].runId;
+        if (!runId) return;
+        try {
+          const r = await api("GET", `/api/nodes/${encodeURIComponent(n)}/init/runs/${runId}`);
+          stateByNode[n].status = r.status;
+          stateByNode[n].step = r.current_step || "";
+          rowByNode[n].querySelector('[data-status]').textContent = r.status;
+          rowByNode[n].querySelector('[data-step]').textContent = r.current_step || "";
+        } catch (_) { /* keep going */ }
+      }));
+      setTimeout(poll, 4000);
+    };
+    poll();
+  }
+
+  // Render a single node as its own <tbody> so it can be replaced atomically
+  // (one tbody per node groups the main row + optional detail rows).
+  function renderNodeRow(n) {
+    const tbody = h("tbody", { "data-node": n.name });
+    const status = n.status || null;
+    const actions = h("td", { class: "actions" });
+    actions.appendChild(h("button", {
+      class: "btn btn-sm",
+      "data-probe-btn": "1",
+      onclick: async (e) => { e.preventDefault(); await probeNode(n.name); },
+    }, "Probe"));
+    actions.appendChild(buildNodeActionMenu(n));
+    const tr = h("tr", null,
+      App.mode === "readwrite"
+        ? h("td", { style: "width: 28px" }, h("input", {
+            type: "checkbox", "data-bulk-node": n.name,
+            onchange: () => updateBulkBar(),
+          }))
+        : null,
+      h("td", { class: "domain" }, n.name),
+      h("td", { class: "mono" }, `${n.ssh_user}@${n.host}:${n.ssh_port}`),
+      h("td", null, nodeReachBadge(status)),
+      h("td", null, nodeServiceBadge(status)),
+      h("td", { class: "muted" }, status ? fmtUptime(status.uptime_seconds) : "—"),
+      h("td", { class: "muted" }, status && status.last_probed_at ? fmtRelative(status.last_probed_at) : "never"),
+      actions,
+    );
+    tbody.appendChild(tr);
+    // Only keep the error row — failed probes need to be visible. All
+    // other sub-lines are available via "View full info".
+    if (status && status.last_probe_error) {
+      const cspan = App.mode === "readwrite" ? "8" : "7";
+      tbody.appendChild(h("tr", { style: "background: var(--danger-bg)" },
+        h("td", { colspan: cspan, class: "mono", style: "color: var(--danger); font-size: 11.5px; padding: 6px 16px" }, status.last_probe_error)));
+    }
+    return tbody;
+  }
+
+  // Look up the <tbody> for a node by name. CSS attribute selectors don't
+  // need escaping for our node-name charset (alphanumeric + dashes).
+  function findNodeTbody(name) {
+    const tbl = document.getElementById("nodes-table");
+    if (!tbl) return null;
+    return tbl.querySelector(`tbody[data-node="${name.replace(/"/g, '\\"')}"]`);
+  }
+
+  // Re-fetch a single node and replace just its row group in the DOM.
+  // ``oldName`` is provided when the node may have been renamed; defaults
+  // to ``newName``.
+  async function refreshNodeRow(newName, oldName) {
+    const target = findNodeTbody(oldName || newName);
+    try {
+      const node = await api("GET", `/api/nodes/${encodeURIComponent(newName)}`);
+      const replacement = renderNodeRow(node);
+      if (target) target.replaceWith(replacement);
+      else {
+        // Node row not in DOM yet (e.g. just added) — append to table.
+        const tbl = document.getElementById("nodes-table");
+        if (tbl) tbl.appendChild(replacement);
+      }
+      return node;
+    } catch (err) {
+      // If the node disappeared (rename or delete), drop the stale row.
+      if (err.status === 404 && target) target.remove();
+      throw err;
+    }
+  }
+
   async function probeNode(name) {
-    toast("info", "Probing", name);
+    const tbody = findNodeTbody(name);
+    let originalLabel = "Probe";
+    let probeBtn = null;
+    if (tbody) {
+      probeBtn = tbody.querySelector('button[data-probe-btn]');
+      if (probeBtn) {
+        originalLabel = probeBtn.textContent;
+        probeBtn.disabled = true;
+        probeBtn.textContent = "Probing…";
+      }
+    }
     try {
       const status = await api("POST", `/api/nodes/${encodeURIComponent(name)}/probe`);
+      // Pull the full node detail so the row reflects fresh status.
+      try { await refreshNodeRow(name); }
+      catch (_) { /* keep going — toast still informs the user */ }
       if (status.reachable) toast("success", "Probe complete", `${name} is reachable`);
       else toast("error", "Unreachable", status.last_probe_error || name);
-      await renderNodesView(document.getElementById("view-root"));
-    } catch (err) { toast("error", "Probe failed", err.message); }
+    } catch (err) {
+      toast("error", "Probe failed", err.message);
+      if (probeBtn) {
+        probeBtn.disabled = false;
+        probeBtn.textContent = originalLabel;
+      }
+    }
+  }
+
+  // Read-only "View full info" modal — shows every node field plus the
+  // last-probe status (including the full raw_probe shell output by
+  // section). Useful for debugging without leaving the Nodes view.
+  async function openNodeFullInfoModal(name) {
+    Modal.open({
+      title: `Node · ${name}`,
+      body: h("div", { class: "muted", style: "padding: 24px; text-align: center" }, "Loading…"),
+      footer: h("div", { class: "row" }, h("button", { class: "btn", onclick: () => Modal.close() }, "Close")),
+    });
+    let node;
+    try { node = await api("GET", `/api/nodes/${encodeURIComponent(name)}`); }
+    catch (err) {
+      Modal.close();
+      toast("error", "Failed to load node", err.message);
+      return;
+    }
+    const body = h("div");
+    const renderRows = (rows) => {
+      const tbl = h("table", { class: "data kv" });
+      const tb = h("tbody");
+      for (const [k, v] of rows) {
+        if (v === undefined || v === null || v === "") continue;
+        tb.appendChild(h("tr", null,
+          h("td", { class: "muted", style: "white-space: nowrap; padding-right: 12px; vertical-align: top; width: 1%;" }, k),
+          h("td", { class: "mono", style: "word-break: break-all; vertical-align: top;" }, String(v)),
+        ));
+      }
+      tbl.appendChild(tb);
+      return tbl;
+    };
+    const section = (title, rows) => {
+      const card = h("div", { style: "margin-bottom: 14px;" });
+      card.appendChild(h("div", { style: "font-weight: 600; margin: 6px 0 4px 0;" }, title));
+      card.appendChild(renderRows(rows));
+      return card;
+    };
+
+    body.appendChild(section("Identity", [
+      ["Name", node.name],
+      ["Description", node.description],
+      ["Tags", (node.tags || []).join(", ")],
+      ["Created", fmtDate(node.created_at)],
+      ["Updated", fmtDate(node.updated_at)],
+    ]));
+    body.appendChild(section("SSH connection", [
+      ["Host", node.host],
+      ["Port", node.ssh_port],
+      ["User", node.ssh_user],
+      ["Auth method", node.auth_method],
+      ["Password set", node.ssh_password ? "yes" : "no"],
+      ["Inline private key", node.ssh_private_key ? "yes (legacy)" : "no"],
+      ["Inline key passphrase", node.ssh_key_passphrase ? "yes" : "no"],
+    ]));
+    if ((node.linked_keys || []).length) {
+      const tbl = h("table", { class: "data" });
+      tbl.appendChild(h("thead", null, h("tr", null,
+        h("th", null, "Name"), h("th", null, "Type"),
+        h("th", null, "Fingerprint"), h("th", null, "Priority"))));
+      const tb = h("tbody");
+      for (const k of node.linked_keys) {
+        tb.appendChild(h("tr", null,
+          h("td", { class: "mono" }, k.name),
+          h("td", null, `${k.key_type}${k.bits ? "·" + k.bits : ""}`),
+          h("td", { class: "mono", style: "font-size: 11.5px;" }, k.fingerprint_sha256 || "—"),
+          h("td", { class: "muted" }, String(k.priority)),
+        ));
+      }
+      tbl.appendChild(tb);
+      const wrap = h("div", { style: "margin-bottom: 14px;" });
+      wrap.appendChild(h("div", { style: "font-weight: 600; margin: 6px 0 4px 0;" },
+        `Linked SSH keys (${node.linked_keys.length})`));
+      wrap.appendChild(tbl);
+      body.appendChild(wrap);
+    }
+
+    const status = node.status || null;
+    if (status) {
+      body.appendChild(section("Last probe", [
+        ["Reachable", status.reachable ? "yes" : "no"],
+        ["Last probed", fmtDate(status.last_probed_at)],
+        ["Probe error", status.last_probe_error],
+        ["OS", status.os_release],
+        ["Uptime", fmtUptime(status.uptime_seconds)],
+        ["Load", status.load_avg],
+        ["Memory", status.memory],
+        ["Disk", status.disk_usage],
+        ["Service installed", status.service_installed === null ? null : (status.service_installed ? "yes" : "no")],
+        ["Service running", status.service_running === null ? null : (status.service_running ? "yes" : "no")],
+        ["Service mode", status.service_mode],
+        ["Service version", status.service_version],
+      ]));
+      const raw = status.raw_probe || null;
+      const sections = raw && raw.sections;
+      if (sections && Object.keys(sections).length) {
+        const wrap = h("div", { style: "margin-bottom: 14px;" });
+        wrap.appendChild(h("div", { style: "font-weight: 600; margin: 6px 0 4px 0;" }, "Raw probe output"));
+        for (const key of Object.keys(sections)) {
+          const val = sections[key];
+          if (!val) continue;
+          wrap.appendChild(h("div", { class: "muted", style: "font-size: 11.5px; margin-top: 8px;" }, key));
+          wrap.appendChild(h("pre", {
+            class: "mono",
+            style: "background: var(--surface-alt); padding: 8px 10px; border-radius: 4px; font-size: 11.5px; white-space: pre-wrap; word-break: break-all; max-height: 160px; overflow: auto; margin: 2px 0;",
+          }, val));
+        }
+        if (raw.exit_code !== undefined && raw.exit_code !== null) {
+          wrap.appendChild(h("div", { class: "muted", style: "font-size: 11.5px; margin-top: 8px;" }, `exit_code: ${raw.exit_code}`));
+        }
+        body.appendChild(wrap);
+      }
+    } else {
+      body.appendChild(h("div", { class: "muted", style: "padding: 8px 0;" }, "Not yet probed."));
+    }
+
+    body.appendChild(section("Initialization defaults", [
+      ["Desired SSH port", node.init_desired_ssh_port],
+      ["Timezone", node.init_timezone],
+      ["Git user.name", node.init_git_user_name],
+      ["Git user.email", node.init_git_user_email],
+      ["Install Codex CLI", node.init_install_codex === false ? "no" : "yes"],
+      ["OPENAI_BASE_URL", node.init_codex_base_url],
+      ["OPENAI_API_KEY set", node.init_codex_api_key ? "yes" : "no"],
+      ["Git deploy key set", node.init_git_private_key ? "yes" : "no"],
+    ]));
+    body.appendChild(section("Commands", [
+      ["Deploy command", node.deploy_command],
+      ["Update command", node.update_command],
+    ]));
+
+    Modal.open({
+      title: `Node · ${node.name}`,
+      body,
+      footer: h("div", { class: "row" },
+        h("button", { class: "btn", onclick: async () => {
+          Modal.close();
+          await probeNode(node.name);
+          // Re-open with fresh data so the user sees the new probe in the same modal flow.
+          openNodeFullInfoModal(node.name);
+        } }, "Probe & refresh"),
+        h("button", { class: "btn btn-primary", onclick: () => Modal.close() }, "Close"),
+      ),
+    });
   }
 
   function confirmDeleteNode(node) {
@@ -1451,7 +1964,17 @@
           await api("DELETE", `/api/nodes/${encodeURIComponent(node.name)}`);
           Modal.close();
           toast("success", "Node deleted", node.name);
-          renderNodesView(document.getElementById("view-root"));
+          // Remove just the affected row instead of re-rendering everything.
+          const tbody = findNodeTbody(node.name);
+          if (tbody) tbody.remove();
+          // Update the count badge.
+          const tbl = document.getElementById("nodes-table");
+          const counter = document.getElementById("nodes-count");
+          if (tbl && counter) {
+            const remaining = tbl.querySelectorAll('tbody[data-node]').length;
+            counter.textContent = `${remaining} node${remaining === 1 ? "" : "s"}`;
+            if (remaining === 0) loadNodesIntoBody();
+          }
         } catch (err) { toast("error", "Delete failed", err.message); }
       } }, "Delete"),
     );
@@ -1463,12 +1986,12 @@
     const isEdit = !!existing;
     form.appendChild(h("div", { class: "form-row" },
       h("div", { class: "field" },
-        h("label", null, "Name", isEdit ? h("span", { class: "hint" }, " — rename allowed; child tables follow") : null),
+        h("label", null, "Name"),
         h("input", { id: "node-name", class: "input mono", value: existing ? existing.name : "", required: true, placeholder: "edge-sg-1" }),
       ),
       h("div", { class: "field" },
-        h("label", null, "Tags ", h("span", { class: "hint" }, " — comma separated")),
-        h("input", { id: "node-tags", class: "input", value: existing ? (existing.tags || []).join(", ") : "" }),
+        h("label", null, "Tags"),
+        h("input", { id: "node-tags", class: "input", value: existing ? (existing.tags || []).join(", ") : "", placeholder: "tag1, tag2" }),
       ),
     ));
     form.appendChild(h("div", { class: "form-row" },
@@ -1490,7 +2013,11 @@
         h("label", null, "Auth method"),
         (() => {
           const sel = h("select", { id: "node-auth", class: "select" });
-          for (const v of [["password", "Password"], ["key", "Private key"]]) {
+          for (const v of [
+            ["password", "Password"],
+            ["key", "Private key"],
+            ["auto", "Auto"],
+          ]) {
             const opt = h("option", { value: v[0] }, v[1]);
             if (existing && existing.auth_method === v[0]) opt.selected = true;
             sel.appendChild(opt);
@@ -1499,59 +2026,130 @@
         })(),
       ),
     ));
-    // Password block — plaintext as requested
+
     const pwdWrap = h("div", { class: "field", id: "node-pwd-wrap" },
       h("label", null, "SSH password"),
       h("input", { id: "node-pwd", class: "input mono", type: "text",
         value: isEdit && existing.ssh_password ? existing.ssh_password : "" }),
     );
-    // Key block — plaintext, expanded textarea
+    // SSH keys: pick from the registered SSH Keys table (multi-select).
+    // Any number of keys can be linked; the platform tries each one
+    // in priority order at connection time. The legacy inline textarea
+    // is kept under a disclosure for one-off / un-registered keys.
+    const linkedKeyIds = new Set((existing && existing.ssh_key_ids) || []);
+    const keyListWrap = h("div", { id: "node-keys-list",
+      style: "max-height: 200px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; padding: 4px; background: var(--surface);" },
+      h("div", { class: "muted", style: "padding: 6px;" }, "Loading SSH keys…"),
+    );
+    const keyToolsRow = h("div", { class: "row", style: "gap: 6px; margin-bottom: 6px; align-items: center;" },
+      h("button", { type: "button", class: "btn btn-sm",
+        onclick: (e) => { e.preventDefault();
+          keyListWrap.querySelectorAll('input[type="checkbox"][data-ssh-key]').forEach(c => c.checked = true);
+          updateLinkedCount();
+        } }, "Select all"),
+      h("button", { type: "button", class: "btn btn-sm",
+        onclick: (e) => { e.preventDefault();
+          keyListWrap.querySelectorAll('input[type="checkbox"][data-ssh-key]').forEach(c => c.checked = false);
+          updateLinkedCount();
+        } }, "Clear"),
+      h("a", { href: "#/ssh-keys",
+        style: "font-size: 12px; margin-left: auto;",
+        onclick: () => Modal.close() }, "Manage SSH Keys →"),
+      h("span", { class: "muted", id: "node-keys-count",
+        style: "font-size: 12px;" }, "0 selected"),
+    );
+    function updateLinkedCount() {
+      const n = keyListWrap.querySelectorAll('input[type="checkbox"][data-ssh-key]:checked').length;
+      const el = document.getElementById("node-keys-count");
+      if (el) el.textContent = `${n} selected`;
+    }
+    // Async populate from /api/ssh-keys
+    api("GET", "/api/ssh-keys").then(r => {
+      const keys = (r && r.ssh_keys) || [];
+      keyListWrap.innerHTML = "";
+      if (!keys.length) {
+        keyListWrap.appendChild(h("div", { class: "muted", style: "padding: 8px;" },
+          "No SSH keys registered yet. ",
+          h("a", { href: "#/ssh-keys", onclick: () => Modal.close() },
+            "Generate or import one →")));
+        return;
+      }
+      for (const k of keys) {
+        const id = `nk-${k.id}`;
+        const checked = linkedKeyIds.has(k.id);
+        const row = h("label", { for: id, class: "row",
+          style: "gap: 8px; padding: 4px 6px; cursor: pointer; align-items: center; font-size: 12.5px;" },
+          h("input", { type: "checkbox", id, "data-ssh-key": String(k.id),
+            checked: checked, onchange: updateLinkedCount }),
+          h("span", { class: "mono" }, k.name),
+          h("span", { class: "badge" },
+            `${k.key_type}${k.bits ? "·" + k.bits : ""}`),
+          h("span", { class: "mono muted",
+            style: "font-size: 11px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" },
+            (k.fingerprint_sha256 || "").slice(0, 30) + "…"),
+          k.comment ? h("span", { class: "muted", style: "font-size: 11px;" }, k.comment) : null,
+        );
+        keyListWrap.appendChild(row);
+      }
+      updateLinkedCount();
+    }).catch(err => {
+      keyListWrap.innerHTML = "";
+      keyListWrap.appendChild(h("div", { class: "muted", style: "padding: 8px;" },
+        "Could not load SSH keys: ", err.message));
+    });
+
+    // Ad-hoc inline key (collapsed by default unless one is set)
+    const inlineKey = (isEdit && existing.ssh_private_key) ? existing.ssh_private_key : "";
+    const adhocOpen = !!inlineKey;
+    const adhocSection = h("details", { style: "margin-top: 6px;" });
+    if (adhocOpen) adhocSection.setAttribute("open", "");
+    adhocSection.appendChild(h("summary", { class: "muted",
+      style: "cursor: pointer; font-size: 12px; padding: 4px 0;" },
+      "Ad-hoc private key"));
+    adhocSection.appendChild(h("textarea", { id: "node-key", class: "textarea mono", rows: "6",
+      placeholder: "-----BEGIN OPENSSH PRIVATE KEY-----" },
+      inlineKey));
+    adhocSection.appendChild(h("div", { class: "field", style: "margin-top: 6px;" },
+      h("label", null, "Passphrase"),
+      h("input", { id: "node-keypass", class: "input mono", type: "text",
+        value: isEdit && existing.ssh_key_passphrase ? existing.ssh_key_passphrase : "" }),
+    ));
+
     const keyWrap = h("div", { id: "node-key-wrap" },
       h("div", { class: "field" },
-        h("label", null, "SSH private key (PEM)"),
-        h("textarea", { id: "node-key", class: "textarea mono", rows: "10",
-          placeholder: "-----BEGIN OPENSSH PRIVATE KEY-----\n..." },
-          (isEdit && existing.ssh_private_key) ? existing.ssh_private_key : ""),
+        h("label", null, "Linked SSH keys"),
+        keyToolsRow,
+        keyListWrap,
       ),
-      h("div", { class: "field" },
-        h("label", null, "Key passphrase (optional)"),
-        h("input", { id: "node-keypass", class: "input mono", type: "text",
-          value: isEdit && existing.ssh_key_passphrase ? existing.ssh_key_passphrase : "" }),
-      ),
+      adhocSection,
     );
     form.appendChild(pwdWrap);
     form.appendChild(keyWrap);
 
-    const updateAuthVisibility = () => {
-      const v = document.getElementById("node-auth").value;
-      pwdWrap.style.display = v === "password" ? "" : "none";
-      keyWrap.style.display = v === "key" ? "" : "none";
-    };
+    // No more visibility toggle — both blocks are always shown so the
+    // operator can populate them in advance. Kept the no-op function
+    // around so the existing setTimeout call below doesn't ReferenceError.
+    const updateAuthVisibility = () => {};
 
     form.appendChild(h("div", { class: "field" },
-      h("label", null, "Description (optional)"),
+      h("label", null, "Description"),
       h("input", { id: "node-desc", class: "input", value: existing && existing.description ? existing.description : "" }),
     ));
     form.appendChild(h("div", { class: "field" },
-      h("label", null, "Deploy command (optional override) ",
-        h("span", { class: "hint" }, " — leave blank to use the default install script")),
+      h("label", null, "Deploy command"),
       h("textarea", { id: "node-deploy", class: "textarea mono", rows: "3",
-        value: existing && existing.deploy_command ? existing.deploy_command : "",
-        placeholder: "e.g. curl -fsSL https://.../setup.sh | sudo bash" }),
+        value: existing && existing.deploy_command ? existing.deploy_command : "" }),
     ));
     form.appendChild(h("div", { class: "field" },
-      h("label", null, "Update command (optional override)"),
+      h("label", null, "Update command"),
       h("textarea", { id: "node-update", class: "textarea mono", rows: "3",
-        value: existing && existing.update_command ? existing.update_command : "",
-        placeholder: "e.g. cd /opt/ssl-service && git pull && systemctl restart ssl-service" }),
+        value: existing && existing.update_command ? existing.update_command : "" }),
     ));
 
     // Initialization defaults — used by the Initialize wizard, editable here directly.
     const initSection = h("details", { style: "margin-top: 14px; border-top: 1px solid var(--border); padding-top: 14px" });
     initSection.appendChild(h("summary", { style: "cursor: pointer; font-weight: 600; margin-bottom: 12px" },
       "Initialization defaults",
-      h("span", { class: "muted", style: "font-weight: 400; font-size: 12px; margin-left: 8px" },
-        "— pre-fill these fields, the wizard reuses them"),
     ));
     initSection.appendChild(h("div", { class: "form-row" },
       h("div", { class: "field" },
@@ -1578,21 +2176,20 @@
       ),
     ));
     initSection.appendChild(h("div", { class: "field" },
-      h("label", null, "Git deploy key (PEM, optional)"),
+      h("label", null, "Git deploy key"),
       h("textarea", { id: "node-init-gitkey", class: "textarea mono", rows: "6",
-        placeholder: "-----BEGIN OPENSSH PRIVATE KEY-----\n..." },
+        placeholder: "-----BEGIN OPENSSH PRIVATE KEY-----" },
         existing && existing.init_git_private_key ? existing.init_git_private_key : ""),
     ));
     initSection.appendChild(h("div", { class: "field inline-checkbox" },
       h("input", { type: "checkbox", id: "node-init-codex",
         checked: !existing || existing.init_install_codex !== false }),
-      h("label", { for: "node-init-codex", style: "margin: 0" }, "Install Codex CLI by default"),
+      h("label", { for: "node-init-codex", style: "margin: 0" }, "Install Codex CLI"),
     ));
     initSection.appendChild(h("div", { class: "form-row" },
       h("div", { class: "field" },
         h("label", null, "OPENAI_BASE_URL"),
         h("input", { id: "node-init-codexurl", class: "input mono",
-          placeholder: "(blank = script default)",
           value: existing && existing.init_codex_base_url ? existing.init_codex_base_url : "" }),
       ),
       h("div", { class: "field" },
@@ -1624,13 +2221,29 @@
         };
         // Secrets — always send what's in the textarea since fields are now plaintext.
         const pwd = document.getElementById("node-pwd").value;
-        const key = document.getElementById("node-key").value;
-        const keypass = document.getElementById("node-keypass").value;
+        const key = document.getElementById("node-key") ? document.getElementById("node-key").value : "";
+        const keypass = document.getElementById("node-keypass") ? document.getElementById("node-keypass").value : "";
         payload.ssh_password = pwd || null;
         payload.ssh_private_key = key || null;
         payload.ssh_key_passphrase = keypass || null;
+
+        // Linked SSH key ids from the multi-select picker
+        const linkedIds = Array.from(
+          document.querySelectorAll('#node-keys-list input[type="checkbox"][data-ssh-key]:checked')
+        ).map(cb => parseInt(cb.getAttribute("data-ssh-key"), 10)).filter(Number.isFinite);
+        payload.ssh_key_ids = linkedIds;
+        const haveAnyKey = key || linkedIds.length > 0;
+
         if (auth === "password" && !pwd) { toast("error", "Password required"); return; }
-        if (auth === "key" && !key) { toast("error", "Private key required"); return; }
+        if (auth === "key" && !haveAnyKey) {
+          toast("error", "No SSH key", "Pick at least one from the list, or paste an ad-hoc key");
+          return;
+        }
+        if (auth === "auto" && !pwd && !haveAnyKey) {
+          toast("error", "Need at least one credential",
+            "Provide password, link a key, or paste one for Auto mode");
+          return;
+        }
 
         // Init defaults section — only push when the section is open OR
         // we already have an existing record (so values are pre-populated).
@@ -1658,8 +2271,15 @@
             await api("POST", "/api/nodes", payload);
           }
           Modal.close();
-          toast("success", isEdit ? "Node updated" : "Node added", enteredName || existing.name);
-          onSaved && onSaved();
+          const finalName = enteredName || (existing && existing.name);
+          toast("success", isEdit ? "Node updated" : "Node added", finalName);
+          if (onSaved) {
+            await onSaved({
+              name: finalName,
+              oldName: isEdit ? existing.name : finalName,
+              isEdit,
+            });
+          }
         } catch (err) { toast("error", "Save failed", err.message); }
       } }, isEdit ? "Save" : "Add node"),
     );
@@ -2317,7 +2937,7 @@
       h("tr", null,
         h("th", null, "Name"),
         h("th", null, "Repo"),
-        h("th", null, "Compose"),
+        h("th", null, "Manifest"),
         h("th", null, "Branch"),
         h("th", null, "Updated"),
         h("th", null, ""),
@@ -2326,6 +2946,16 @@
     const tbody = h("tbody");
     for (const s of services) {
       const actions = h("td", { class: "actions" });
+      actions.appendChild(h("button", { class: "btn btn-sm",
+        title: s.has_manifest ? "Re-fetch .deploy.yaml from GitHub" : "Pull .deploy.yaml from GitHub",
+        onclick: () => fetchServiceManifest(s.name, true)
+      }, s.has_manifest ? "Sync" : "Sync manifest"));
+      actions.appendChild(h("button", { class: "btn btn-sm btn-primary",
+        title: "Deploy this service to one or more nodes",
+        onclick: () => openServiceDeployModal(s)
+      }, "Deploy…"));
+      actions.appendChild(h("button", { class: "btn btn-sm",
+        onclick: () => openServiceHistoryModal(s.name) }, "History"));
       actions.appendChild(h("button", { class: "btn btn-sm",
         onclick: () => openServiceModal(s, () => renderServicesView(document.getElementById("view-root")))
       }, "Edit"));
@@ -2338,13 +2968,29 @@
               toast("success", "Deleted", s.name);
               renderServicesView(document.getElementById("view-root"));
             } catch (err) { toast("error", "Delete failed", err.message); }
-          } }, "Delete"));
+          } }, "✕"));
+      }
+      const manifestCell = h("td", null);
+      if (s.has_manifest) {
+        manifestCell.appendChild(h("span", { class: "badge ok" }, "loaded"));
+        if ((s.required_env || []).length) {
+          manifestCell.appendChild(h("span", { class: "muted",
+            style: "margin-left: 6px; font-size: 11px;" },
+            `requires ${s.required_env.length} env`));
+        }
+        if ((s.exposed_ports || []).length) {
+          manifestCell.appendChild(h("span", { class: "muted",
+            style: "margin-left: 6px; font-size: 11px;" },
+            `port ${s.exposed_ports.join(",")}`));
+        }
+      } else {
+        manifestCell.appendChild(h("span", { class: "badge warn" }, "not synced"));
       }
       tbody.appendChild(h("tr", null,
         h("td", { class: "domain" }, s.name,
           s.description ? h("div", { class: "muted", style: "font-size: 11px; margin-top: 2px" }, s.description) : null),
         h("td", { class: "mono", style: "font-size: 12px" }, s.github_repo_url),
-        h("td", { class: "mono", style: "font-size: 12px" }, s.compose_file),
+        manifestCell,
         h("td", { class: "mono", style: "font-size: 12px" }, s.default_branch),
         h("td", { class: "muted" }, fmtRelative(s.updated_at)),
         actions,
@@ -2354,6 +3000,311 @@
     const wrap = h("div", { class: "table-wrap" });
     wrap.appendChild(table);
     return wrap;
+  }
+
+  async function fetchServiceManifest(name, refresh) {
+    toast("info", "Syncing", `Fetching .deploy.yaml from ${name}…`);
+    try {
+      const r = await api("POST", `/api/services/${encodeURIComponent(name)}/manifest`,
+        { save: true });
+      toast("success", "Manifest synced",
+        `${name} · branch=${r.branch_used} · ${(r.manifest.required_env || []).length} required env`);
+      if (refresh) renderServicesView(document.getElementById("view-root"));
+    } catch (err) { toast("error", "Sync failed", err.message); }
+  }
+
+  async function openServiceDeployModal(service) {
+    let manifest = null;
+    try {
+      // Always re-parse from cached deploy_yaml if available; otherwise fetch.
+      if (service.has_manifest && service.deploy_yaml) {
+        manifest = parseInlineManifest(service);
+      } else {
+        const r = await api("POST", `/api/services/${encodeURIComponent(service.name)}/manifest`,
+          { save: true });
+        manifest = r.manifest;
+      }
+    } catch (err) { toast("error", "Could not load manifest", err.message); return; }
+
+    const form = h("form");
+    form.appendChild(h("p", { class: "muted" },
+      "Deploy ", h("strong", null, service.name),
+      " — git: ", h("span", { class: "mono" }, service.github_repo_url),
+      ". The platform will clone, write .env, run ",
+      h("span", { class: "mono" }, "docker compose up -d --build"),
+      ", and verify the healthcheck before marking each node successful."));
+
+    // Revision pin
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Revision ", h("span", { class: "hint" },
+          " — git SHA, tag, or branch. Default: ", h("span", { class: "mono" }, service.default_branch || "main"))),
+        h("input", { id: "svc-revision", class: "input mono",
+          placeholder: service.default_branch || "main", value: "" })),
+      h("div", { class: "field" },
+        h("label", null, "Triggered by ", h("span", { class: "hint" }, " — record only")),
+        h("input", { id: "svc-triggered-by", class: "input", value: "admin" })),
+    ));
+
+    // Env overrides — show defaults + required highlighted
+    const envWrap = h("div", { class: "field" },
+      h("label", null, "Environment ", h("span", { class: "hint" },
+        " — required fields in red MUST be filled; others use the default")));
+    const envTable = h("table", { class: "data", style: "width: 100%; font-size: 12.5px;" });
+    envTable.appendChild(h("thead", null, h("tr", null,
+      h("th", null, "Variable"), h("th", null, "Default"), h("th", null, "Override (per-deploy)"))));
+    const envBody = h("tbody");
+    const allKeys = new Set([
+      ...(manifest.required_env || []),
+      ...Object.keys(manifest.defaults || {}),
+      ...Object.keys(service.default_env || {}),
+    ]);
+    for (const key of Array.from(allKeys).sort()) {
+      const isRequired = (manifest.required_env || []).includes(key);
+      const def = (manifest.defaults || {})[key] ?? (service.default_env || {})[key] ?? "";
+      const tr = h("tr", null,
+        h("td", { class: "mono", style: "font-size: 12px" },
+          isRequired
+            ? h("span", { style: "color: var(--danger); font-weight: bold;" }, key + " *")
+            : key),
+        h("td", { class: "muted mono", style: "font-size: 11px" }, def || h("span", null, "—")),
+        h("td", null, h("input", {
+          class: "input mono",
+          "data-env-key": key,
+          placeholder: def || (isRequired ? "(required)" : ""),
+          style: isRequired && !def ? "border-color: var(--danger);" : "",
+        })),
+      );
+      envBody.appendChild(tr);
+    }
+    envTable.appendChild(envBody);
+    const envWrapInner = h("div", { class: "table-wrap",
+      style: "max-height: 240px; overflow-y: auto;" });
+    envWrapInner.appendChild(envTable);
+    envWrap.appendChild(envWrapInner);
+    form.appendChild(envWrap);
+
+    // Node multi-select
+    const listWrap = h("div", { class: "field" },
+      h("label", null, "Target nodes"));
+    const tools = h("div", { class: "row", style: "gap: 6px; margin-bottom: 6px;" },
+      h("button", { type: "button", class: "btn btn-sm",
+        onclick: (e) => { e.preventDefault();
+          form.querySelectorAll('input[type="checkbox"][data-node]').forEach(c => c.checked = true);
+          updateCount();
+        } }, "Select all"),
+      h("button", { type: "button", class: "btn btn-sm",
+        onclick: (e) => { e.preventDefault();
+          form.querySelectorAll('input[type="checkbox"][data-node]').forEach(c => c.checked = false);
+          updateCount();
+        } }, "Clear"),
+      h("span", { class: "muted", id: "svc-deploy-count", style: "margin-left: 8px;" }, "0 selected"),
+    );
+    listWrap.appendChild(tools);
+    const list = h("div", { style:
+      "max-height: 200px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; padding: 6px; background: var(--surface);" });
+    listWrap.appendChild(list);
+    form.appendChild(listWrap);
+
+    function updateCount() {
+      const n = form.querySelectorAll('input[type="checkbox"][data-node]:checked').length;
+      const el = document.getElementById("svc-deploy-count");
+      if (el) el.textContent = `${n} selected`;
+    }
+    try {
+      const r = await api("GET", "/api/nodes");
+      for (const n of (r.nodes || [])) {
+        const id = `sn-${n.name}`;
+        list.appendChild(h("label", {
+          class: "row", style: "gap: 8px; padding: 4px 6px; cursor: pointer; align-items: center;", for: id },
+          h("input", { type: "checkbox", id, "data-node": n.name, onchange: updateCount }),
+          h("span", { class: "mono" }, n.name),
+          h("span", { class: "muted", style: "font-size: 11.5px;" },
+            ` ${n.ssh_user}@${n.host}:${n.ssh_port}`),
+          h("span", { class: "badge", style: "margin-left: auto; font-size: 10.5px;" }, n.auth_method),
+        ));
+      }
+    } catch (err) { toast("error", "Could not list nodes", err.message); }
+
+    const footer = h("div", { class: "row" },
+      h("button", { type: "button", class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("div", { style: "flex: 1;" }),
+      h("button", { type: "button", class: "btn btn-primary", onclick: async () => {
+        const nodes = Array.from(form.querySelectorAll('input[type="checkbox"][data-node]:checked'))
+          .map(c => c.getAttribute("data-node"));
+        if (!nodes.length) { toast("error", "Pick at least one node"); return; }
+        const env = {};
+        form.querySelectorAll('input[data-env-key]').forEach(inp => {
+          const k = inp.getAttribute("data-env-key");
+          const v = inp.value;
+          if (v && v.trim()) env[k] = v;
+        });
+        const payload = {
+          nodes,
+          env,
+          revision: document.getElementById("svc-revision").value.trim() || null,
+          triggered_by: document.getElementById("svc-triggered-by").value.trim() || "admin",
+        };
+        if (!confirm(`Deploy ${service.name} (${payload.revision || service.default_branch || 'main'}) to ${nodes.length} node(s)?`))
+          return;
+        try {
+          const r = await api("POST", `/api/services/${encodeURIComponent(service.name)}/deploy`, payload);
+          Modal.close();
+          openServiceDeployReportModal(r);
+          toast(r.fail === 0 ? "success" : "info", "Deploy complete",
+            `${r.success}/${r.total} ok · ${r.fail} failed`);
+        } catch (err) { toast("error", "Deploy failed", err.message); }
+      } }, "Deploy"),
+    );
+    Modal.open({ title: `Deploy ${service.name}`, body: form, footer });
+  }
+
+  function parseInlineManifest(service) {
+    // The backend already split out the parsed fields; rebuild a
+    // partial manifest object so the modal logic doesn't re-parse YAML.
+    return {
+      required_env: service.required_env || [],
+      defaults: {},   // manifest defaults are folded into required_env display
+      exposed_ports: service.exposed_ports || [],
+      healthcheck: service.healthcheck || {},
+    };
+  }
+
+  function openServiceDeployReportModal(report) {
+    const body = h("div", null,
+      h("div", { class: "row", style: "gap: 12px; margin-bottom: 12px;" },
+        h("div", null, h("strong", null, "Service: "), report.service),
+        h("div", null, h("strong", null, "Revision: "),
+          h("span", { class: "mono" }, report.revision_requested)),
+        h("div", null, h("span", { class: "badge ok" }, `${report.success} ok`)),
+        h("div", null, h("span", { class: "badge danger" }, `${report.fail} failed`)),
+        h("div", { class: "muted" }, "at " + fmtDate(report.at)),
+      ),
+    );
+    const tbl = h("table", { class: "data" });
+    tbl.appendChild(h("thead", null, h("tr", null,
+      h("th", null, "Node"), h("th", null, "Result"),
+      h("th", null, "Healthcheck"), h("th", null, "SHA"),
+      h("th", null, "Duration"), h("th", null, "Detail"))));
+    const tb = h("tbody");
+    for (const r of (report.results || [])) {
+      tb.appendChild(h("tr", null,
+        h("td", { class: "mono" }, r.node),
+        h("td", null, r.ok
+          ? h("span", { class: "badge ok" }, "ok")
+          : h("span", { class: "badge danger" }, "fail")),
+        h("td", null,
+          r.healthcheck_passed === true
+            ? h("span", { class: "badge ok" }, "passed")
+            : (r.healthcheck_passed === false
+              ? h("span", { class: "badge danger" }, "failed")
+              : h("span", { class: "muted" }, "—"))),
+        h("td", { class: "mono", style: "font-size: 11px" },
+          r.deployed_sha ? r.deployed_sha.slice(0, 8) : "—"),
+        h("td", { class: "muted mono", style: "font-size: 11px" },
+          r.duration_seconds != null ? r.duration_seconds + "s" : "—"),
+        h("td", { class: "muted mono", style: "font-size: 11px" },
+          (r.error || r.healthcheck_detail || "").slice(0, 120)),
+      ));
+    }
+    tbl.appendChild(tb);
+    const wrap = h("div", { class: "table-wrap" });
+    wrap.appendChild(tbl);
+    body.appendChild(wrap);
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Close"));
+    Modal.open({ title: "Deploy report", body, footer });
+  }
+
+  async function openServiceHistoryModal(serviceName) {
+    let r;
+    try {
+      r = await api("GET", `/api/services/${encodeURIComponent(serviceName)}/deployments?limit=50`);
+    } catch (err) { toast("error", "Load failed", err.message); return; }
+
+    const body = h("div", null);
+    body.appendChild(h("h3", { style: "margin: 0 0 6px;" }, "Current state per node"));
+    if ((r.states || []).length === 0) {
+      body.appendChild(h("div", { class: "muted" }, "(never deployed)"));
+    } else {
+      const stateTable = h("table", { class: "data" });
+      stateTable.appendChild(h("thead", null, h("tr", null,
+        h("th", null, "Node"), h("th", null, "Status"),
+        h("th", null, "Revision"), h("th", null, "Updated"))));
+      const stb = h("tbody");
+      for (const st of r.states) {
+        stb.appendChild(h("tr", null,
+          h("td", { class: "mono" }, st.node_name),
+          h("td", null, st.status === "success"
+            ? h("span", { class: "badge ok" }, "success")
+            : (st.status === "failed"
+              ? h("span", { class: "badge danger" }, "failed")
+              : h("span", { class: "badge" }, st.status || "—"))),
+          h("td", { class: "mono", style: "font-size: 11px" },
+            (st.revision || "—").slice(0, 12)),
+          h("td", { class: "muted" }, fmtRelative(st.updated_at)),
+        ));
+      }
+      stateTable.appendChild(stb);
+      const w1 = h("div", { class: "table-wrap" }); w1.appendChild(stateTable);
+      body.appendChild(w1);
+    }
+
+    body.appendChild(h("h3", { style: "margin: 16px 0 6px;" }, "Recent deployments"));
+    const histTable = h("table", { class: "data" });
+    histTable.appendChild(h("thead", null, h("tr", null,
+      h("th", null, "When"), h("th", null, "Node"), h("th", null, "Status"),
+      h("th", null, "HC"), h("th", null, "Revision"),
+      h("th", null, "Trigger"), h("th", null, ""))));
+    const hb = h("tbody");
+    for (const d of (r.deployments || [])) {
+      hb.appendChild(h("tr", null,
+        h("td", { class: "muted mono", style: "font-size: 11px" }, fmtDate(d.started_at)),
+        h("td", { class: "mono" }, d.node_name),
+        h("td", null, d.status === "success"
+          ? h("span", { class: "badge ok" }, "success")
+          : (d.status === "failed"
+            ? h("span", { class: "badge danger" }, "failed")
+            : h("span", { class: "badge" }, d.status))),
+        h("td", null, d.healthcheck_passed === true
+          ? h("span", { class: "badge ok" }, "✓")
+          : (d.healthcheck_passed === false
+            ? h("span", { class: "badge danger" }, "✗")
+            : h("span", { class: "muted" }, "—"))),
+        h("td", { class: "mono", style: "font-size: 11px" },
+          (d.revision || "—").slice(0, 12)),
+        h("td", { class: "muted", style: "font-size: 11px" }, d.triggered_by || ""),
+        h("td", null, h("button", { class: "btn btn-sm",
+          onclick: () => openDeploymentLogModal(d) }, "Log")),
+      ));
+    }
+    histTable.appendChild(hb);
+    const w2 = h("div", { class: "table-wrap" }); w2.appendChild(histTable);
+    body.appendChild(w2);
+
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Close"));
+    Modal.open({ title: `Deployment history · ${serviceName}`, body, footer });
+  }
+
+  function openDeploymentLogModal(d) {
+    const body = h("div", null,
+      h("div", { class: "muted", style: "margin-bottom: 8px;" },
+        `${d.node_name} · ${d.status} · started ${fmtDate(d.started_at)}` +
+        (d.finished_at ? ` · finished ${fmtDate(d.finished_at)}` : "")
+      ),
+      h("h4", { style: "margin: 6px 0 4px;" }, "Healthcheck detail"),
+      h("pre", { class: "mono",
+        style: "background: var(--surface-alt); padding: 8px; max-height: 120px; overflow: auto; font-size: 11px;" },
+        d.healthcheck_detail || "(none)"),
+      h("h4", { style: "margin: 12px 0 4px;" }, "Log"),
+      h("pre", { class: "mono",
+        style: "background: var(--surface-alt); padding: 8px; max-height: 320px; overflow: auto; font-size: 11px; white-space: pre-wrap;" },
+        d.log_text || "(empty)"),
+    );
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Close"));
+    Modal.open({ title: `Deployment #${d.id}`, body, footer });
   }
 
   function envDictToText(envDict) {
@@ -2467,6 +3418,1228 @@
       } }, isEdit ? "Save" : "Add service"),
     );
     Modal.open({ title: isEdit ? `Edit ${existing.name}` : "Add service", body: form, footer });
+  }
+
+  // ----- Static IPs view -----
+
+  // Per-row loop-test timers that survive view re-renders within the
+  // same #/static-ips session. Cleared when the user navigates away.
+  const StaticIpLoopState = {
+    timers: new Map(),    // id -> setInterval handle
+    seconds: new Map(),   // id -> chosen seconds
+    statuses: new Map(),  // id -> latest result {success, latency_ms, error, at}
+    onTickCallbacks: new Set(),
+    start(id, seconds, runOnce) {
+      this.stop(id);
+      this.seconds.set(id, seconds);
+      const handle = setInterval(() => runOnce(id), seconds * 1000);
+      this.timers.set(id, handle);
+      runOnce(id);
+    },
+    stop(id) {
+      const t = this.timers.get(id);
+      if (t) clearInterval(t);
+      this.timers.delete(id);
+      this.seconds.delete(id);
+    },
+    stopAll() {
+      for (const t of this.timers.values()) clearInterval(t);
+      this.timers.clear();
+      this.seconds.clear();
+      // statuses is cosmetic (used to show fresh badges in the table) —
+      // wipe it too so we don't carry stale "ok" indicators into a
+      // future visit when the DB has since changed.
+      this.statuses.clear();
+    },
+    isRunning(id) { return this.timers.has(id); },
+  };
+
+  function ipResultBadge(success, latency, error, at) {
+    if (success === null || success === undefined)
+      return h("span", { class: "badge" }, "—");
+    if (success) {
+      const text = (latency != null) ? `ok · ${latency}ms` : "ok";
+      const b = h("span", { class: "badge ok", title: at ? fmtDate(at) : "" }, h("span", { class: "dot" }), text);
+      return b;
+    }
+    return h("span", { class: "badge danger", title: error || "" }, h("span", { class: "dot" }), "fail");
+  }
+
+  function ipUnlockBadge(item) {
+    const s = (item.status || "").toLowerCase();
+    if (s === "available" || s === "full") return h("span", { class: "badge ok" }, item.service);
+    if (s === "originals_only") return h("span", { class: "badge warn" }, item.service + " · originals");
+    if (s === "blocked") return h("span", { class: "badge danger" }, item.service + " · blocked");
+    if (s === "error") return h("span", { class: "badge" }, item.service + " · err");
+    return h("span", { class: "badge" }, item.service + " · ?");
+  }
+
+  async function renderStaticIpsView(root, params) {
+    setActiveNav("static-ips");
+    root.innerHTML = "";
+    // Loop timers must persist across in-view re-renders (caused by
+    // sort changes, bulk-add, single-test toasts, etc.). They should
+    // only be cleared when the user navigates AWAY to a different
+    // page. We set the leave hook once per session — Router calls
+    // App._leaveCurrent on hashchange.
+    App._leaveCurrent = () => StaticIpLoopState.stopAll();
+
+    let currentSort = (params && params.sort) || "country";
+
+    // Page header
+    root.appendChild(h("div", { class: "page-header" },
+      h("div", null,
+        h("h1", null, "Static IPs"),
+        h("p", { class: "lede" }, "Registry of static IP endpoints with country / provider attribution. Bulk-paste any blob — IPs, ports, protocols, country names — and an AI parser turns it into clean rows. Test connectivity per row, in a loop, or all at once. Probe an IP for a full information snapshot."),
+      ),
+      h("div", { class: "row" },
+        h("button", { class: "btn", onclick: () => renderStaticIpsView(root, { sort: currentSort }) }, "Refresh"),
+        h("button", { class: "btn btn-primary", id: "btn-test-all", onclick: () => runTestAll() }, "▶ Test all"),
+        h("button", { class: "btn btn-primary", onclick: () => openBulkAddModal(() => renderStaticIpsView(root, { sort: currentSort })) }, "+ Bulk add"),
+      ),
+    ));
+
+    // Sort controls
+    const sortRow = h("div", { class: "row", style: "gap: 6px; margin-bottom: 12px;" },
+      h("span", { class: "muted" }, "Sort: "),
+      ...["country", "provider", "ip", "created"].map(opt =>
+        h("button", { class: "btn btn-sm" + (opt === currentSort ? " btn-primary" : ""),
+          onclick: () => { currentSort = opt; renderStaticIpsView(root, { sort: opt }); } },
+          opt[0].toUpperCase() + opt.slice(1)),
+      ),
+    );
+    root.appendChild(sortRow);
+
+    // Card with table
+    const card = h("div", { class: "card" });
+    card.appendChild(h("div", { class: "card-header" },
+      h("h2", null, "All static IPs"),
+      h("span", { class: "hint", id: "ips-count" }, ""),
+    ));
+    const body = h("div", { class: "card-body tight", id: "ips-body" });
+    card.appendChild(body);
+    root.appendChild(card);
+
+    try {
+      const resp = await api("GET", "/api/static-ips?sort=" + encodeURIComponent(currentSort));
+      const ips = resp.static_ips || [];
+      document.getElementById("ips-count").textContent = `${ips.length} IP${ips.length === 1 ? "" : "s"}`;
+      if (!ips.length) {
+        body.appendChild(h("div", { class: "empty" },
+          h("div", { class: "title" }, "No static IPs registered yet"),
+          h("div", { class: "sub" }, 'Click "+ Bulk add" to paste a blob and let the AI parser turn it into rows.'),
+        ));
+      } else {
+        body.appendChild(renderStaticIpsTable(ips));
+      }
+    } catch (err) {
+      if (err.status === 401) showLogin();
+      else toast("error", "Failed to load static IPs", err.message);
+    }
+  }
+
+  function renderStaticIpsTable(ips) {
+    const table = h("table", { class: "data" });
+    table.appendChild(h("thead", null,
+      h("tr", null,
+        h("th", null, "IP"),
+        h("th", null, "Port"),
+        h("th", null, "Protocol"),
+        h("th", null, "Country"),
+        h("th", null, "Provider"),
+        h("th", null, "Last test"),
+        h("th", null, "Loop"),
+        h("th", null, ""),
+      ),
+    ));
+    const tbody = h("tbody");
+    for (const r of ips) {
+      const liveStatus = StaticIpLoopState.statuses.get(r.id);
+      const lastSuccess = liveStatus ? liveStatus.success : r.last_test_success;
+      const lastLatency = liveStatus ? liveStatus.latency_ms : r.last_test_latency_ms;
+      const lastError = liveStatus ? liveStatus.error : r.last_test_error;
+      const lastAt = liveStatus ? liveStatus.at : r.last_test_at;
+
+      const actions = h("td", { class: "actions" });
+      actions.appendChild(h("button", { class: "btn btn-sm",
+        onclick: async () => { await runSingleTest(r.id); }
+      }, "Test"));
+      actions.appendChild(h("button", { class: "btn btn-sm",
+        onclick: async () => { await runProbe(r.id); }
+      }, "Probe"));
+      actions.appendChild(h("button", { class: "btn btn-sm",
+        onclick: () => openIpDetailModal(r.id)
+      }, "Details"));
+      if (App.mode === "readwrite") {
+        actions.appendChild(h("button", { class: "btn btn-sm",
+          onclick: () => openEditIpModal(r, () => renderStaticIpsView(document.getElementById("view-root"), {}))
+        }, "Edit"));
+        actions.appendChild(h("button", { class: "btn btn-sm danger",
+          onclick: () => confirmDeleteIp(r)
+        }, "✕"));
+      }
+
+      const loopRunning = StaticIpLoopState.isRunning(r.id);
+      const loopBtn = h("button", {
+        class: "btn btn-sm" + (loopRunning ? " btn-primary" : ""),
+        onclick: () => toggleLoop(r),
+      }, loopRunning ? `Stop (${StaticIpLoopState.seconds.get(r.id)}s)` : "▶ Loop");
+
+      const tr = h("tr", { "data-ip": r.id },
+        h("td", { class: "mono" }, r.ip),
+        h("td", { class: "mono" }, r.port == null ? "—" : String(r.port)),
+        h("td", null, h("span", { class: "badge" }, r.protocol || "tcp")),
+        h("td", null, r.country || h("span", { class: "muted" }, "—")),
+        h("td", null, r.provider || h("span", { class: "muted" }, "—")),
+        h("td", null, ipResultBadge(lastSuccess, lastLatency, lastError, lastAt),
+          lastAt ? h("div", { class: "muted", style: "font-size: 11px; margin-top: 2px" }, fmtRelative(lastAt)) : null),
+        h("td", null, loopBtn),
+        actions,
+      );
+      tbody.appendChild(tr);
+
+      // Static info preview row (when present)
+      if (r.static_info && (r.static_info.geo || (r.static_info.unlock || []).length)) {
+        const detailCells = [];
+        const geo = r.static_info.geo || {};
+        if (geo.country || geo.country_code) detailCells.push(`geo: ${geo.country || ""} ${geo.country_code ? "(" + geo.country_code + ")" : ""}`);
+        if (geo.city) detailCells.push(`city: ${geo.city}`);
+        if (geo.org) detailCells.push(`org: ${geo.org}`);
+        if (geo.asn) detailCells.push(`asn: ${geo.asn}`);
+        const wrap = h("div", { class: "row", style: "flex-wrap: wrap; gap: 4px;" });
+        for (const u of (r.static_info.unlock || [])) wrap.appendChild(ipUnlockBadge(u));
+        if (detailCells.length || wrap.childNodes.length) {
+          const cell = h("td", { colspan: "8", class: "muted", style: "font-size: 11.5px; padding: 6px 16px" },
+            detailCells.join("  ·  "),
+            detailCells.length && wrap.childNodes.length ? "  " : null,
+            wrap.childNodes.length ? wrap : null,
+          );
+          tbody.appendChild(h("tr", { style: "background: var(--surface-alt)" }, cell));
+        }
+      }
+    }
+    table.appendChild(tbody);
+    const wrap = h("div", { class: "table-wrap" });
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  function toggleLoop(row) {
+    if (StaticIpLoopState.isRunning(row.id)) {
+      StaticIpLoopState.stop(row.id);
+      renderStaticIpsView(document.getElementById("view-root"), {});
+      return;
+    }
+    // Ask user for interval
+    const form = h("form");
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Interval (seconds)"),
+      h("input", { id: "loop-interval", class: "input mono", type: "number", min: "1", value: row.loop_test_seconds || 10 }),
+    ));
+    const footer = h("div", { class: "row" },
+      h("button", { type: "button", class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { type: "button", class: "btn btn-primary", onclick: async () => {
+        const sec = Math.max(1, parseInt(document.getElementById("loop-interval").value, 10) || 10);
+        Modal.close();
+        // Persist preference
+        try { await api("PATCH", `/api/static-ips/${row.id}`, { loop_test_seconds: sec }); } catch (_) {}
+        StaticIpLoopState.start(row.id, sec, async (id) => {
+          try {
+            const r = await api("POST", `/api/static-ips/${id}/test`, { kind: "loop" });
+            StaticIpLoopState.statuses.set(id, {
+              success: r.result.success,
+              latency_ms: r.result.latency_ms,
+              error: r.result.error,
+              at: new Date().toISOString(),
+            });
+            renderStaticIpsView(document.getElementById("view-root"), {});
+          } catch (err) {
+            toast("error", "Loop test failed", err.message);
+            StaticIpLoopState.stop(id);
+          }
+        });
+        renderStaticIpsView(document.getElementById("view-root"), {});
+      } }, "Start"),
+    );
+    Modal.open({ title: `Loop test ${row.ip}`, body: form, footer });
+  }
+
+  async function runSingleTest(id) {
+    toast("info", "Testing", "Running connectivity check…");
+    try {
+      const r = await api("POST", `/api/static-ips/${id}/test`, { kind: "manual" });
+      if (r.result.success) toast("success", "Test ok", `${r.ip} · ${r.result.latency_ms ?? ""}ms`);
+      else toast("error", "Test failed", r.result.error || `${r.ip} unreachable`);
+      renderStaticIpsView(document.getElementById("view-root"), {});
+    } catch (err) {
+      toast("error", "Test failed", err.message);
+    }
+  }
+
+  async function runProbe(id) {
+    toast("info", "Probing", "Looking up info…");
+    try {
+      const r = await api("POST", `/api/static-ips/${id}/probe`);
+      toast("success", "Probe complete", r.ip);
+      // Show summary in modal
+      openStaticInfoModal(r.ip, r.static_info);
+      renderStaticIpsView(document.getElementById("view-root"), {});
+    } catch (err) {
+      toast("error", "Probe failed", err.message);
+    }
+  }
+
+  async function runTestAll() {
+    const btn = document.getElementById("btn-test-all");
+    if (btn) { btn.setAttribute("disabled", "true"); btn.textContent = "Testing…"; }
+    try {
+      const r = await api("POST", "/api/static-ips/test-all");
+      openTestAllReportModal(r);
+      renderStaticIpsView(document.getElementById("view-root"), {});
+      const persistFail = (r.errors || []).length;
+      const tone = (r.fail === 0 && persistFail === 0) ? "success" : (persistFail ? "error" : "info");
+      const detail = `${r.success}/${r.total} ok · ${r.fail} failed`
+        + (persistFail ? ` · ${persistFail} persist errors` : "");
+      toast(tone, "Test-all complete", detail);
+    } catch (err) {
+      toast("error", "Test-all failed", err.message);
+    } finally {
+      if (btn) { btn.removeAttribute("disabled"); btn.textContent = "▶ Test all"; }
+    }
+  }
+
+  function openTestAllReportModal(report) {
+    const persistErrors = (report.errors || []);
+    const body = h("div", null,
+      h("div", { class: "row", style: "gap: 12px; margin-bottom: 12px" },
+        h("div", null, h("strong", null, "Total: "), String(report.total)),
+        h("div", null, h("span", { class: "badge ok" }, `${report.success} ok`)),
+        h("div", null, h("span", { class: "badge danger" }, `${report.fail} failed`)),
+        persistErrors.length
+          ? h("div", null, h("span", { class: "badge warn" }, `${persistErrors.length} persist errors`))
+          : null,
+        h("div", { class: "muted" }, "at " + fmtDate(report.at)),
+      ),
+    );
+    if (persistErrors.length) {
+      const ul = h("ul", { style: "margin: 0 0 12px; padding-left: 20px; font-size: 12px;" });
+      for (const e of persistErrors) {
+        ul.appendChild(h("li", { class: "muted mono" },
+          `[${e.stage || "?"}] ${e.ip} (id=${e.id}): ${e.error}`));
+      }
+      body.appendChild(ul);
+    }
+    const table = h("table", { class: "data" });
+    table.appendChild(h("thead", null, h("tr", null,
+      h("th", null, "IP"),
+      h("th", null, "Port"),
+      h("th", null, "Country"),
+      h("th", null, "Provider"),
+      h("th", null, "Result"),
+      h("th", null, "Latency"),
+      h("th", null, "Error"),
+    )));
+    const tbody = h("tbody");
+    for (const row of (report.results || [])) {
+      const ok = row.result.success;
+      tbody.appendChild(h("tr", null,
+        h("td", { class: "mono" }, row.ip),
+        h("td", { class: "mono" }, row.port == null ? "—" : String(row.port)),
+        h("td", null, row.country || "—"),
+        h("td", null, row.provider || "—"),
+        h("td", null, ok ? h("span", { class: "badge ok" }, "ok") : h("span", { class: "badge danger" }, "fail")),
+        h("td", { class: "mono" }, row.result.latency_ms == null ? "—" : (row.result.latency_ms + "ms")),
+        h("td", { class: "muted mono", style: "font-size: 11px" }, row.result.error || ""),
+      ));
+    }
+    table.appendChild(tbody);
+    const wrap = h("div", { class: "table-wrap" });
+    wrap.appendChild(table);
+    body.appendChild(wrap);
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Close"),
+    );
+    Modal.open({ title: "Test-all report", body, footer });
+  }
+
+  function openStaticInfoModal(ip, info) {
+    const body = h("div", null);
+    const geo = info && info.geo ? info.geo : {};
+    const geoTable = h("table", { class: "data" });
+    geoTable.appendChild(h("tbody", null,
+      h("tr", null, h("th", null, "IP"), h("td", { class: "mono" }, geo.ip || ip || "—")),
+      h("tr", null, h("th", null, "Country"), h("td", null, (geo.country || "") + (geo.country_code ? " (" + geo.country_code + ")" : "") || "—")),
+      h("tr", null, h("th", null, "Region"), h("td", null, geo.region || "—")),
+      h("tr", null, h("th", null, "City"), h("td", null, geo.city || "—")),
+      h("tr", null, h("th", null, "Organization"), h("td", null, geo.org || "—")),
+      h("tr", null, h("th", null, "ASN"), h("td", { class: "mono" }, geo.asn || "—")),
+      h("tr", null, h("th", null, "Coordinates"), h("td", { class: "mono" },
+        (geo.lat != null && geo.lon != null) ? (geo.lat + ", " + geo.lon) : "—")),
+    ));
+    body.appendChild(h("h3", { style: "margin: 0 0 6px" }, "Geo / network"));
+    body.appendChild(geoTable);
+
+    body.appendChild(h("h3", { style: "margin: 16px 0 6px" }, "Streaming / service unlock"));
+    if (info && info.probed_from) {
+      body.appendChild(h("p", { class: "muted", style: "font-size: 12px; margin: 0 0 8px" },
+        "Note: checks run from the admin host's vantage point, not the target IP."));
+    }
+    const unlocks = h("div", { class: "row", style: "flex-wrap: wrap; gap: 6px" });
+    for (const u of (info && info.unlock || [])) unlocks.appendChild(ipUnlockBadge(u));
+    body.appendChild(unlocks);
+
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Close"),
+    );
+    Modal.open({ title: `Info: ${ip}`, body, footer });
+  }
+
+  async function openIpDetailModal(id) {
+    try {
+      const r = await api("GET", `/api/static-ips/${id}`);
+      const body = h("div", null);
+      body.appendChild(h("div", { class: "muted", style: "margin-bottom: 8px" },
+        `${r.ip}${r.port ? ":" + r.port : ""} · ${r.protocol} · ${r.country || "—"} / ${r.provider || "—"}`,
+      ));
+
+      // Static info section
+      body.appendChild(h("h3", { style: "margin: 12px 0 6px" }, "Static info"));
+      if (r.static_info && (r.static_info.geo || r.static_info.unlock)) {
+        const geo = r.static_info.geo || {};
+        const cells = [];
+        if (geo.country) cells.push(`country: ${geo.country}`);
+        if (geo.city) cells.push(`city: ${geo.city}`);
+        if (geo.org) cells.push(`org: ${geo.org}`);
+        if (geo.asn) cells.push(`asn: ${geo.asn}`);
+        body.appendChild(h("div", { class: "muted mono", style: "font-size: 12px" }, cells.join("  ·  ") || "—"));
+        const u = h("div", { class: "row", style: "flex-wrap: wrap; gap: 4px; margin-top: 6px" });
+        for (const item of (r.static_info.unlock || [])) u.appendChild(ipUnlockBadge(item));
+        body.appendChild(u);
+      } else {
+        body.appendChild(h("div", { class: "muted" }, "(no static info recorded — click Probe)"));
+      }
+
+      // Recent results section
+      body.appendChild(h("h3", { style: "margin: 16px 0 6px" }, "Recent test history"));
+      const tbl = h("table", { class: "data" });
+      tbl.appendChild(h("thead", null, h("tr", null,
+        h("th", null, "When"),
+        h("th", null, "Kind"),
+        h("th", null, "Result"),
+        h("th", null, "Latency"),
+        h("th", null, "Error"),
+      )));
+      const tbody = h("tbody");
+      for (const row of (r.recent_results || [])) {
+        tbody.appendChild(h("tr", null,
+          h("td", { class: "muted mono", style: "font-size: 11.5px" }, fmtDate(row.created_at)),
+          h("td", null, h("span", { class: "badge" }, row.test_kind)),
+          h("td", null, row.success ? h("span", { class: "badge ok" }, "ok") : h("span", { class: "badge danger" }, "fail")),
+          h("td", { class: "mono" }, row.latency_ms == null ? "—" : (row.latency_ms + "ms")),
+          h("td", { class: "muted mono", style: "font-size: 11px" }, row.error || ""),
+        ));
+      }
+      tbl.appendChild(tbody);
+      const wrap = h("div", { class: "table-wrap" });
+      wrap.appendChild(tbl);
+      body.appendChild(wrap);
+
+      const footer = h("div", { class: "row" },
+        h("button", { class: "btn btn-primary", onclick: async () => { await runProbe(id); } }, "Probe info"),
+        h("button", { class: "btn", onclick: async () => { await runSingleTest(id); } }, "Test connectivity"),
+        h("button", { class: "btn", onclick: () => Modal.close() }, "Close"),
+      );
+      Modal.open({ title: `IP detail · ${r.ip}`, body, footer });
+    } catch (err) {
+      toast("error", "Failed to load detail", err.message);
+    }
+  }
+
+  function confirmDeleteIp(row) {
+    const body = h("div", null,
+      h("p", null, "Delete static IP ", h("span", { class: "mono" }, row.ip),
+        row.port ? h("span", { class: "mono" }, ":" + row.port) : null,
+        " (", row.protocol, ")? Test history will be lost."),
+    );
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { class: "btn btn-danger", onclick: async () => {
+        try {
+          await api("DELETE", `/api/static-ips/${row.id}`);
+          Modal.close();
+          toast("success", "Deleted", row.ip);
+          renderStaticIpsView(document.getElementById("view-root"), {});
+        } catch (err) { toast("error", "Delete failed", err.message); }
+      } }, "Delete"),
+    );
+    Modal.open({ title: `Delete ${row.ip}?`, body, footer });
+  }
+
+  function openEditIpModal(row, onSaved) {
+    const form = h("form");
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "IP"),
+        h("input", { id: "ip-ip", class: "input mono", value: row.ip, required: true }),
+      ),
+      h("div", { class: "field" },
+        h("label", null, "Port"),
+        h("input", { id: "ip-port", class: "input mono", type: "number", min: "1", max: "65535", value: row.port == null ? "" : String(row.port) }),
+      ),
+    ));
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Protocol"),
+        h("input", { id: "ip-proto", class: "input mono", value: row.protocol || "tcp" }),
+      ),
+      h("div", { class: "field" },
+        h("label", null, "Country"),
+        h("input", { id: "ip-country", class: "input", value: row.country || "" }),
+      ),
+    ));
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Provider"),
+        h("input", { id: "ip-provider", class: "input", value: row.provider || "" }),
+      ),
+      h("div", { class: "field" },
+        h("label", null, "Label"),
+        h("input", { id: "ip-label", class: "input", value: row.label || "" }),
+      ),
+    ));
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Notes"),
+      h("textarea", { id: "ip-notes", class: "textarea", rows: "3" }, row.notes || ""),
+    ));
+    const footer = h("div", { class: "row" },
+      h("button", { type: "button", class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { type: "button", class: "btn btn-primary", onclick: async () => {
+        const payload = {
+          ip: document.getElementById("ip-ip").value.trim(),
+          port: document.getElementById("ip-port").value || null,
+          protocol: document.getElementById("ip-proto").value.trim() || "tcp",
+          country: document.getElementById("ip-country").value.trim() || null,
+          provider: document.getElementById("ip-provider").value.trim() || null,
+          label: document.getElementById("ip-label").value.trim() || null,
+          notes: document.getElementById("ip-notes").value.trim() || null,
+        };
+        try {
+          await api("PATCH", `/api/static-ips/${row.id}`, payload);
+          Modal.close();
+          toast("success", "Saved", payload.ip);
+          if (onSaved) onSaved();
+        } catch (err) { toast("error", "Save failed", err.message); }
+      } }, "Save"),
+    );
+    Modal.open({ title: `Edit ${row.ip}`, body: form, footer });
+  }
+
+  function openBulkAddModal(onSaved) {
+    const form = h("form");
+    form.appendChild(h("p", { class: "muted" },
+      "Paste anything: a list of IPs, IP:port pairs, ss:// / trojan:// URLs, country names in any language, provider names, even messy free-form text. The AI parser (or its regex fallback) extracts ip / port / protocol / country / provider for each row."));
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Bulk input ", h("span", { class: "hint" },
+        " — up to ~8000 chars are sent to the AI parser; longer input is truncated.")),
+      h("textarea", { id: "bulk-text", class: "textarea mono", rows: "10",
+        maxlength: "32000",
+        placeholder: "1.1.1.1:443 https Cloudflare 美国\n8.8.8.8 google US\ntrojan://abc@13.230.45.67:8443 Japan AWS\nss://def@45.32.20.10:9999 新加坡 Vultr" }),
+    ));
+    const previewWrap = h("div", { id: "bulk-preview", style: "margin-top: 8px;" });
+    form.appendChild(previewWrap);
+    const footer = h("div", { class: "row" },
+      h("button", { type: "button", class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { type: "button", class: "btn", onclick: async () => {
+        const text = document.getElementById("bulk-text").value;
+        if (!text.trim()) return;
+        previewWrap.innerHTML = "Parsing…";
+        try {
+          const r = await api("POST", "/api/static-ips/parse", { text, commit: false });
+          previewWrap.innerHTML = "";
+          previewWrap.appendChild(h("div", { class: "muted", style: "margin-bottom: 6px" },
+            `Parser: ${r.mode} · ${r.parsed.length} row${r.parsed.length === 1 ? "" : "s"} detected`,
+            r.ai_fallback ? h("span", { class: "badge warn", style: "margin-left: 6px" },
+              "AI configured but request failed — check Logs"
+            ) : null,
+          ));
+          const tbl = h("table", { class: "data" });
+          tbl.appendChild(h("thead", null, h("tr", null,
+            h("th", null, "IP"), h("th", null, "Port"), h("th", null, "Protocol"),
+            h("th", null, "Country"), h("th", null, "Provider"))));
+          const tb = h("tbody");
+          for (const p of r.parsed) {
+            tb.appendChild(h("tr", null,
+              h("td", { class: "mono" }, p.ip),
+              h("td", { class: "mono" }, p.port == null ? "—" : String(p.port)),
+              h("td", null, p.protocol || "tcp"),
+              h("td", null, p.country || "—"),
+              h("td", null, p.provider || "—"),
+            ));
+          }
+          tbl.appendChild(tb);
+          const wrap = h("div", { class: "table-wrap" });
+          wrap.appendChild(tbl);
+          previewWrap.appendChild(wrap);
+        } catch (err) { toast("error", "Parse failed", err.message); previewWrap.innerHTML = ""; }
+      } }, "Preview parse"),
+      h("button", { type: "button", class: "btn btn-primary", onclick: async () => {
+        const text = document.getElementById("bulk-text").value;
+        if (!text.trim()) return;
+        try {
+          const r = await api("POST", "/api/static-ips/parse", { text, commit: true });
+          Modal.close();
+          const errCount = (r.errors && r.errors.length) || 0;
+          const tone = errCount ? "info" : "success";
+          let detail = `parser: ${r.mode} · added ${r.committed.length}`;
+          if (errCount) detail += `, ${errCount} errors`;
+          if (r.ai_fallback) detail += " — AI fallback (check Logs)";
+          toast(tone, "Bulk add complete", detail);
+          if (onSaved) onSaved();
+        } catch (err) { toast("error", "Bulk add failed", err.message); }
+      } }, "Add all"),
+    );
+    Modal.open({ title: "Bulk add static IPs", body: form, footer });
+  }
+
+  // ----- SSH Keys view -----
+
+  function keyTypeBadge(rec) {
+    const text = `${rec.key_type}${rec.bits ? "·" + rec.bits : ""}`;
+    return h("span", { class: "badge" }, text);
+  }
+
+  function shortFp(fp) {
+    if (!fp) return "—";
+    return fp.length > 24 ? (fp.slice(0, 24) + "…") : fp;
+  }
+
+  async function renderSshKeysView(root) {
+    setActiveNav("ssh-keys");
+    root.innerHTML = "";
+    root.appendChild(h("div", { class: "page-header" },
+      h("div", null,
+        h("h1", null, "SSH Keys"),
+        h("p", { class: "lede" },
+          "Manage SSH keypairs centrally — generate, import, deploy to nodes. ",
+          h("span", { class: "muted" }, "Stored in plaintext by design."),
+        ),
+      ),
+      h("div", { class: "row", style: "gap: 6px; align-items: center;" },
+        h("button", { class: "btn btn-sm btn-ghost", title: "Reload from database",
+          onclick: () => renderSshKeysView(root) },
+          h("span", { style: "display: inline-block; font-size: 14px; line-height: 1;" }, "↻"),
+          " Refresh"),
+        h("button", { class: "btn", title: "Paste an existing private key",
+          onclick: () => openImportSshKeyModal(() => renderSshKeysView(root)) }, "Import…"),
+        h("button", { class: "btn btn-primary", title: "Create a new keypair (Ed25519 / RSA / ECDSA)",
+          onclick: () => openGenerateSshKeyModal(() => renderSshKeysView(root)) }, "+ Generate"),
+      ),
+    ));
+    const card = h("div", { class: "card" });
+    card.appendChild(h("div", { class: "card-header" },
+      h("h2", null, "All SSH keys"),
+      h("span", { class: "hint", id: "ssh-keys-count" }, ""),
+    ));
+    const body = h("div", { class: "card-body tight", id: "ssh-keys-body" });
+    card.appendChild(body);
+    root.appendChild(card);
+    try {
+      const resp = await api("GET", "/api/ssh-keys");
+      const keys = resp.ssh_keys || [];
+      document.getElementById("ssh-keys-count").textContent =
+        `${keys.length} key${keys.length === 1 ? "" : "s"}`;
+      if (!keys.length) {
+        body.appendChild(h("div", { class: "empty" },
+          h("div", { class: "title" }, "No SSH keys yet"),
+          h("div", { class: "sub" }, 'Click "+ Generate" to create one, or "Import…" to paste a private key.'),
+        ));
+      } else {
+        body.appendChild(renderSshKeysTable(keys));
+      }
+    } catch (err) {
+      if (err.status === 401) showLogin();
+      else toast("error", "Failed to load SSH keys", err.message);
+    }
+  }
+
+  function renderSshKeysTable(keys) {
+    const table = h("table", { class: "data" });
+    table.appendChild(h("thead", null,
+      h("tr", null,
+        h("th", null, "Name"),
+        h("th", null, "Type"),
+        h("th", null, "Fingerprint"),
+        h("th", null, "Comment"),
+        h("th", null, "Source"),
+        h("th", null, "Used by"),
+        h("th", null, "Created"),
+        h("th", null, ""),
+      ),
+    ));
+    const tbody = h("tbody");
+    for (const k of keys) {
+      const actions = h("td", { class: "actions" });
+      actions.appendChild(h("button", { class: "btn btn-sm",
+        onclick: () => openSshKeyDetailModal(k.id, () => renderSshKeysView(document.getElementById("view-root")))
+      }, "View"));
+      actions.appendChild(h("button", { class: "btn btn-sm",
+        onclick: () => openDeploySshKeyModal(k.id, k.name, () => renderSshKeysView(document.getElementById("view-root")))
+      }, "Deploy"));
+      actions.appendChild(h("button", { class: "btn btn-sm",
+        title: "Overwrite this Mac's ~/.ssh/id_<algo> with this keypair (existing files are backed up)",
+        onclick: () => openApplyLocalSshKeyModal(k, () => renderSshKeysView(document.getElementById("view-root")))
+      }, "Apply local"));
+      actions.appendChild(h("button", { class: "btn btn-sm danger",
+        onclick: () => confirmDeleteSshKey(k)
+      }, "✕"));
+      const tr = h("tr", { "data-key-id": k.id },
+        h("td", null,
+          h("div", null, k.name),
+          k.description ? h("div", { class: "muted", style: "font-size: 11px; margin-top: 2px" }, k.description) : null,
+        ),
+        h("td", null, keyTypeBadge(k)),
+        h("td", { class: "mono", style: "font-size: 11px" }, shortFp(k.fingerprint_sha256)),
+        h("td", { class: "mono", style: "font-size: 11px" }, k.comment || h("span", { class: "muted" }, "—")),
+        h("td", null,
+          k.source === "imported"
+            ? h("span", { class: "badge warn" }, "imported")
+            : h("span", { class: "badge ok" }, "generated")),
+        h("td", null,
+          k.used_by_nodes > 0
+            ? h("span", { class: "badge info" }, `${k.used_by_nodes} node${k.used_by_nodes === 1 ? "" : "s"}`)
+            : h("span", { class: "muted" }, "—")),
+        h("td", { class: "muted", style: "font-size: 11.5px" }, fmtRelative(k.created_at)),
+        actions,
+      );
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    const wrap = h("div", { class: "table-wrap" });
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  function openGenerateSshKeyModal(onSaved) {
+    const form = h("form");
+    form.appendChild(h("p", { class: "muted" },
+      "Generate a fresh SSH keypair. Ed25519 is recommended for new keys (faster, smaller, equivalent security to RSA-3072+)."));
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Name"),
+        h("input", { id: "k-name", class: "input mono", required: true,
+          placeholder: "e.g. infra-edge or my-laptop-2026" })),
+      h("div", { class: "field" },
+        h("label", null, "Tags ", h("span", { class: "hint" }, " — comma separated")),
+        h("input", { id: "k-tags", class: "input" })),
+    ));
+    const typeSel = h("select", { id: "k-type", class: "select" });
+    for (const t of [["ed25519", "Ed25519 (recommended)"], ["rsa", "RSA"], ["ecdsa", "ECDSA"], ["dsa", "DSA (legacy)"]]) {
+      typeSel.appendChild(h("option", { value: t[0] }, t[1]));
+    }
+    const bitsSel = h("select", { id: "k-bits", class: "select" });
+    function refreshBits() {
+      bitsSel.innerHTML = "";
+      const opts = {
+        ed25519: [["", "256 (fixed)"]],
+        rsa: [["2048", "2048"], ["3072", "3072 (default)"], ["4096", "4096"]],
+        ecdsa: [["256", "nistp256"], ["384", "nistp384"], ["521", "nistp521"]],
+        dsa: [["1024", "1024 (legacy)"], ["2048", "2048"]],
+      }[typeSel.value] || [["", ""]];
+      for (const [v, l] of opts) bitsSel.appendChild(h("option", { value: v }, l));
+      bitsSel.disabled = (typeSel.value === "ed25519");
+      // Pre-select 3072 for RSA
+      if (typeSel.value === "rsa") bitsSel.value = "3072";
+    }
+    typeSel.addEventListener("change", refreshBits);
+    refreshBits();
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" }, h("label", null, "Type"), typeSel),
+      h("div", { class: "field" }, h("label", null, "Size"), bitsSel),
+    ));
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Comment ", h("span", { class: "hint" }, " — appended to public key, e.g. user@host")),
+        h("input", { id: "k-comment", class: "input mono", placeholder: "leo@laptop" })),
+      h("div", { class: "field" },
+        h("label", null, "Passphrase (optional)"),
+        h("input", { id: "k-passphrase", class: "input mono", type: "text" })),
+    ));
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Description (optional)"),
+      h("textarea", { id: "k-desc", class: "textarea", rows: "2" })));
+    const footer = h("div", { class: "row" },
+      h("button", { type: "button", class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { type: "button", class: "btn btn-primary", onclick: async () => {
+        const payload = {
+          name: document.getElementById("k-name").value.trim(),
+          key_type: typeSel.value,
+          bits: bitsSel.value || null,
+          comment: document.getElementById("k-comment").value.trim(),
+          passphrase: document.getElementById("k-passphrase").value || null,
+          description: document.getElementById("k-desc").value.trim() || null,
+          tags: document.getElementById("k-tags").value.split(",").map(s => s.trim()).filter(Boolean),
+        };
+        try {
+          const r = await api("POST", "/api/ssh-keys", payload);
+          Modal.close();
+          toast("success", "Key generated",
+            `${r.name} · ${r.key_type}${r.bits ? "·"+r.bits : ""} · ${r.fingerprint_sha256.slice(0, 30)}…`);
+          if (onSaved) onSaved();
+        } catch (err) { toast("error", "Generate failed", err.message); }
+      } }, "Generate"),
+    );
+    Modal.open({ title: "Generate SSH key", body: form, footer });
+  }
+
+  function openImportSshKeyModal(onSaved) {
+    const form = h("form");
+    form.appendChild(h("p", { class: "muted" },
+      "Paste an existing private key. We auto-derive the public key, fingerprint, type, and bit-size. If the key has a passphrase, enter it below so we can read the metadata."));
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Name"),
+        h("input", { id: "k-imp-name", class: "input mono", required: true })),
+      h("div", { class: "field" },
+        h("label", null, "Tags ", h("span", { class: "hint" }, " — comma separated")),
+        h("input", { id: "k-imp-tags", class: "input" })),
+    ));
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Private key"),
+      h("textarea", { id: "k-imp-priv", class: "textarea mono", rows: "12", required: true,
+        placeholder: "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----" })));
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Passphrase (if encrypted)"),
+        h("input", { id: "k-imp-passphrase", class: "input mono", type: "text" })),
+      h("div", { class: "field" },
+        h("label", null, "Comment (optional override)"),
+        h("input", { id: "k-imp-comment", class: "input mono" })),
+    ));
+    form.appendChild(h("div", { class: "field" },
+      h("label", null, "Description (optional)"),
+      h("textarea", { id: "k-imp-desc", class: "textarea", rows: "2" })));
+    const footer = h("div", { class: "row" },
+      h("button", { type: "button", class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { type: "button", class: "btn btn-primary", onclick: async () => {
+        const payload = {
+          name: document.getElementById("k-imp-name").value.trim(),
+          private_key: document.getElementById("k-imp-priv").value,
+          passphrase: document.getElementById("k-imp-passphrase").value || null,
+          comment: document.getElementById("k-imp-comment").value.trim(),
+          description: document.getElementById("k-imp-desc").value.trim() || null,
+          tags: document.getElementById("k-imp-tags").value.split(",").map(s => s.trim()).filter(Boolean),
+        };
+        try {
+          const r = await api("POST", "/api/ssh-keys", payload);
+          Modal.close();
+          toast("success", "Key imported", `${r.name} · ${r.key_type}${r.bits ? "·"+r.bits : ""}`);
+          if (onSaved) onSaved();
+        } catch (err) { toast("error", "Import failed", err.message); }
+      } }, "Import"),
+    );
+    Modal.open({ title: "Import SSH key", body: form, footer });
+  }
+
+  async function openSshKeyDetailModal(keyId, onSaved) {
+    let rec;
+    try {
+      rec = await api("GET", `/api/ssh-keys/${keyId}`);
+    } catch (err) { toast("error", "Load failed", err.message); return; }
+
+    const showPriv = h("div", { class: "field" },
+      h("label", null, "Private key (PEM) ", h("span", { class: "hint" }, " — click to reveal")),
+      (() => {
+        const pre = h("pre", { class: "mono",
+          style: "background: var(--surface-alt); padding: 8px; max-height: 220px; overflow: auto; font-size: 11px; cursor: pointer; user-select: none;",
+          title: "Click to reveal/hide" }, "•".repeat(80) + "\n(click to reveal)");
+        let revealed = false;
+        pre.addEventListener("click", () => {
+          revealed = !revealed;
+          pre.textContent = revealed ? rec.private_key : ("•".repeat(80) + "\n(click to reveal)");
+          pre.style.userSelect = revealed ? "text" : "none";
+        });
+        return pre;
+      })(),
+    );
+
+    const body = h("div", null,
+      h("div", { class: "form-row" },
+        h("div", { class: "field" },
+          h("label", null, "Name"),
+          h("input", { id: "k-det-name", class: "input mono", value: rec.name })),
+        h("div", { class: "field" },
+          h("label", null, "Tags"),
+          h("input", { id: "k-det-tags", class: "input", value: (rec.tags || []).join(", ") })),
+      ),
+      h("div", { class: "form-row" },
+        h("div", { class: "field" },
+          h("label", null, "Type"),
+          h("input", { class: "input mono", value: `${rec.key_type}${rec.bits ? " · " + rec.bits : ""}`, readonly: true })),
+        h("div", { class: "field" },
+          h("label", null, "Fingerprint (SHA256)"),
+          h("input", { class: "input mono", value: rec.fingerprint_sha256, readonly: true,
+            onclick: (e) => { e.target.select(); document.execCommand("copy"); toast("info", "Copied"); } })),
+      ),
+      h("div", { class: "form-row" },
+        h("div", { class: "field" },
+          h("label", null, "Comment ", h("span", { class: "hint" }, " — editable; rebuilds public key + fingerprint")),
+          h("input", { id: "k-det-comment", class: "input mono", value: rec.comment || "" })),
+        h("div", { class: "field" },
+          h("label", null, "Passphrase ", h("span", { class: "hint" }, " — plaintext")),
+          h("input", { id: "k-det-passphrase", class: "input mono", type: "text", value: rec.passphrase || "" })),
+      ),
+      h("div", { class: "field" },
+        h("label", null, "Description"),
+        h("textarea", { id: "k-det-desc", class: "textarea", rows: "2" }, rec.description || "")),
+      h("div", { class: "field" },
+        h("label", null, "Public key ", h("span", { class: "hint" }, " — click to copy")),
+        h("textarea", { class: "textarea mono", rows: "3", readonly: true,
+          onclick: (e) => { e.target.select(); document.execCommand("copy"); toast("info", "Copied"); } },
+          rec.public_key)),
+      showPriv,
+      h("div", { class: "muted", style: "margin-top: 8px; font-size: 12px" },
+        `Source: ${rec.source} · Used by ${rec.used_by_nodes || 0} node${rec.used_by_nodes === 1 ? "" : "s"} · Created ${fmtDate(rec.created_at)}`),
+    );
+
+    const footer = h("div", { class: "row" },
+      h("button", { type: "button", class: "btn",
+        onclick: () => openRegenerateSshKeyModal(rec, onSaved) }, "Regenerate…"),
+      h("button", { type: "button", class: "btn",
+        onclick: () => openDeploySshKeyModal(rec.id, rec.name, () => { Modal.close(); if (onSaved) onSaved(); }) }, "Deploy to nodes…"),
+      h("button", { type: "button", class: "btn",
+        title: "Overwrite this Mac's ~/.ssh/id_<algo> with this keypair",
+        onclick: () => openApplyLocalSshKeyModal(rec, () => { Modal.close(); if (onSaved) onSaved(); }) }, "Apply to this Mac…"),
+      h("button", { type: "button", class: "btn", onclick: () => Modal.close() }, "Close"),
+      h("button", { type: "button", class: "btn btn-primary", onclick: async () => {
+        const payload = {
+          name: document.getElementById("k-det-name").value.trim(),
+          comment: document.getElementById("k-det-comment").value,
+          passphrase: document.getElementById("k-det-passphrase").value || null,
+          description: document.getElementById("k-det-desc").value.trim() || null,
+          tags: document.getElementById("k-det-tags").value.split(",").map(s => s.trim()).filter(Boolean),
+        };
+        try {
+          await api("PATCH", `/api/ssh-keys/${rec.id}`, payload);
+          Modal.close();
+          toast("success", "Saved", payload.name);
+          if (onSaved) onSaved();
+        } catch (err) { toast("error", "Save failed", err.message); }
+      } }, "Save"),
+    );
+    Modal.open({ title: `SSH key · ${rec.name}`, body, footer });
+  }
+
+  function openRegenerateSshKeyModal(rec, onSaved) {
+    const form = h("form");
+    form.appendChild(h("p", { class: "muted" },
+      "Replace the keypair on this row. The fingerprint will change. Any node currently using the old key will need to be reattached."));
+    const typeSel = h("select", { class: "select" });
+    for (const t of ["ed25519", "rsa", "ecdsa", "dsa"]) {
+      const opt = h("option", { value: t }, t);
+      if (t === rec.key_type) opt.selected = true;
+      typeSel.appendChild(opt);
+    }
+    const bitsInput = h("input", { class: "input mono", type: "number",
+      value: rec.bits || "", placeholder: "leave blank for type default" });
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" }, h("label", null, "Type"), typeSel),
+      h("div", { class: "field" }, h("label", null, "Bits"), bitsInput),
+    ));
+    const footer = h("div", { class: "row" },
+      h("button", { type: "button", class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { type: "button", class: "btn btn-primary", onclick: async () => {
+        try {
+          await api("POST", `/api/ssh-keys/${rec.id}/regenerate`, {
+            key_type: typeSel.value,
+            bits: bitsInput.value || null,
+          });
+          Modal.close();
+          toast("success", "Key regenerated", rec.name);
+          if (onSaved) onSaved();
+        } catch (err) { toast("error", "Regenerate failed", err.message); }
+      } }, "Regenerate"),
+    );
+    Modal.open({ title: `Regenerate ${rec.name}`, body: form, footer });
+  }
+
+  async function openAttachSshKeyModal(keyId, keyName, onSaved) {
+    // Backward-compat shim — open the new Deploy modal.
+    return openDeploySshKeyModal(keyId, keyName, onSaved);
+  }
+
+  async function openDeploySshKeyModal(keyId, keyName, onSaved) {
+    const form = h("form");
+    form.appendChild(h("p", { class: "muted", style: "margin-bottom: 12px" },
+      "Pick what to deploy and to which nodes. ",
+      h("strong", null, "Push public key"),
+      " adds this keypair to the node's ", h("span", { class: "mono" }, "~/.ssh/authorized_keys"),
+      " (so clients holding the matching private key can SSH in). ",
+      h("strong", null, "Push private key"),
+      " writes the private+public files to the node's ",
+      h("span", { class: "mono" }, "~/.ssh/" + keyName),
+      " (so the node can use this identity to authenticate to GitHub or anywhere this public key is trusted). ",
+      h("strong", null, "Push both"),
+      " does both."));
+
+    // Node multi-select with Select all / Clear ----------------------
+    const listWrap = h("div", { class: "field" },
+      h("label", null, "Nodes"));
+    const toolbar = h("div", { class: "row", style: "gap: 6px; margin-bottom: 6px;" },
+      h("button", { type: "button", class: "btn btn-sm",
+        onclick: (e) => { e.preventDefault();
+          form.querySelectorAll('input[type="checkbox"][data-node]').forEach(c => c.checked = true);
+          updateCount();
+        } }, "Select all"),
+      h("button", { type: "button", class: "btn btn-sm",
+        onclick: (e) => { e.preventDefault();
+          form.querySelectorAll('input[type="checkbox"][data-node]').forEach(c => c.checked = false);
+          updateCount();
+        } }, "Clear"),
+      h("span", { class: "muted", id: "deploy-count", style: "margin-left: 8px;" }, "0 selected"),
+    );
+    listWrap.appendChild(toolbar);
+    const list = h("div", {
+      style: "max-height: 260px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; padding: 6px; background: var(--surface);",
+    });
+    listWrap.appendChild(list);
+    form.appendChild(listWrap);
+
+    function updateCount() {
+      const n = form.querySelectorAll('input[type="checkbox"][data-node]:checked').length;
+      const el = document.getElementById("deploy-count");
+      if (el) el.textContent = `${n} selected`;
+    }
+
+    try {
+      const r = await api("GET", "/api/nodes");
+      const nodes = r.nodes || [];
+      if (!nodes.length) {
+        list.appendChild(h("div", { class: "muted", style: "padding: 8px;" }, "No nodes registered. Add some on the Nodes page first."));
+      } else {
+        for (const n of nodes) {
+          const id = `dn-${n.name}`;
+          const row = h("label", { class: "row",
+            style: "gap: 8px; padding: 4px 6px; cursor: pointer; align-items: center;",
+            for: id },
+            h("input", { type: "checkbox", id, "data-node": n.name, onchange: updateCount }),
+            h("span", { class: "mono" }, n.name),
+            h("span", { class: "muted", style: "font-size: 11.5px;" },
+              ` ${n.ssh_user}@${n.host}:${n.ssh_port}`),
+            h("span", { class: "badge",
+              style: "margin-left: auto; font-size: 10.5px;" }, n.auth_method),
+          );
+          list.appendChild(row);
+        }
+      }
+    } catch (err) { toast("error", "Could not list nodes", err.message); }
+
+    // Deploy actions ---------------------------------------------------
+    const deployBar = h("div", { class: "row",
+      style: "gap: 8px; margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border);" });
+
+    function selectedNodes() {
+      return Array.from(form.querySelectorAll('input[type="checkbox"][data-node]:checked'))
+        .map(c => c.getAttribute("data-node"));
+    }
+    async function doDeploy(mode) {
+      const nodes = selectedNodes();
+      if (!nodes.length) {
+        toast("error", "No nodes selected", "Pick at least one node or click Select all");
+        return;
+      }
+      const modeLabel = { public: "public key", private: "private key", both: "public + private" }[mode];
+      // For destructive private-key writes, confirm first.
+      if (mode === "private" || mode === "both") {
+        if (!confirm(`Push ${modeLabel} to ${nodes.length} node(s)?\n\nThe private key will be written to ~/.ssh/${keyName} on each target. Anyone with shell on that node will be able to read it.`)) return;
+      }
+      const btns = deployBar.querySelectorAll("button");
+      btns.forEach(b => b.setAttribute("disabled", "true"));
+      try {
+        const r = await api("POST", `/api/ssh-keys/${keyId}/deploy`,
+          { nodes, mode });
+        Modal.close();
+        openDeployResultModal(r);
+        toast(r.fail === 0 ? "success" : "info", "Deploy complete",
+          `${r.success}/${r.total} ok · ${r.fail} failed`);
+        if (onSaved) onSaved();
+      } catch (err) {
+        toast("error", "Deploy failed", err.message);
+      } finally {
+        btns.forEach(b => b.removeAttribute("disabled"));
+      }
+    }
+    deployBar.appendChild(h("button", { type: "button", class: "btn",
+      onclick: () => Modal.close() }, "Cancel"));
+    deployBar.appendChild(h("div", { style: "flex: 1;" }));
+    deployBar.appendChild(h("button", { type: "button", class: "btn",
+      title: "Append public key to authorized_keys",
+      onclick: () => doDeploy("public") }, "📤 Push public"));
+    deployBar.appendChild(h("button", { type: "button", class: "btn",
+      title: "Write private+public key files to ~/.ssh/<name>",
+      onclick: () => doDeploy("private") }, "🔐 Push private"));
+    deployBar.appendChild(h("button", { type: "button", class: "btn btn-primary",
+      title: "Do both (push public + push private)",
+      onclick: () => doDeploy("both") }, "📤🔐 Push both"));
+
+    Modal.open({ title: `Deploy ${keyName}`, body: form, footer: deployBar });
+  }
+
+  function openDeployResultModal(report) {
+    const body = h("div", null,
+      h("div", { class: "row", style: "gap: 12px; margin-bottom: 12px;" },
+        h("div", null, h("strong", null, "Mode: "), report.mode),
+        h("div", null, h("span", { class: "badge ok" }, `${report.success} ok`)),
+        h("div", null, h("span", { class: "badge danger" }, `${report.fail} failed`)),
+        h("div", { class: "muted" }, "at " + fmtDate(report.at)),
+      ),
+    );
+    const tbl = h("table", { class: "data" });
+    tbl.appendChild(h("thead", null, h("tr", null,
+      h("th", null, "Node"),
+      h("th", null, "Host"),
+      h("th", null, "Result"),
+      h("th", null, "Public"),
+      h("th", null, "Private"),
+      h("th", null, "Duration"),
+      h("th", null, "Error"),
+    )));
+    const tb = h("tbody");
+    for (const r of (report.results || [])) {
+      tb.appendChild(h("tr", null,
+        h("td", { class: "mono" }, r.node),
+        h("td", { class: "mono", style: "font-size: 11px" }, r.host || "—"),
+        h("td", null, r.ok
+          ? h("span", { class: "badge ok" }, "ok")
+          : h("span", { class: "badge danger" }, "fail")),
+        h("td", null,
+          r.public_already_present
+            ? h("span", { class: "badge" }, "already present")
+            : (r.public_added
+              ? h("span", { class: "badge ok" }, "appended")
+              : h("span", { class: "muted" }, "—"))),
+        h("td", { class: "mono", style: "font-size: 11px" }, r.private_path || "—"),
+        h("td", { class: "muted mono", style: "font-size: 11px" },
+          r.duration_seconds != null ? r.duration_seconds + "s" : "—"),
+        h("td", { class: "muted mono", style: "font-size: 11px" }, r.error || ""),
+      ));
+    }
+    tbl.appendChild(tb);
+    const wrap = h("div", { class: "table-wrap" });
+    wrap.appendChild(tbl);
+    body.appendChild(wrap);
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Close"),
+    );
+    Modal.open({ title: "Deploy report", body, footer });
+  }
+
+  function openApplyLocalSshKeyModal(rec, onSaved) {
+    const defaultName = "id_" + rec.key_type;
+    const form = h("form");
+    form.appendChild(h("div", { class: "row",
+      style: "padding: 10px; background: var(--danger-bg); border-radius: 6px; margin-bottom: 12px; gap: 8px; align-items: flex-start;" },
+      h("span", { style: "font-size: 16px; line-height: 1;" }, "⚠"),
+      h("div", { style: "flex: 1; font-size: 12.5px;" },
+        h("strong", null, "This overwrites your Mac's SSH identity files."),
+        " The platform will write ",
+        h("span", { class: "mono" }, "~/.ssh/" + defaultName), " and ",
+        h("span", { class: "mono" }, "~/.ssh/" + defaultName + ".pub"),
+        ". Anything currently at those paths is renamed to ",
+        h("span", { class: "mono" }, "*.bak.<timestamp>"), " — recoverable, but every program that uses these defaults (git, ssh from Terminal, etc.) will start using ",
+        h("strong", null, rec.name), " from the moment you confirm.",
+      ),
+    ));
+    form.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Key"),
+        h("input", { class: "input mono", readonly: true,
+          value: `${rec.name} · ${rec.key_type}${rec.bits ? "·" + rec.bits : ""} · ${rec.fingerprint_sha256.slice(0, 30)}…` })),
+      h("div", { class: "field" },
+        h("label", null, "File name ", h("span", { class: "hint" },
+          " — default ", h("span", { class: "mono" }, defaultName), "; change it if you don't want to clobber the default identity")),
+        h("input", { id: "applocal-name", class: "input mono", value: defaultName,
+          placeholder: defaultName })),
+    ));
+    const footer = h("div", { class: "row" },
+      h("button", { type: "button", class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("div", { style: "flex: 1;" }),
+      h("button", { type: "button", class: "btn btn-danger", onclick: async () => {
+        const fname = (document.getElementById("applocal-name").value || "").trim();
+        const payload = fname && fname !== defaultName ? { filename: fname } : {};
+        const isCustom = !!payload.filename;
+        const finalName = isCustom ? payload.filename : defaultName;
+        if (!confirm(
+          `Overwrite ~/.ssh/${finalName} and ~/.ssh/${finalName}.pub with ${rec.name}?\n\n` +
+          `Existing files (if any) will be backed up to *.bak.<timestamp>.`)) return;
+        try {
+          const r = await api("POST", `/api/ssh-keys/${rec.id}/apply-local`, payload);
+          Modal.close();
+          openApplyLocalReportModal(r);
+          toast("success", "Applied to this Mac",
+            `${rec.name} → ${r.written.length} file(s)` +
+            (r.backups.length ? ` · ${r.backups.length} backup(s)` : ""));
+          if (onSaved) onSaved();
+        } catch (err) { toast("error", "Apply failed", err.message); }
+      } }, "Overwrite ~/.ssh/" + defaultName),
+    );
+    Modal.open({ title: `Apply ${rec.name} to this machine`, body: form, footer });
+  }
+
+  function openApplyLocalReportModal(r) {
+    const body = h("div", null,
+      h("p", null, h("strong", null, r.ssh_key_name),
+        ` · ${r.key_type} · ${r.fingerprint_sha256.slice(0, 30)}…`),
+      h("p", { class: "muted", style: "margin-bottom: 12px;" },
+        "Applied to ", h("span", { class: "mono" }, r.ssh_dir),
+        " at ", fmtDate(r.applied_at), "."),
+      h("h4", { style: "margin: 4px 0;" }, "Files written"),
+    );
+    const wlist = h("ul", { style: "margin: 4px 0 12px 18px; font-size: 12px;" });
+    for (const p of r.written) {
+      wlist.appendChild(h("li", { class: "mono" }, p));
+    }
+    body.appendChild(wlist);
+    if (r.backups && r.backups.length) {
+      body.appendChild(h("h4", { style: "margin: 8px 0 4px;" },
+        "Existing files backed up to"));
+      const blist = h("ul", { style: "margin: 4px 0 0 18px; font-size: 12px;" });
+      for (const p of r.backups) {
+        blist.appendChild(h("li", { class: "mono muted" }, p));
+      }
+      body.appendChild(blist);
+      body.appendChild(h("p", { class: "muted",
+        style: "margin-top: 12px; font-size: 11.5px;" },
+        "To roll back: ",
+        h("span", { class: "mono" }, "mv <backup> <original-path>"),
+        " in Terminal."));
+    } else {
+      body.appendChild(h("p", { class: "muted", style: "margin-top: 8px; font-size: 12px;" },
+        "(no existing files at the target paths — nothing was backed up)"));
+    }
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Close"));
+    Modal.open({ title: "Apply complete", body, footer });
+  }
+
+  function confirmDeleteSshKey(rec) {
+    const inUse = (rec.used_by_nodes || 0) > 0;
+    const body = h("div", null,
+      h("p", null, "Delete SSH key ", h("span", { class: "mono" }, rec.name), "?"),
+      inUse ? h("p", { class: "muted" },
+        `This key is in use by ${rec.used_by_nodes} node(s). The server will refuse to delete; detach it first.`) : null,
+    );
+    const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { class: "btn btn-danger", onclick: async () => {
+        try {
+          await api("DELETE", `/api/ssh-keys/${rec.id}`);
+          Modal.close();
+          toast("success", "Deleted", rec.name);
+          renderSshKeysView(document.getElementById("view-root"));
+        } catch (err) { toast("error", "Delete failed", err.message); }
+      } }, "Delete"),
+    );
+    Modal.open({ title: `Delete ${rec.name}?`, body, footer });
   }
 
   // ----- Logs view -----
@@ -2597,6 +4770,99 @@
     ));
     acmeCard.appendChild(acmeBody);
     root.appendChild(acmeCard);
+
+    // -------- AI API system config (used by the Static IPs bulk parser) --------
+    const aiCard = h("div", { class: "card" });
+    aiCard.appendChild(h("div", { class: "card-header" },
+      h("h2", null, "AI API"),
+      h("span", { class: "hint" }, "Used by Static IPs bulk parser. Plain text storage."),
+    ));
+    const aiBody = h("div", { class: "card-body" });
+    const baseInput = h("input", { id: "ai-base-url", class: "input mono",
+      placeholder: "https://api.develop.cc/v1" });
+    const keyInput  = h("input", { id: "ai-api-key",  class: "input mono",
+      placeholder: "sk-...", type: "text" });
+    const modelInput = h("input", { id: "ai-model",   class: "input mono",
+      placeholder: "gpt-5.5" });
+    const providerSel = h("select", { id: "ai-provider", class: "select" });
+    for (const v of [["openai", "OpenAI-compatible"], ["anthropic", "Anthropic"]]) {
+      providerSel.appendChild(h("option", { value: v[0] }, v[1]));
+    }
+    aiBody.appendChild(h("div", { class: "form-row" },
+      h("div", { class: "field" },
+        h("label", null, "Provider"), providerSel),
+      h("div", { class: "field" },
+        h("label", null, "Model"), modelInput),
+    ));
+    aiBody.appendChild(h("div", { class: "field" },
+      h("label", null, "Base URL ", h("span", { class: "hint" },
+        " — for OpenAI-compatible only. Both bare and `/v1`-suffixed forms work.")),
+      baseInput));
+    aiBody.appendChild(h("div", { class: "field" },
+      h("label", null, "API key"), keyInput));
+    const aiStatus = h("div", { class: "muted", id: "ai-config-status",
+      style: "margin-top: 6px; font-size: 12px" }, "loading…");
+    function aiStatusText(cfg) {
+      if (cfg && cfg.api_key) {
+        return "configured · " + (cfg.provider || "openai") + (cfg.model ? " · " + cfg.model : "");
+      }
+      return "not configured";
+    }
+    aiBody.appendChild(h("div", { class: "row", style: "gap: 8px; margin-top: 12px;" },
+      h("button", { class: "btn btn-primary", onclick: async (e) => {
+        e.preventDefault();
+        const payload = {
+          provider: providerSel.value,
+          base_url: baseInput.value.trim(),
+          api_key:  keyInput.value.trim(),
+          model:    modelInput.value.trim(),
+        };
+        try {
+          const saved = await api("PUT", "/api/system-config/ai_api", payload);
+          aiStatus.textContent = aiStatusText(saved);
+          toast("success", "AI config saved", payload.provider + " · " + (payload.model || "(no model)"));
+        } catch (err) { toast("error", "Save failed", err.message); }
+      } }, "Save"),
+      h("button", { class: "btn", onclick: async (e) => {
+        e.preventDefault();
+        try {
+          const r = await api("GET", "/api/system-config/ai_api");
+          providerSel.value = r.provider || "openai";
+          baseInput.value = r.base_url || "";
+          keyInput.value  = r.api_key  || "";
+          modelInput.value = r.model || "";
+          aiStatus.textContent = aiStatusText(r);
+        } catch (err) { toast("error", "Reload failed", err.message); }
+      } }, "Reload"),
+      h("button", { class: "btn", onclick: async (e) => {
+        e.preventDefault();
+        if (!confirm("Clear stored AI API config? Bulk parser will fall back to regex.")) return;
+        try {
+          const cleared = await api("PUT", "/api/system-config/ai_api", {
+            provider: providerSel.value || "openai",
+          });
+          baseInput.value = cleared.base_url || "";
+          keyInput.value  = cleared.api_key  || "";
+          modelInput.value = cleared.model || "";
+          aiStatus.textContent = aiStatusText(cleared);
+          toast("success", "AI config cleared", "");
+        } catch (err) { toast("error", "Clear failed", err.message); }
+      } }, "Clear"),
+      aiStatus,
+    ));
+    aiCard.appendChild(aiBody);
+    root.appendChild(aiCard);
+
+    // Initial fetch
+    api("GET", "/api/system-config/ai_api").then(r => {
+      providerSel.value = r.provider || "openai";
+      baseInput.value = r.base_url || "";
+      keyInput.value  = r.api_key  || "";
+      modelInput.value = r.model || "";
+      aiStatus.textContent = aiStatusText(r);
+    }).catch(err => {
+      aiStatus.textContent = "load error: " + err.message;
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -2610,6 +4876,8 @@
     "#/zones": renderZonesView,
     "#/nodes": renderNodesView,
     "#/services": renderServicesView,
+    "#/static-ips": renderStaticIpsView,
+    "#/ssh-keys": renderSshKeysView,
     "#/logs": renderLogsView,
     "#/settings": renderSettingsView,
   };

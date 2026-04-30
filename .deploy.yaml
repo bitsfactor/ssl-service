@@ -1,0 +1,71 @@
+# =============================================================================
+# Deployment manifest for ssl-service itself, read by the admin platform.
+#
+# Flow on a target node:
+#   git clone (or pull) bitsfactor/ssl-service into /opt/ssl-service
+#   write a fresh .env from `defaults` + per-deploy overrides + secrets
+#   docker compose up -d --build
+#   poll healthcheck until OK
+#
+# After this, `docker compose ps` shows the `ssl-service` container running
+# and the probe in the admin UI flips to "running".
+# =============================================================================
+
+service: ssl-service
+runtime: compose
+
+compose_file: docker-compose.yml
+install_dir_template: /opt/{name}
+
+# Required at deploy time. The admin UI refuses to deploy until these are
+# either filled in by the operator or supplied via `secrets`.
+required_env:
+  - SSL_SERVICE_MODE
+  - SSL_SERVICE_PG_DSN
+  - SSL_SERVICE_ADMIN_TOKEN
+
+# Sensible defaults. Operator can override per-deploy.
+defaults:
+  SSL_SERVICE_MODE: readonly
+  SSL_SERVICE_LOG_LEVEL: INFO
+  SSL_SERVICE_ADMIN_BIND: 0.0.0.0
+  SSL_SERVICE_ADMIN_PORT: "8088"
+  SSL_SERVICE_ACME_EMAIL: domain@bitsfactor.com
+  SSL_SERVICE_ACME_STAGING: "false"
+  SSL_SERVICE_ACME_DNS_PROVIDER: cloudflare
+  SSL_SERVICE_RENEW_BEFORE_DAYS: "30"
+  SSL_SERVICE_POLL_INTERVAL_SECONDS: "30"
+  TZ: Asia/Shanghai
+
+# Pull these from system_config at deploy time so they aren't typed by hand.
+secrets:
+  - env: SSL_SERVICE_PG_DSN
+    from: system_config:postgres_dsn
+  - env: SSL_SERVICE_ADMIN_TOKEN
+    from: system_config:admin_token
+
+# Container ports. The admin UI surfaces these in the deploy preview and
+# can offer to wire up Caddy routes for them.
+exposed_ports:
+  - 80
+  - 443
+  - 8088
+
+# Healthcheck — the admin polls this from inside the target node after
+# `compose up` finishes. Deploy is only marked successful once one probe
+# returns 200.
+healthcheck:
+  url: http://localhost:8088/api/healthz
+  expect_status: 200
+  timeout_seconds: 60
+  retries: 12
+  interval_seconds: 5
+
+# Persistent dirs the platform pre-creates (used as bind mounts below).
+volumes:
+  - /opt/{name}/state
+  - /opt/{name}/logs
+  - /opt/{name}/config
+
+depends_on: []
+hooks: {}

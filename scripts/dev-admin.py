@@ -56,11 +56,16 @@ from ssl_proxy_controller.db import (  # noqa: E402
   NODE_AUTH_METHODS,
   CertificateRecord,
   DnsZoneTokenRecord,
+  IpTestResultRecord,
   NodeInitRunRecord,
   NodeRecord,
   NodeStatusRecord,
   RouteRecord,
+  ServiceDeploymentRecord,
+  ServiceNodeStateRecord,
   ServiceRecord,
+  SshKeyRecord,
+  StaticIpRecord,
   UpstreamRecord,
 )
 
@@ -83,6 +88,13 @@ class FakeDatabase:
     self.init_runs: dict[int, NodeInitRunRecord] = {}
     self._init_run_seq: int = 0
     self.services: dict[str, ServiceRecord] = {}
+    self.static_ips: dict[int, StaticIpRecord] = {}
+    self._static_ip_seq: int = 0
+    self.ip_test_results: dict[int, IpTestResultRecord] = {}
+    self._ip_test_seq: int = 0
+    self.system_config: dict[str, dict] = {}
+    self.ssh_keys: dict[int, SshKeyRecord] = {}
+    self._ssh_key_seq: int = 0
 
   # routes -----------------------------------------------------------
   def list_routes(self) -> list[RouteRecord]:
@@ -357,6 +369,274 @@ class FakeDatabase:
 
   def delete_service(self, name: str) -> bool:
     return self.services.pop(name, None) is not None
+
+  # static IPs ------------------------------------------------------
+  def list_static_ips(self, *, sort: str = "country") -> list[StaticIpRecord]:
+    rows = list(self.static_ips.values())
+    def k(r: StaticIpRecord):
+      if sort == "provider":
+        return ((r.provider or "~").lower(), (r.country or "~").lower(), r.ip)
+      if sort == "ip":
+        return (r.ip,)
+      if sort == "created":
+        return (-r.id,)
+      return ((r.country or "~").lower(), (r.provider or "~").lower(), r.ip)
+    rows.sort(key=k)
+    return rows
+
+  def get_static_ip(self, ip_id: int) -> StaticIpRecord | None:
+    return self.static_ips.get(int(ip_id))
+
+  def insert_static_ip(self, *, ip, port, protocol, country=None, provider=None,
+                       label=None, notes=None, static_info=None,
+                       loop_test_seconds=None) -> StaticIpRecord:
+    # uniqueness: (ip, port, protocol)
+    for existing in self.static_ips.values():
+      if existing.ip == ip and (existing.port or 0) == (port or 0) and existing.protocol == protocol:
+        # update non-null fields
+        if country: existing.country = country
+        if provider: existing.provider = provider
+        if label: existing.label = label
+        if notes: existing.notes = notes
+        existing.updated_at = datetime.now(tz=UTC)
+        return existing
+    self._static_ip_seq += 1
+    rec = StaticIpRecord(
+      id=self._static_ip_seq,
+      ip=ip, port=port, protocol=protocol, country=country, provider=provider,
+      label=label, notes=notes, static_info=static_info or {},
+      loop_test_seconds=loop_test_seconds,
+      last_test_at=None, last_test_success=None, last_test_latency_ms=None,
+      last_test_error=None, last_probe_at=None,
+      created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
+    )
+    self.static_ips[rec.id] = rec
+    return rec
+
+  def bulk_insert_static_ips(self, records):
+    out, errs = [], []
+    for rec in records:
+      ip = (rec.get("ip") or "").strip()
+      if not ip:
+        errs.append({"input": rec, "error": "empty ip"})
+        continue
+      try:
+        row = self.insert_static_ip(
+          ip=ip, port=rec.get("port"),
+          protocol=rec.get("protocol") or "tcp",
+          country=rec.get("country"), provider=rec.get("provider"),
+          label=rec.get("label"), notes=rec.get("notes"),
+          loop_test_seconds=rec.get("loop_test_seconds"),
+        )
+        out.append(row)
+      except Exception as exc:  # noqa: BLE001
+        errs.append({"input": rec, "error": str(exc)[:300]})
+    return out, errs
+
+  def update_static_ip(self, ip_id: int, fields: dict) -> StaticIpRecord | None:
+    rec = self.static_ips.get(int(ip_id))
+    if rec is None:
+      return None
+    for k, v in fields.items():
+      if hasattr(rec, k):
+        setattr(rec, k, v)
+    rec.updated_at = datetime.now(tz=UTC)
+    return rec
+
+  def delete_static_ip(self, ip_id: int) -> bool:
+    return self.static_ips.pop(int(ip_id), None) is not None
+
+  def insert_ip_test_result(self, *, ip_id, test_kind, success, latency_ms,
+                            error, raw=None) -> IpTestResultRecord:
+    self._ip_test_seq += 1
+    rec = IpTestResultRecord(
+      id=self._ip_test_seq, ip_id=int(ip_id), test_kind=test_kind,
+      success=bool(success), latency_ms=latency_ms, error=error,
+      raw=raw or {}, created_at=datetime.now(tz=UTC),
+    )
+    self.ip_test_results[rec.id] = rec
+    return rec
+
+  def list_ip_test_results(self, ip_id: int, *, limit: int = 100) -> list[IpTestResultRecord]:
+    rows = [r for r in self.ip_test_results.values() if r.ip_id == int(ip_id)]
+    rows.sort(key=lambda r: r.created_at, reverse=True)
+    return rows[:limit]
+
+  # system_config ----------------------------------------------------
+  def list_system_config(self) -> dict[str, dict]:
+    return dict(self.system_config)
+
+  def get_system_config(self, key: str) -> dict | None:
+    return self.system_config.get(key)
+
+  def upsert_system_config(self, key: str, value: dict) -> dict:
+    self.system_config[key] = dict(value or {})
+    return self.system_config[key]
+
+  def delete_system_config(self, key: str) -> bool:
+    return self.system_config.pop(key, None) is not None
+
+  # ssh_keys ----------------------------------------------------------
+  def list_ssh_keys(self):
+    return sorted(self.ssh_keys.values(), key=lambda r: r.name)
+
+  def get_ssh_key(self, key_id):
+    return self.ssh_keys.get(int(key_id))
+
+  def get_ssh_key_by_name(self, name):
+    for r in self.ssh_keys.values():
+      if r.name == name:
+        return r
+    return None
+
+  def insert_ssh_key(self, *, name, key_type, bits, private_key, public_key,
+                     fingerprint_sha256, comment=None, passphrase=None,
+                     description=None, source="generated", tags=None):
+    if any(r.name == name for r in self.ssh_keys.values()):
+      raise RuntimeError(f"duplicate ssh_key name: {name}")
+    self._ssh_key_seq += 1
+    rec = SshKeyRecord(
+      id=self._ssh_key_seq, name=name, description=description,
+      key_type=key_type, bits=bits, private_key=private_key,
+      public_key=public_key, fingerprint_sha256=fingerprint_sha256,
+      comment=comment, passphrase=passphrase, source=source,
+      tags=list(tags or []),
+      created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
+    )
+    self.ssh_keys[rec.id] = rec
+    return rec
+
+  def update_ssh_key(self, key_id, fields):
+    rec = self.ssh_keys.get(int(key_id))
+    if rec is None:
+      return None
+    for k, v in fields.items():
+      if hasattr(rec, k):
+        setattr(rec, k, v)
+    rec.updated_at = datetime.now(tz=UTC)
+    return rec
+
+  def delete_ssh_key(self, key_id):
+    return self.ssh_keys.pop(int(key_id), None) is not None
+
+  def count_nodes_using_key(self, private_key, *, key_id=None):
+    seen = set()
+    if private_key:
+      for n in self.nodes.values():
+        if n.ssh_private_key == private_key:
+          seen.add(n.name)
+    if key_id is not None:
+      links = getattr(self, "_node_ssh_keys", {})
+      for (nname, kid) in links.keys():
+        if kid == int(key_id):
+          seen.add(nname)
+    return len(seen)
+
+  def list_node_ssh_key_links(self, node_name):
+    out = []
+    links = getattr(self, "_node_ssh_keys", {})
+    for (nname, kid), prio in links.items():
+      if nname != node_name:
+        continue
+      k = self.ssh_keys.get(int(kid))
+      if k is None:
+        continue
+      out.append({
+        "ssh_key_id": k.id, "name": k.name, "key_type": k.key_type,
+        "bits": k.bits, "fingerprint_sha256": k.fingerprint_sha256,
+        "private_key": k.private_key, "passphrase": k.passphrase,
+        "priority": prio,
+      })
+    out.sort(key=lambda x: (x["priority"], x["name"]))
+    return out
+
+  def list_all_node_ssh_key_links(self):
+    out = {}
+    links = getattr(self, "_node_ssh_keys", {})
+    for (nname, kid), prio in links.items():
+      k = self.ssh_keys.get(int(kid))
+      if k is None:
+        continue
+      out.setdefault(nname, []).append({
+        "ssh_key_id": k.id, "name": k.name, "key_type": k.key_type,
+        "bits": k.bits, "fingerprint_sha256": k.fingerprint_sha256,
+        "private_key": k.private_key, "passphrase": k.passphrase,
+        "priority": prio,
+      })
+    for nname, items in out.items():
+      items.sort(key=lambda x: (x["priority"], x["name"]))
+    return out
+
+  def set_node_ssh_keys(self, node_name, key_ids):
+    if not hasattr(self, "_node_ssh_keys"):
+      self._node_ssh_keys = {}
+    # Drop any prior links for this node
+    self._node_ssh_keys = {k: v for k, v in self._node_ssh_keys.items() if k[0] != node_name}
+    for idx, kid in enumerate(key_ids or []):
+      self._node_ssh_keys[(node_name, int(kid))] = 100 + idx * 10
+
+  # service_deployments ---------------------------------------------
+  def insert_service_deployment(self, *, service_name, node_name, revision,
+                                 env_snapshot, triggered_by=None):
+    if not hasattr(self, "_service_deployments"):
+      self._service_deployments = {}; self._service_deployment_seq = 0
+      self._service_node_state = {}
+    self._service_deployment_seq += 1
+    rec = ServiceDeploymentRecord(
+      id=self._service_deployment_seq, service_name=service_name,
+      node_name=node_name, revision=revision, status="running",
+      healthcheck_passed=None, healthcheck_detail=None,
+      env_snapshot=dict(env_snapshot or {}), log_text="", exit_code=None,
+      started_at=datetime.now(tz=UTC), finished_at=None, triggered_by=triggered_by,
+    )
+    self._service_deployments[rec.id] = rec
+    return rec
+
+  def finalize_service_deployment(self, deployment_id, *, status,
+                                   healthcheck_passed, healthcheck_detail,
+                                   log_text, exit_code, revision=None):
+    rec = self._service_deployments.get(int(deployment_id))
+    if rec is None:
+      return None
+    rec.status = status; rec.healthcheck_passed = healthcheck_passed
+    rec.healthcheck_detail = healthcheck_detail; rec.log_text = log_text or ""
+    rec.exit_code = exit_code; rec.finished_at = datetime.now(tz=UTC)
+    if revision is not None: rec.revision = revision
+    return rec
+
+  def list_service_deployments(self, *, service_name=None, node_name=None, limit=50):
+    items = list(getattr(self, "_service_deployments", {}).values())
+    if service_name: items = [r for r in items if r.service_name == service_name]
+    if node_name: items = [r for r in items if r.node_name == node_name]
+    items.sort(key=lambda r: r.started_at, reverse=True)
+    return items[:limit]
+
+  def upsert_service_node_state(self, *, service_name, node_name,
+                                 revision, status, last_deployment_id):
+    if not hasattr(self, "_service_node_state"):
+      self._service_node_state = {}
+    self._service_node_state[(service_name, node_name)] = ServiceNodeStateRecord(
+      service_name=service_name, node_name=node_name, revision=revision,
+      status=status, last_deployment_id=last_deployment_id,
+      updated_at=datetime.now(tz=UTC),
+    )
+
+  def list_service_node_states(self, *, service_name=None):
+    items = list(getattr(self, "_service_node_state", {}).values())
+    if service_name: items = [r for r in items if r.service_name == service_name]
+    items.sort(key=lambda r: (r.service_name, r.node_name))
+    return items
+
+  def attach_ssh_key_to_node(self, node_name, private_key, passphrase):
+    n = self.nodes.get(node_name)
+    if n is None:
+      return False
+    n.auth_method = "key"
+    n.ssh_private_key = private_key
+    n.ssh_key_passphrase = passphrase
+    n.ssh_password = None
+    n.updated_at = datetime.now(tz=UTC)
+    return True
 
 
 def seed_demo_data(db: FakeDatabase) -> None:

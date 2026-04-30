@@ -1,0 +1,42 @@
+# Compose file run by the platform via `docker compose up -d --build`.
+# Project name is set automatically to `ssl-service`, so the container
+# comes up as `ssl-service-app-1`.
+#
+# `.env` is freshly written by the platform on each deploy from
+# .deploy.yaml `defaults` + secrets + per-deploy overrides — don't
+# commit a real .env to the repo.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ssl-service:local
+    container_name: ssl-service
+    restart: unless-stopped
+    network_mode: host    # we need :80 and :443 directly for Caddy + ACME
+    environment:
+      # The admin process reads these via env-substitution into config.yaml
+      # at container start (see scripts/container-entrypoint.sh).
+      SSL_SERVICE_MODE: "${SSL_SERVICE_MODE}"
+      SSL_SERVICE_PG_DSN: "${SSL_SERVICE_PG_DSN}"
+      SSL_SERVICE_ADMIN_TOKEN: "${SSL_SERVICE_ADMIN_TOKEN}"
+      SSL_SERVICE_LOG_LEVEL: "${SSL_SERVICE_LOG_LEVEL}"
+      SSL_SERVICE_ADMIN_BIND: "${SSL_SERVICE_ADMIN_BIND}"
+      SSL_SERVICE_ADMIN_PORT: "${SSL_SERVICE_ADMIN_PORT}"
+      SSL_SERVICE_ACME_EMAIL: "${SSL_SERVICE_ACME_EMAIL}"
+      SSL_SERVICE_ACME_STAGING: "${SSL_SERVICE_ACME_STAGING}"
+      SSL_SERVICE_ACME_DNS_PROVIDER: "${SSL_SERVICE_ACME_DNS_PROVIDER}"
+      SSL_SERVICE_RENEW_BEFORE_DAYS: "${SSL_SERVICE_RENEW_BEFORE_DAYS}"
+      SSL_SERVICE_POLL_INTERVAL_SECONDS: "${SSL_SERVICE_POLL_INTERVAL_SECONDS}"
+      TZ: "${TZ}"
+    volumes:
+      - ./config:/app/config           # config.yaml lives here
+      - ./state:/app/state             # generated Caddyfile, certs, runtime state
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/api/healthz', timeout=3).read(1)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -7,6 +8,16 @@ from typing import Iterator
 
 import psycopg
 from psycopg.rows import dict_row
+
+# Connection pool — optional. Without psycopg_pool we fall back to
+# opening a fresh connection per call, which is slow over the public
+# internet (TLS + Postgres startup adds 0.5–2 s per request).
+try:  # pragma: no cover — import-only guard
+  from psycopg_pool import ConnectionPool  # type: ignore
+except Exception:  # noqa: BLE001
+  ConnectionPool = None  # type: ignore
+
+LOGGER = logging.getLogger("ssl_proxy_controller.db")
 
 
 LB_POLICIES = ("random", "round_robin", "ip_hash", "uri_hash")
@@ -65,7 +76,7 @@ class DnsZoneTokenRecord:
   updated_at: datetime
 
 
-NODE_AUTH_METHODS = ("password", "key")
+NODE_AUTH_METHODS = ("password", "key", "auto")
 
 
 @dataclass(slots=True)
@@ -125,6 +136,50 @@ class ServiceRecord:
   config_files: dict
   created_at: datetime
   updated_at: datetime
+  # Manifest fields populated from `.deploy.yaml` at fetch time.
+  required_env: list[str] = None  # type: ignore[assignment]
+  healthcheck: dict = None  # type: ignore[assignment]
+  depends_on: list[str] = None  # type: ignore[assignment]
+  exposed_ports: list[int] = None  # type: ignore[assignment]
+  deploy_yaml: str | None = None
+  deploy_yaml_fetched_at: datetime | None = None
+
+  def __post_init__(self) -> None:
+    if self.required_env is None:
+      self.required_env = []
+    if self.healthcheck is None:
+      self.healthcheck = {}
+    if self.depends_on is None:
+      self.depends_on = []
+    if self.exposed_ports is None:
+      self.exposed_ports = []
+
+
+@dataclass(slots=True)
+class ServiceDeploymentRecord:
+  id: int
+  service_name: str
+  node_name: str
+  revision: str | None
+  status: str
+  healthcheck_passed: bool | None
+  healthcheck_detail: str | None
+  env_snapshot: dict
+  log_text: str
+  exit_code: int | None
+  started_at: datetime
+  finished_at: datetime | None
+  triggered_by: str | None
+
+
+@dataclass(slots=True)
+class ServiceNodeStateRecord:
+  service_name: str
+  node_name: str
+  revision: str | None
+  status: str | None
+  last_deployment_id: int | None
+  updated_at: datetime
 
 
 @dataclass(slots=True)
@@ -158,14 +213,118 @@ class NodeStatusRecord:
   raw_probe: dict | None = None
 
 
+# Static IP registry --------------------------------------------------
+IP_PROTOCOLS = (
+  "tcp", "udp", "http", "https", "ssh", "socks5", "socks4",
+  "shadowsocks", "ss", "trojan", "vmess", "vless", "wireguard",
+  "openvpn", "hysteria", "hysteria2", "icmp", "other",
+)
+
+
+@dataclass(slots=True)
+class StaticIpRecord:
+  id: int
+  ip: str
+  port: int | None
+  protocol: str
+  country: str | None
+  provider: str | None
+  label: str | None
+  notes: str | None
+  static_info: dict
+  loop_test_seconds: int | None
+  last_test_at: datetime | None
+  last_test_success: bool | None
+  last_test_latency_ms: int | None
+  last_test_error: str | None
+  last_probe_at: datetime | None
+  created_at: datetime
+  updated_at: datetime
+
+
+@dataclass(slots=True)
+class SshKeyRecord:
+  id: int
+  name: str
+  description: str | None
+  key_type: str
+  bits: int | None
+  private_key: str
+  public_key: str
+  fingerprint_sha256: str
+  comment: str | None
+  passphrase: str | None
+  source: str
+  tags: list[str]
+  created_at: datetime
+  updated_at: datetime
+
+
+@dataclass(slots=True)
+class IpTestResultRecord:
+  id: int
+  ip_id: int
+  test_kind: str
+  success: bool
+  latency_ms: int | None
+  error: str | None
+  raw: dict
+  created_at: datetime
+
+
 class Database:
-  def __init__(self, dsn: str) -> None:
+  def __init__(
+    self,
+    dsn: str,
+    *,
+    pool_min_size: int = 3,
+    pool_max_size: int = 10,
+    pool_timeout: float = 30.0,
+    use_pool: bool = True,
+  ) -> None:
     self._dsn = dsn
+    self._pool = None
+    if use_pool and ConnectionPool is not None:
+      try:
+        self._pool = ConnectionPool(
+          dsn,
+          min_size=pool_min_size,
+          max_size=pool_max_size,
+          timeout=pool_timeout,
+          open=True,
+          kwargs={"row_factory": dict_row},
+        )
+        # Block until at least one connection is ready so the first
+        # request after startup doesn't pay the full TLS/handshake tax.
+        self._pool.wait(timeout=pool_timeout)
+        LOGGER.info(
+          "psycopg connection pool ready (min=%d, max=%d)",
+          pool_min_size, pool_max_size,
+        )
+      except Exception as exc:  # noqa: BLE001
+        LOGGER.warning(
+          "could not start psycopg connection pool (%s); "
+          "falling back to per-call connections",
+          exc,
+        )
+        self._pool = None
+
+  def close(self) -> None:
+    """Close the underlying pool. Safe to call multiple times."""
+    if self._pool is not None:
+      try:
+        self._pool.close()
+      finally:
+        self._pool = None
 
   @contextmanager
   def connect(self) -> Iterator[psycopg.Connection]:
-    with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
-      yield connection
+    if self._pool is not None:
+      with self._pool.connection() as connection:
+        yield connection
+    else:
+      with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+        yield connection
 
   _ROUTE_SELECT_COLUMNS = """
     domain,
@@ -781,9 +940,21 @@ class Database:
         return None if row is None else self._row_to_node_status(row)
 
   def list_node_statuses(self) -> dict[str, NodeStatusRecord]:
+    """List all node_status rows EXCLUDING raw_probe (which can be a
+    multi-KB jsonb blob per row). The list endpoint never displays
+    raw_probe; callers that need it should use get_node_status() for
+    a single node instead."""
     with self.connect() as connection:
       with connection.cursor() as cursor:
-        cursor.execute("SELECT * FROM node_status")
+        cursor.execute(
+          """
+          SELECT node_name, reachable, service_installed, service_running,
+                 service_mode, service_version, uptime_seconds, load_avg,
+                 memory, disk_usage, os_release, last_probed_at,
+                 last_probe_error
+          FROM node_status
+          """
+        )
         return {r["node_name"]: self._row_to_node_status(r) for r in cursor.fetchall()}
 
   def upsert_node_status(self, status: NodeStatusRecord) -> NodeStatusRecord:
@@ -842,11 +1013,21 @@ class Database:
     "name, display_name, description, github_repo_url, default_branch, "
     "compose_file, install_dir_template, default_env, "
     "pre_deploy_command, post_deploy_command, "
-    "compose_template, config_files, created_at, updated_at"
+    "compose_template, config_files, created_at, updated_at, "
+    "COALESCE(required_env, ARRAY[]::TEXT[]) AS required_env, "
+    "COALESCE(healthcheck, '{}'::jsonb) AS healthcheck, "
+    "COALESCE(depends_on, ARRAY[]::TEXT[]) AS depends_on, "
+    "COALESCE(exposed_ports, ARRAY[]::INTEGER[]) AS exposed_ports, "
+    "deploy_yaml, deploy_yaml_fetched_at"
   )
 
   @staticmethod
   def _row_to_service(row: dict) -> ServiceRecord:
+    healthcheck = row.get("healthcheck") or {}
+    if isinstance(healthcheck, str):
+      import json as _json
+      try: healthcheck = _json.loads(healthcheck)
+      except Exception: healthcheck = {}
     return ServiceRecord(
       name=row["name"],
       display_name=row["display_name"],
@@ -862,6 +1043,12 @@ class Database:
       config_files=dict(row.get("config_files") or {}),
       created_at=row["created_at"],
       updated_at=row["updated_at"],
+      required_env=list(row.get("required_env") or []),
+      healthcheck=dict(healthcheck) if isinstance(healthcheck, dict) else {},
+      depends_on=list(row.get("depends_on") or []),
+      exposed_ports=[int(p) for p in (row.get("exposed_ports") or [])],
+      deploy_yaml=row.get("deploy_yaml"),
+      deploy_yaml_fetched_at=row.get("deploy_yaml_fetched_at"),
     )
 
   def list_services(self) -> list[ServiceRecord]:
@@ -924,15 +1111,24 @@ class Database:
     allowed = {"display_name", "description", "github_repo_url", "default_branch",
                "compose_file", "install_dir_template", "default_env",
                "pre_deploy_command", "post_deploy_command",
-               "compose_template", "config_files"}
+               "compose_template", "config_files",
+               # Manifest fields written by the deploy machinery.
+               "required_env", "healthcheck", "depends_on", "exposed_ports",
+               "deploy_yaml", "deploy_yaml_fetched_at"}
     sets = []
     params: dict = {"name": name}
     for k, v in fields.items():
       if k not in allowed:
         continue
-      if k in ("default_env", "config_files"):
+      if k in ("default_env", "config_files", "healthcheck"):
         sets.append(f"{k} = %({k})s::jsonb")
         params[k] = _json.dumps(v or {})
+      elif k in ("required_env", "depends_on"):
+        sets.append(f"{k} = %({k})s")
+        params[k] = list(v or [])
+      elif k == "exposed_ports":
+        sets.append(f"{k} = %({k})s")
+        params[k] = [int(p) for p in (v or [])]
       else:
         sets.append(f"{k} = %({k})s")
         params[k] = v
@@ -1019,6 +1215,26 @@ class Database:
         )
         return [self._row_to_init_run(r) for r in cursor.fetchall()]
 
+  def latest_init_run_per_node(self, node_names: list[str]) -> dict[str, NodeInitRunRecord]:
+    """Bulk: latest init run per node, for the supplied set. Single
+    round-trip to the DB. Used by the pre-deploy "is initialized?" check."""
+    if not node_names:
+      return {}
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          SELECT DISTINCT ON (node_name)
+                 id, node_name, status, current_step, log_text, exit_code,
+                 started_at, finished_at, config_snapshot
+          FROM node_init_runs
+          WHERE node_name = ANY(%s)
+          ORDER BY node_name, started_at DESC
+          """,
+          (list(node_names),),
+        )
+        return {r["node_name"]: self._row_to_init_run(r) for r in cursor.fetchall()}
+
   def update_init_run(
     self,
     run_id: int,
@@ -1052,6 +1268,804 @@ class Database:
       with connection.cursor() as cursor:
         cursor.execute(sql, params)
       connection.commit()
+
+  # static IPs ------------------------------------------------------
+  _STATIC_IP_COLUMNS = """
+    id, ip, port, protocol, country, provider, label, notes,
+    COALESCE(static_info, '{}'::jsonb) AS static_info,
+    loop_test_seconds, last_test_at, last_test_success,
+    last_test_latency_ms, last_test_error, last_probe_at,
+    created_at, updated_at
+  """
+
+  def _row_to_static_ip(self, row: dict) -> StaticIpRecord:
+    info = row["static_info"] or {}
+    if isinstance(info, str):
+      import json as _json
+      try:
+        info = _json.loads(info)
+      except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("static_ips.id=%s static_info JSON decode failed: %s; raw[:200]=%r",
+                       row.get("id"), exc, info[:200] if isinstance(info, str) else info)
+        info = {}
+    return StaticIpRecord(
+      id=int(row["id"]),
+      ip=row["ip"],
+      port=(int(row["port"]) if row["port"] is not None else None),
+      protocol=row["protocol"],
+      country=row["country"],
+      provider=row["provider"],
+      label=row["label"],
+      notes=row["notes"],
+      static_info=info if isinstance(info, dict) else {},
+      loop_test_seconds=(
+        int(row["loop_test_seconds"]) if row["loop_test_seconds"] is not None else None
+      ),
+      last_test_at=row["last_test_at"],
+      last_test_success=row["last_test_success"],
+      last_test_latency_ms=(
+        int(row["last_test_latency_ms"]) if row["last_test_latency_ms"] is not None else None
+      ),
+      last_test_error=row["last_test_error"],
+      last_probe_at=row["last_probe_at"],
+      created_at=row["created_at"],
+      updated_at=row["updated_at"],
+    )
+
+  def list_static_ips(
+    self,
+    *,
+    sort: str = "country",
+  ) -> list[StaticIpRecord]:
+    sort_clauses = {
+      "country": "country NULLS LAST, provider NULLS LAST, ip ASC",
+      "provider": "provider NULLS LAST, country NULLS LAST, ip ASC",
+      "ip": "ip ASC",
+      "created": "created_at DESC",
+    }
+    order = sort_clauses.get(sort, sort_clauses["country"])
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"SELECT {self._STATIC_IP_COLUMNS} FROM static_ips ORDER BY {order}"
+        )
+        return [self._row_to_static_ip(r) for r in cursor.fetchall()]
+
+  def get_static_ip(self, ip_id: int) -> StaticIpRecord | None:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"SELECT {self._STATIC_IP_COLUMNS} FROM static_ips WHERE id = %s",
+          (int(ip_id),),
+        )
+        row = cursor.fetchone()
+        return None if row is None else self._row_to_static_ip(row)
+
+  def insert_static_ip(
+    self,
+    *,
+    ip: str,
+    port: int | None,
+    protocol: str,
+    country: str | None = None,
+    provider: str | None = None,
+    label: str | None = None,
+    notes: str | None = None,
+    static_info: dict | None = None,
+    loop_test_seconds: int | None = None,
+  ) -> StaticIpRecord:
+    import json as _json
+    info = _json.dumps(static_info or {})
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"""
+          INSERT INTO static_ips
+            (ip, port, protocol, country, provider, label, notes,
+             static_info, loop_test_seconds)
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+          ON CONFLICT (ip, COALESCE(port, 0), protocol) DO UPDATE SET
+            country = COALESCE(EXCLUDED.country, static_ips.country),
+            provider = COALESCE(EXCLUDED.provider, static_ips.provider),
+            label = COALESCE(EXCLUDED.label, static_ips.label),
+            notes = COALESCE(EXCLUDED.notes, static_ips.notes),
+            updated_at = NOW()
+          RETURNING {self._STATIC_IP_COLUMNS}
+          """,
+          (ip, port, protocol, country, provider, label, notes, info, loop_test_seconds),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+      return self._row_to_static_ip(row)
+
+  # Whitelist of columns the admin layer is allowed to update on
+  # static_ips. Treat this as the SQL identifier safety boundary —
+  # f-strings below are only safe BECAUSE every key is checked against
+  # this set before substitution.
+  _STATIC_IP_UPDATABLE_COLUMNS: frozenset[str] = frozenset({
+    "ip", "port", "protocol", "country", "provider", "label", "notes",
+    "static_info", "loop_test_seconds",
+    "last_test_at", "last_test_success", "last_test_latency_ms",
+    "last_test_error", "last_probe_at",
+  })
+
+  def bulk_insert_static_ips(
+    self, records: list[dict]
+  ) -> tuple[list[StaticIpRecord], list[dict]]:
+    """Bulk-upsert many records in a single round trip.
+
+    Each record dict can have ``ip`` (required) plus any of ``port``,
+    ``protocol``, ``country``, ``provider``, ``label``, ``notes``,
+    ``loop_test_seconds``. Same ON CONFLICT semantics as
+    ``insert_static_ip``.
+
+    Returns ``(committed_records, per_record_errors)``. Errors are
+    surfaced for rows that fail validation BEFORE the SQL is sent;
+    the bulk SQL itself is all-or-nothing — if it fails, the whole
+    list goes into the error bucket so the caller can fall back to
+    per-row inserts.
+    """
+    import json as _json
+    if not records:
+      return [], []
+
+    valid: list[tuple] = []
+    raw_for_index: list[dict] = []
+    pre_errors: list[dict] = []
+    for rec in records:
+      ip = (rec.get("ip") or "").strip()
+      if not ip:
+        pre_errors.append({"input": rec, "error": "empty ip"})
+        continue
+      port = rec.get("port")
+      if port == "":
+        port = None
+      protocol = (rec.get("protocol") or "tcp")
+      country = rec.get("country") or None
+      provider = rec.get("provider") or None
+      label = rec.get("label") or None
+      notes = rec.get("notes") or None
+      info = _json.dumps(rec.get("static_info") or {})
+      loop_seconds = rec.get("loop_test_seconds")
+      valid.append((
+        ip, port, protocol, country, provider, label, notes, info, loop_seconds,
+      ))
+      raw_for_index.append(rec)
+
+    if not valid:
+      return [], pre_errors
+
+    placeholders = ",\n          ".join(
+      ["(%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)"] * len(valid)
+    )
+    sql = f"""
+      INSERT INTO static_ips
+        (ip, port, protocol, country, provider, label, notes,
+         static_info, loop_test_seconds)
+      VALUES
+        {placeholders}
+      ON CONFLICT (ip, COALESCE(port, 0), protocol) DO UPDATE SET
+        country = COALESCE(EXCLUDED.country, static_ips.country),
+        provider = COALESCE(EXCLUDED.provider, static_ips.provider),
+        label = COALESCE(EXCLUDED.label, static_ips.label),
+        notes = COALESCE(EXCLUDED.notes, static_ips.notes),
+        updated_at = NOW()
+      RETURNING {self._STATIC_IP_COLUMNS}
+    """
+    flat: list = []
+    for tup in valid:
+      flat.extend(tup)
+    try:
+      with self.connect() as connection:
+        with connection.cursor() as cursor:
+          cursor.execute(sql, flat)
+          rows = cursor.fetchall()
+        connection.commit()
+    except Exception as exc:  # noqa: BLE001
+      LOGGER.exception("bulk_insert_static_ips failed for %d rows", len(valid))
+      # Surface each row as an error so the caller can decide on a
+      # fallback path.
+      pre_errors.extend(
+        {"input": r, "error": f"bulk insert failed: {exc}"[:300]}
+        for r in raw_for_index
+      )
+      return [], pre_errors
+    return [self._row_to_static_ip(r) for r in rows], pre_errors
+
+  def update_static_ip(self, ip_id: int, fields: dict) -> StaticIpRecord | None:
+    if not fields:
+      return self.get_static_ip(ip_id)
+    sets: list[str] = []
+    params: list = []
+    for key, value in fields.items():
+      if key not in self._STATIC_IP_UPDATABLE_COLUMNS:
+        continue
+      if key == "static_info":
+        import json as _json
+        sets.append(f"{key} = %s::jsonb")
+        params.append(_json.dumps(value or {}))
+      else:
+        sets.append(f"{key} = %s")
+        params.append(value)
+    if not sets:
+      return self.get_static_ip(ip_id)
+    params.append(int(ip_id))
+    sql = (
+      f"UPDATE static_ips SET {', '.join(sets)} "
+      f"WHERE id = %s RETURNING {self._STATIC_IP_COLUMNS}"
+    )
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(sql, params)
+        row = cursor.fetchone()
+      connection.commit()
+      return None if row is None else self._row_to_static_ip(row)
+
+  def delete_static_ip(self, ip_id: int) -> bool:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute("DELETE FROM static_ips WHERE id = %s", (int(ip_id),))
+        deleted = cursor.rowcount
+      connection.commit()
+      return deleted > 0
+
+  def insert_ip_test_result(
+    self,
+    *,
+    ip_id: int,
+    test_kind: str,
+    success: bool,
+    latency_ms: int | None,
+    error: str | None,
+    raw: dict | None = None,
+  ) -> IpTestResultRecord:
+    import json as _json
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          INSERT INTO ip_test_results
+            (ip_id, test_kind, success, latency_ms, error, raw)
+          VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+          RETURNING id, ip_id, test_kind, success, latency_ms, error, raw, created_at
+          """,
+          (int(ip_id), test_kind, bool(success), latency_ms, error, _json.dumps(raw or {})),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    raw_val = row["raw"] or {}
+    if isinstance(raw_val, str):
+      try:
+        raw_val = _json.loads(raw_val)
+      except Exception:
+        raw_val = {}
+    return IpTestResultRecord(
+      id=int(row["id"]),
+      ip_id=int(row["ip_id"]),
+      test_kind=row["test_kind"],
+      success=row["success"],
+      latency_ms=(int(row["latency_ms"]) if row["latency_ms"] is not None else None),
+      error=row["error"],
+      raw=raw_val if isinstance(raw_val, dict) else {},
+      created_at=row["created_at"],
+    )
+
+  def list_ip_test_results(
+    self, ip_id: int, *, limit: int = 100
+  ) -> list[IpTestResultRecord]:
+    import json as _json
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          SELECT id, ip_id, test_kind, success, latency_ms, error,
+                 COALESCE(raw, '{}'::jsonb) AS raw, created_at
+          FROM ip_test_results
+          WHERE ip_id = %s
+          ORDER BY created_at DESC
+          LIMIT %s
+          """,
+          (int(ip_id), int(limit)),
+        )
+        out: list[IpTestResultRecord] = []
+        for r in cursor.fetchall():
+          raw_val = r["raw"] or {}
+          if isinstance(raw_val, str):
+            try:
+              raw_val = _json.loads(raw_val)
+            except Exception:
+              raw_val = {}
+          out.append(IpTestResultRecord(
+            id=int(r["id"]),
+            ip_id=int(r["ip_id"]),
+            test_kind=r["test_kind"],
+            success=r["success"],
+            latency_ms=(int(r["latency_ms"]) if r["latency_ms"] is not None else None),
+            error=r["error"],
+            raw=raw_val if isinstance(raw_val, dict) else {},
+            created_at=r["created_at"],
+          ))
+        return out
+
+  # service_deployments --------------------------------------------
+  _DEPLOYMENT_COLUMNS = (
+    "id, service_name, node_name, revision, status, "
+    "healthcheck_passed, healthcheck_detail, "
+    "COALESCE(env_snapshot, '{}'::jsonb) AS env_snapshot, "
+    "log_text, exit_code, started_at, finished_at, triggered_by"
+  )
+
+  @staticmethod
+  def _row_to_deployment(row: dict) -> ServiceDeploymentRecord:
+    snap = row.get("env_snapshot") or {}
+    if isinstance(snap, str):
+      import json as _json
+      try: snap = _json.loads(snap)
+      except Exception: snap = {}
+    return ServiceDeploymentRecord(
+      id=int(row["id"]),
+      service_name=row["service_name"],
+      node_name=row["node_name"],
+      revision=row.get("revision"),
+      status=row["status"],
+      healthcheck_passed=row.get("healthcheck_passed"),
+      healthcheck_detail=row.get("healthcheck_detail"),
+      env_snapshot=dict(snap) if isinstance(snap, dict) else {},
+      log_text=row.get("log_text") or "",
+      exit_code=(int(row["exit_code"]) if row.get("exit_code") is not None else None),
+      started_at=row["started_at"],
+      finished_at=row.get("finished_at"),
+      triggered_by=row.get("triggered_by"),
+    )
+
+  def insert_service_deployment(
+    self,
+    *,
+    service_name: str,
+    node_name: str,
+    revision: str | None,
+    env_snapshot: dict,
+    triggered_by: str | None = None,
+  ) -> ServiceDeploymentRecord:
+    import json as _json
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"""
+          INSERT INTO service_deployments
+            (service_name, node_name, revision, status, env_snapshot, triggered_by)
+          VALUES (%s, %s, %s, 'running', %s::jsonb, %s)
+          RETURNING {self._DEPLOYMENT_COLUMNS}
+          """,
+          (service_name, node_name, revision,
+           _json.dumps(env_snapshot or {}), triggered_by),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    return self._row_to_deployment(row)
+
+  def finalize_service_deployment(
+    self,
+    deployment_id: int,
+    *,
+    status: str,
+    healthcheck_passed: bool | None,
+    healthcheck_detail: str | None,
+    log_text: str,
+    exit_code: int | None,
+    revision: str | None = None,
+  ) -> ServiceDeploymentRecord | None:
+    sets = ["status = %s", "healthcheck_passed = %s", "healthcheck_detail = %s",
+            "log_text = %s", "exit_code = %s", "finished_at = NOW()"]
+    params: list = [status, healthcheck_passed, healthcheck_detail,
+                    log_text or "", exit_code]
+    if revision is not None:
+      sets.append("revision = %s")
+      params.append(revision)
+    params.append(int(deployment_id))
+    sql = (
+      f"UPDATE service_deployments SET {', '.join(sets)} "
+      f"WHERE id = %s RETURNING {self._DEPLOYMENT_COLUMNS}"
+    )
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(sql, params)
+        row = cursor.fetchone()
+      connection.commit()
+    return None if row is None else self._row_to_deployment(row)
+
+  def list_service_deployments(
+    self, *, service_name: str | None = None,
+    node_name: str | None = None, limit: int = 50,
+  ) -> list[ServiceDeploymentRecord]:
+    where = []
+    params: list = []
+    if service_name:
+      where.append("service_name = %s")
+      params.append(service_name)
+    if node_name:
+      where.append("node_name = %s")
+      params.append(node_name)
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    params.append(int(limit))
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"SELECT {self._DEPLOYMENT_COLUMNS} FROM service_deployments "
+          f"{clause} ORDER BY started_at DESC LIMIT %s",
+          params,
+        )
+        return [self._row_to_deployment(r) for r in cursor.fetchall()]
+
+  def upsert_service_node_state(
+    self, *, service_name: str, node_name: str,
+    revision: str | None, status: str | None,
+    last_deployment_id: int | None,
+  ) -> None:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          INSERT INTO service_node_state
+            (service_name, node_name, revision, status, last_deployment_id, updated_at)
+          VALUES (%s, %s, %s, %s, %s, NOW())
+          ON CONFLICT (service_name, node_name) DO UPDATE SET
+            revision = EXCLUDED.revision,
+            status = EXCLUDED.status,
+            last_deployment_id = EXCLUDED.last_deployment_id,
+            updated_at = NOW()
+          """,
+          (service_name, node_name, revision, status, last_deployment_id),
+        )
+      connection.commit()
+
+  def list_service_node_states(
+    self, *, service_name: str | None = None,
+  ) -> list[ServiceNodeStateRecord]:
+    where = ""
+    params: list = []
+    if service_name:
+      where = "WHERE service_name = %s"
+      params.append(service_name)
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"""SELECT service_name, node_name, revision, status,
+                     last_deployment_id, updated_at
+              FROM service_node_state {where}
+              ORDER BY service_name, node_name""",
+          params,
+        )
+        return [
+          ServiceNodeStateRecord(
+            service_name=r["service_name"],
+            node_name=r["node_name"],
+            revision=r.get("revision"),
+            status=r.get("status"),
+            last_deployment_id=(int(r["last_deployment_id"])
+                                 if r.get("last_deployment_id") is not None else None),
+            updated_at=r["updated_at"],
+          )
+          for r in cursor.fetchall()
+        ]
+
+  # ssh_keys --------------------------------------------------------
+  _SSH_KEY_COLUMNS = """
+    id, name, description, key_type, bits, private_key, public_key,
+    fingerprint_sha256, comment, passphrase, source,
+    COALESCE(tags, ARRAY[]::TEXT[]) AS tags,
+    created_at, updated_at
+  """
+
+  _SSH_KEY_UPDATABLE_COLUMNS: frozenset[str] = frozenset({
+    "name", "description", "comment", "passphrase", "tags",
+    "private_key", "public_key", "fingerprint_sha256", "key_type", "bits",
+    "source",
+  })
+
+  def _row_to_ssh_key(self, row: dict) -> SshKeyRecord:
+    return SshKeyRecord(
+      id=int(row["id"]),
+      name=row["name"],
+      description=row["description"],
+      key_type=row["key_type"],
+      bits=int(row["bits"]) if row["bits"] is not None else None,
+      private_key=row["private_key"],
+      public_key=row["public_key"],
+      fingerprint_sha256=row["fingerprint_sha256"],
+      comment=row["comment"],
+      passphrase=row["passphrase"],
+      source=row["source"],
+      tags=list(row["tags"] or []),
+      created_at=row["created_at"],
+      updated_at=row["updated_at"],
+    )
+
+  def list_ssh_keys(self) -> list[SshKeyRecord]:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"SELECT {self._SSH_KEY_COLUMNS} FROM ssh_keys ORDER BY name ASC"
+        )
+        return [self._row_to_ssh_key(r) for r in cursor.fetchall()]
+
+  def get_ssh_key(self, key_id: int) -> SshKeyRecord | None:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"SELECT {self._SSH_KEY_COLUMNS} FROM ssh_keys WHERE id = %s",
+          (int(key_id),),
+        )
+        row = cursor.fetchone()
+        return None if row is None else self._row_to_ssh_key(row)
+
+  def get_ssh_key_by_name(self, name: str) -> SshKeyRecord | None:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"SELECT {self._SSH_KEY_COLUMNS} FROM ssh_keys WHERE name = %s",
+          (name,),
+        )
+        row = cursor.fetchone()
+        return None if row is None else self._row_to_ssh_key(row)
+
+  def insert_ssh_key(
+    self,
+    *,
+    name: str,
+    key_type: str,
+    bits: int | None,
+    private_key: str,
+    public_key: str,
+    fingerprint_sha256: str,
+    comment: str | None = None,
+    passphrase: str | None = None,
+    description: str | None = None,
+    source: str = "generated",
+    tags: list[str] | None = None,
+  ) -> SshKeyRecord:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"""
+          INSERT INTO ssh_keys
+            (name, description, key_type, bits, private_key, public_key,
+             fingerprint_sha256, comment, passphrase, source, tags)
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+          RETURNING {self._SSH_KEY_COLUMNS}
+          """,
+          (
+            name, description, key_type, bits, private_key, public_key,
+            fingerprint_sha256, comment, passphrase, source,
+            list(tags or []),
+          ),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    return self._row_to_ssh_key(row)
+
+  def update_ssh_key(self, key_id: int, fields: dict) -> SshKeyRecord | None:
+    if not fields:
+      return self.get_ssh_key(key_id)
+    sets: list[str] = []
+    params: list = []
+    for key, value in fields.items():
+      if key not in self._SSH_KEY_UPDATABLE_COLUMNS:
+        continue
+      sets.append(f"{key} = %s")
+      params.append(value)
+    if not sets:
+      return self.get_ssh_key(key_id)
+    params.append(int(key_id))
+    sql = (
+      f"UPDATE ssh_keys SET {', '.join(sets)} "
+      f"WHERE id = %s RETURNING {self._SSH_KEY_COLUMNS}"
+    )
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(sql, params)
+        row = cursor.fetchone()
+      connection.commit()
+    return None if row is None else self._row_to_ssh_key(row)
+
+  def delete_ssh_key(self, key_id: int) -> bool:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute("DELETE FROM ssh_keys WHERE id = %s", (int(key_id),))
+        deleted = cursor.rowcount
+      connection.commit()
+      return deleted > 0
+
+  def count_nodes_using_key(self, private_key: str, *, key_id: int | None = None) -> int:
+    """Return how many nodes use this key — either inlined in
+    ``nodes.ssh_private_key`` OR linked via ``node_ssh_keys`` (when
+    ``key_id`` is provided). Counted once per node even if both
+    paths apply."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        if key_id is None and not private_key:
+          return 0
+        if key_id is None:
+          cursor.execute(
+            "SELECT COUNT(*) AS n FROM nodes WHERE ssh_private_key = %s",
+            (private_key,),
+          )
+        else:
+          cursor.execute(
+            """
+            SELECT COUNT(*) AS n FROM (
+              SELECT name FROM nodes WHERE ssh_private_key = %s
+              UNION
+              SELECT node_name AS name FROM node_ssh_keys WHERE ssh_key_id = %s
+            ) u
+            """,
+            (private_key or "", int(key_id)),
+          )
+        row = cursor.fetchone()
+        return int(row["n"]) if row else 0
+
+  # node ↔ ssh_key linkage ------------------------------------------
+  def list_node_ssh_key_links(self, node_name: str) -> list[dict]:
+    """Returns ``[{ssh_key_id, name, key_type, bits, fingerprint_sha256,
+    private_key, passphrase, priority}, …]`` ordered by priority."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          SELECT k.id AS ssh_key_id, k.name, k.key_type, k.bits,
+                 k.fingerprint_sha256, k.private_key, k.passphrase,
+                 l.priority
+          FROM node_ssh_keys l
+          JOIN ssh_keys k ON k.id = l.ssh_key_id
+          WHERE l.node_name = %s
+          ORDER BY l.priority ASC, k.name ASC
+          """,
+          (node_name,),
+        )
+        return list(cursor.fetchall())
+
+  def list_all_node_ssh_key_links(self) -> dict[str, list[dict]]:
+    """Bulk variant — one round trip, groups by node_name. Used by the
+    /api/nodes list endpoint to avoid N+1 over a remote DB."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          SELECT l.node_name,
+                 k.id AS ssh_key_id, k.name, k.key_type, k.bits,
+                 k.fingerprint_sha256, k.private_key, k.passphrase,
+                 l.priority
+          FROM node_ssh_keys l
+          JOIN ssh_keys k ON k.id = l.ssh_key_id
+          ORDER BY l.node_name ASC, l.priority ASC, k.name ASC
+          """,
+        )
+        out: dict[str, list[dict]] = {}
+        for row in cursor.fetchall():
+          out.setdefault(row["node_name"], []).append({
+            "ssh_key_id": row["ssh_key_id"],
+            "name": row["name"],
+            "key_type": row["key_type"],
+            "bits": row["bits"],
+            "fingerprint_sha256": row["fingerprint_sha256"],
+            "private_key": row["private_key"],
+            "passphrase": row["passphrase"],
+            "priority": row["priority"],
+          })
+        return out
+
+  def set_node_ssh_keys(
+    self, node_name: str, key_ids: list[int],
+  ) -> None:
+    """Replace a node's linked-key set with exactly ``key_ids``."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          "DELETE FROM node_ssh_keys WHERE node_name = %s",
+          (node_name,),
+        )
+        if key_ids:
+          # priority defaults to insertion order * 10 so the operator
+          # can re-order via UI later if we expose it.
+          values = []
+          for idx, kid in enumerate(key_ids):
+            values.append((node_name, int(kid), 100 + idx * 10))
+          cursor.executemany(
+            "INSERT INTO node_ssh_keys (node_name, ssh_key_id, priority) "
+            "VALUES (%s, %s, %s) ON CONFLICT (node_name, ssh_key_id) DO NOTHING",
+            values,
+          )
+      connection.commit()
+
+  def attach_ssh_key_to_node(self, node_name: str, private_key: str,
+                              passphrase: str | None) -> bool:
+    """Copy a key's private material into a node row, switching it to key auth."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          UPDATE nodes
+          SET auth_method = 'key',
+              ssh_private_key = %s,
+              ssh_key_passphrase = %s,
+              ssh_password = NULL,
+              updated_at = NOW()
+          WHERE name = %s
+          """,
+          (private_key, passphrase, node_name),
+        )
+        affected = cursor.rowcount
+      connection.commit()
+      return affected > 0
+
+  # system_config -------------------------------------------------
+  def list_system_config(self) -> dict[str, dict]:
+    import json as _json
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          "SELECT key, COALESCE(value, '{}'::jsonb) AS value FROM system_config ORDER BY key"
+        )
+        out: dict[str, dict] = {}
+        for row in cursor.fetchall():
+          val = row["value"]
+          if isinstance(val, str):
+            try:
+              val = _json.loads(val)
+            except Exception:
+              val = {}
+          out[row["key"]] = val if isinstance(val, dict) else {}
+        return out
+
+  def get_system_config(self, key: str) -> dict | None:
+    import json as _json
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          "SELECT COALESCE(value, '{}'::jsonb) AS value FROM system_config WHERE key = %s",
+          (key,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+          return None
+        val = row["value"]
+        if isinstance(val, str):
+          try:
+            val = _json.loads(val)
+          except Exception:
+            val = {}
+        return val if isinstance(val, dict) else {}
+
+  def upsert_system_config(self, key: str, value: dict) -> dict:
+    import json as _json
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          INSERT INTO system_config (key, value)
+          VALUES (%s, %s::jsonb)
+          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+          RETURNING COALESCE(value, '{}'::jsonb) AS value
+          """,
+          (key, _json.dumps(value or {})),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    val = row["value"]
+    if isinstance(val, str):
+      try:
+        val = _json.loads(val)
+      except Exception:
+        val = {}
+    return val if isinstance(val, dict) else {}
+
+  def delete_system_config(self, key: str) -> bool:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute("DELETE FROM system_config WHERE key = %s", (key,))
+        deleted = cursor.rowcount
+      connection.commit()
+      return deleted > 0
 
   def try_advisory_lock(self, connection: psycopg.Connection, key: str) -> bool:
     with connection.cursor() as cursor:

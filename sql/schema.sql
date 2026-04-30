@@ -266,3 +266,229 @@ CREATE TRIGGER nodes_touch_updated_at
 BEFORE UPDATE ON nodes
 FOR EACH ROW
 EXECUTE FUNCTION touch_updated_at();
+
+-- Static IPs ----------------------------------------------------------
+-- Independent registry of static IP addresses the operator wants to
+-- track. Each row is a single (ip, port, protocol) triple plus
+-- country/provider attribution and an optional free-form static
+-- description (used to store the result of one-off info probes such as
+-- streaming-unlock checks). Connectivity testing and full-info probes
+-- are recorded as ip_test_results rows.
+
+CREATE TABLE IF NOT EXISTS static_ips (
+  id BIGSERIAL PRIMARY KEY,
+  ip TEXT NOT NULL,
+  port INTEGER CHECK (port IS NULL OR (port > 0 AND port < 65536)),
+  protocol TEXT NOT NULL DEFAULT 'tcp',
+  country TEXT,
+  provider TEXT,
+  label TEXT,
+  notes TEXT,
+  static_info JSONB NOT NULL DEFAULT '{}'::jsonb,
+  loop_test_seconds INTEGER,
+  last_test_at TIMESTAMPTZ,
+  last_test_success BOOLEAN,
+  last_test_latency_ms INTEGER,
+  last_test_error TEXT,
+  last_probe_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_static_ips_ip_port_proto
+  ON static_ips (ip, COALESCE(port, 0), protocol);
+CREATE INDEX IF NOT EXISTS idx_static_ips_country ON static_ips (country);
+CREATE INDEX IF NOT EXISTS idx_static_ips_provider ON static_ips (provider);
+
+DROP TRIGGER IF EXISTS static_ips_touch_updated_at ON static_ips;
+CREATE TRIGGER static_ips_touch_updated_at
+BEFORE UPDATE ON static_ips
+FOR EACH ROW
+EXECUTE FUNCTION touch_updated_at();
+
+CREATE TABLE IF NOT EXISTS ip_test_results (
+  id BIGSERIAL PRIMARY KEY,
+  ip_id BIGINT NOT NULL REFERENCES static_ips(id) ON DELETE CASCADE,
+  test_kind TEXT NOT NULL DEFAULT 'connectivity'
+    CHECK (test_kind IN ('connectivity','probe','manual','loop','test_all')),
+  success BOOLEAN NOT NULL,
+  latency_ms INTEGER,
+  error TEXT,
+  raw JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ip_test_results_ip_created
+  ON ip_test_results (ip_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ip_test_results_created
+  ON ip_test_results (created_at DESC);
+
+-- System configuration ------------------------------------------------
+-- Generic key/value store for runtime-tunable settings such as the
+-- AI-parser endpoint, model, and API key. The admin UI reads/writes
+-- this table directly. Values are intentionally stored in plain text
+-- per the operator's instruction; treat the schema as low-trust.
+
+CREATE TABLE IF NOT EXISTS system_config (
+  key TEXT PRIMARY KEY,
+  value JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS system_config_touch_updated_at ON system_config;
+CREATE TRIGGER system_config_touch_updated_at
+BEFORE UPDATE ON system_config
+FOR EACH ROW
+EXECUTE FUNCTION touch_updated_at();
+
+-- SSH key registry --------------------------------------------------
+-- Centralized lifecycle management for the SSH key material the
+-- operator uses to authenticate to managed nodes. Both generated and
+-- imported keys live here. We store the full private + public key
+-- text in plain text per the operator's deliberate decision (the
+-- existing `nodes` table already does this for inline keys); the
+-- `passphrase` column is optional and likewise plain text.
+--
+-- Linkage to nodes is by content (nodes.ssh_private_key holds the
+-- same PEM body) — we expose "used by N nodes" to the UI by matching
+-- text. This avoids an FK migration of the existing nodes table.
+
+CREATE TABLE IF NOT EXISTS ssh_keys (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT,
+  key_type TEXT NOT NULL CHECK (key_type IN ('rsa','ed25519','ecdsa','dsa')),
+  bits INTEGER,
+  private_key TEXT NOT NULL,
+  public_key TEXT NOT NULL,
+  fingerprint_sha256 TEXT NOT NULL,
+  comment TEXT,
+  passphrase TEXT,
+  source TEXT NOT NULL CHECK (source IN ('generated','imported')) DEFAULT 'generated',
+  tags TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ssh_keys_fingerprint ON ssh_keys (fingerprint_sha256);
+CREATE INDEX IF NOT EXISTS idx_ssh_keys_type ON ssh_keys (key_type);
+
+DROP TRIGGER IF EXISTS ssh_keys_touch_updated_at ON ssh_keys;
+CREATE TRIGGER ssh_keys_touch_updated_at
+BEFORE UPDATE ON ssh_keys
+FOR EACH ROW
+EXECUTE FUNCTION touch_updated_at();
+
+-- Expand nodes.auth_method to allow 'auto' (try key then password). The
+-- existing CHECK constraint only accepts 'password' or 'key'; lift it
+-- and re-create with the wider set. Both ssh_password and ssh_private_key
+-- can now be populated simultaneously regardless of auth_method — the
+-- column tells the SSH driver which to attempt first / use, but the
+-- inactive credential is preserved on disk so VPS-reinit recovery just
+-- means flipping auth_method, not re-typing.
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'nodes_auth_method_check'
+      AND conrelid = 'nodes'::regclass
+  ) THEN
+    ALTER TABLE nodes DROP CONSTRAINT nodes_auth_method_check;
+  END IF;
+END;
+$$;
+
+ALTER TABLE nodes
+  ADD CONSTRAINT nodes_auth_method_check
+  CHECK (auth_method IN ('password', 'key', 'auto'));
+
+-- Many-to-many between nodes and centrally-managed SSH keys ----------
+-- A node can have any number of registered keys linked. When the
+-- platform connects, it tries every linked key (in priority order)
+-- before falling back to password (if auth_method='auto').
+--
+-- The legacy ``nodes.ssh_private_key`` column stays for backward
+-- compatibility — connection logic tries it first as an extra slot.
+-- The Edit UI moves the primary input to this junction; inline paste
+-- becomes a power-user disclosure.
+
+CREATE TABLE IF NOT EXISTS node_ssh_keys (
+  node_name TEXT NOT NULL REFERENCES nodes(name) ON DELETE CASCADE ON UPDATE CASCADE,
+  ssh_key_id BIGINT NOT NULL REFERENCES ssh_keys(id) ON DELETE CASCADE,
+  priority INTEGER NOT NULL DEFAULT 100,
+  added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (node_name, ssh_key_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_ssh_keys_node
+  ON node_ssh_keys (node_name, priority);
+CREATE INDEX IF NOT EXISTS idx_node_ssh_keys_key
+  ON node_ssh_keys (ssh_key_id);
+
+-- Opportunistic backfill — link existing inline-keyed nodes by exact
+-- text match. Idempotent; safe to re-run.
+INSERT INTO node_ssh_keys (node_name, ssh_key_id, priority)
+SELECT n.name, k.id, 50
+FROM nodes n
+JOIN ssh_keys k ON k.private_key = n.ssh_private_key
+WHERE n.ssh_private_key IS NOT NULL
+  AND n.ssh_private_key <> ''
+ON CONFLICT (node_name, ssh_key_id) DO NOTHING;
+
+-- Service deployment manifest support ---------------------------------
+-- Extends the existing `services` table with the manifest fields the
+-- platform reads from each repo's `.deploy.yaml`. Older rows continue
+-- to work — these columns just default to empty values.
+
+ALTER TABLE services ADD COLUMN IF NOT EXISTS required_env TEXT[]    NOT NULL DEFAULT ARRAY[]::TEXT[];
+ALTER TABLE services ADD COLUMN IF NOT EXISTS healthcheck  JSONB    NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS depends_on   TEXT[]   NOT NULL DEFAULT ARRAY[]::TEXT[];
+ALTER TABLE services ADD COLUMN IF NOT EXISTS deploy_yaml  TEXT;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS deploy_yaml_fetched_at TIMESTAMPTZ;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS exposed_ports INTEGER[] NOT NULL DEFAULT ARRAY[]::INTEGER[];
+
+-- Per-(service, node) deployment history. Each row is one attempt —
+-- success or failure — so the operator can see what's running where
+-- and roll back if needed.
+
+CREATE TABLE IF NOT EXISTS service_deployments (
+  id BIGSERIAL PRIMARY KEY,
+  service_name TEXT NOT NULL REFERENCES services(name) ON DELETE CASCADE ON UPDATE CASCADE,
+  node_name TEXT NOT NULL REFERENCES nodes(name) ON DELETE CASCADE ON UPDATE CASCADE,
+  revision TEXT,                        -- git SHA / tag / branch that was deployed
+  status TEXT NOT NULL CHECK (status IN ('pending','running','success','failed','rolled_back')),
+  healthcheck_passed BOOLEAN,           -- NULL if no healthcheck configured
+  healthcheck_detail TEXT,              -- last response / error
+  env_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,   -- effective env at deploy time
+  log_text TEXT NOT NULL DEFAULT '',     -- combined stdout/stderr from setup script
+  exit_code INTEGER,
+  started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  finished_at TIMESTAMPTZ,
+  triggered_by TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_service_deployments_service
+  ON service_deployments (service_name, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_service_deployments_node
+  ON service_deployments (node_name, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_service_deployments_status
+  ON service_deployments (status);
+
+-- Track which (service, node) currently has which revision running.
+-- This is a fast lookup table, kept in sync by application code.
+CREATE TABLE IF NOT EXISTS service_node_state (
+  service_name TEXT NOT NULL REFERENCES services(name) ON DELETE CASCADE ON UPDATE CASCADE,
+  node_name TEXT NOT NULL REFERENCES nodes(name) ON DELETE CASCADE ON UPDATE CASCADE,
+  revision TEXT,
+  status TEXT,                          -- mirrors the latest service_deployments row
+  last_deployment_id BIGINT REFERENCES service_deployments(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (service_name, node_name)
+);
+
+DROP TRIGGER IF EXISTS service_node_state_touch_updated_at ON service_node_state;
+CREATE TRIGGER service_node_state_touch_updated_at
+BEFORE UPDATE ON service_node_state
+FOR EACH ROW
+EXECUTE FUNCTION touch_updated_at();
