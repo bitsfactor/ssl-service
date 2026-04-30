@@ -3104,6 +3104,105 @@ def _build_router(ctx: AdminContext) -> _Router:
       delete_zone(ctx, request.path_params["zone_name"]),
     )
 
+  def zone_test_acme_cleanup_handler(request: _Request) -> _Response:
+    """Diagnostic endpoint: end-to-end test the proactive ``_acme-challenge``
+    TXT cleanup path against the configured Cloudflare zone.
+
+    Body (JSON):
+      domain: "<sub>.bitio.cc"   — the FQDN we'd be requesting a cert for.
+                                    The challenge name is ``_acme-challenge.<domain>``.
+      seed:   bool (default: true)
+              If true, first CREATE a placeholder TXT record at the
+              challenge name (mimicking a stale record from a previous
+              run) so the cleanup has something to delete. If false, just
+              run cleanup against whatever's there.
+
+    Returns:
+      before:    list of TXT record names found before cleanup
+      seeded:    boolean — did we add a placeholder record
+      after:     list of TXT record names left after cleanup (should be [])
+      removed:   how many records cleanup deleted
+    """
+    _require_readwrite(ctx)
+    payload = request.json_body() if request.body else {}
+    zone_name = (request.path_params.get("zone_name") or "").strip().lower()
+    domain = (payload.get("domain") or "").strip().lower()
+    seed = bool(payload.get("seed", True))
+    if not zone_name or not domain:
+      raise HttpError(HTTPStatus.BAD_REQUEST, "zone_name and domain are required",
+                      code="ids_required")
+    # Look up the zone by exact zone_name match.
+    zone_token = next(
+      (z for z in ctx.database.list_dns_zone_tokens() if z.zone_name == zone_name),
+      None,
+    )
+    if zone_token is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"no zone token: {zone_name}",
+                      code="zone_not_found")
+
+    import json as _json
+    import urllib.parse as _urlparse
+    import urllib.request as _urlreq
+    from .acme import _cleanup_cloudflare_acme_txt_records, _cloudflare_request
+
+    challenge_name = f"_acme-challenge.{domain}".rstrip(".")
+    list_url = (
+      f"https://api.cloudflare.com/client/v4/zones/{zone_token.zone_id}"
+      f"/dns_records?{_urlparse.urlencode({'type': 'TXT', 'name': challenge_name, 'per_page': '100'})}"
+    )
+
+    def _list_txt_records() -> list[str]:
+      payload = _cloudflare_request(zone_token.api_token, "GET", list_url)
+      return [r.get("name", "") for r in (payload.get("result") or [])]
+
+    before = _list_txt_records()
+    seeded = False
+    if seed:
+      # Create a placeholder TXT record at the challenge name to mimic a
+      # stale record from an interrupted previous run.
+      create_url = f"https://api.cloudflare.com/client/v4/zones/{zone_token.zone_id}/dns_records"
+      body = _json.dumps({
+        "type": "TXT",
+        "name": challenge_name,
+        "content": "claude-dns-cleanup-test-placeholder",
+        "ttl": 60,
+      }).encode("utf-8")
+      req = _urlreq.Request(create_url, data=body, method="POST", headers={
+        "Authorization": f"Bearer {zone_token.api_token}",
+        "Content-Type": "application/json",
+      })
+      with _urlreq.urlopen(req, timeout=20) as resp:
+        cf_resp = _json.load(resp)
+      # Cloudflare's API often returns HTTP 200 with ``success: false`` —
+      # we'd otherwise report ``seeded=true`` but no record exists, then
+      # claim the cleanup removed 0 records and confuse the operator.
+      if not cf_resp.get("success"):
+        errors = cf_resp.get("errors") or []
+        raise HttpError(
+          HTTPStatus.BAD_GATEWAY,
+          f"Cloudflare did not create the placeholder record: {errors!r}",
+          code="cloudflare_seed_failed",
+        )
+      seeded = True
+
+    mid = _list_txt_records() if seeded else before
+
+    _cleanup_cloudflare_acme_txt_records(zone_token.zone_id, zone_token.api_token, domain)
+    after = _list_txt_records()
+    removed = max(0, len(mid) - len(after))
+
+    return _json_response(HTTPStatus.OK, {
+      "zone": zone_name,
+      "domain": domain,
+      "challenge_name": challenge_name,
+      "before": before,
+      "seeded": seeded,
+      "mid": mid,
+      "after": after,
+      "removed": removed,
+      "success": len(after) == 0,
+    })
+
   def logs_handler(request: _Request) -> _Response:
     which = request.query_str("which", "controller")
     tail = max(1, min(request.query_int("tail", 500), 5000))
@@ -3241,6 +3340,8 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("GET", "/api/zones", with_auth(zones_handler))
   router.add("POST", "/api/zones", with_auth(upsert_zone_handler))
   router.add("DELETE", "/api/zones/{zone_name}", with_auth(delete_zone_handler))
+  router.add("POST", "/api/zones/{zone_name}/test-acme-cleanup",
+             with_auth(zone_test_acme_cleanup_handler))
   router.add("GET", "/api/logs", with_auth(logs_handler))
   router.add("POST", "/api/sync", with_auth(sync_handler))
   router.add("GET", "/api/nodes", with_auth(nodes_handler))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import subprocess
@@ -19,18 +20,26 @@ from .config import AppConfig
 from .db import CertificateRecord, Database
 
 
+LOGGER = logging.getLogger("ssl_proxy_controller.acme")
+
+
 # Cloudflare returns one of these phrases when a TXT record with the same
 # (name, content) already exists for a zone. We don't want to depend on the
 # exact wording — partial match against any of these is enough to trigger
 # the cleanup-and-retry path. The PROACTIVE cleanup that always runs
 # before certbot makes hitting this recovery branch unlikely, but we keep
 # it as a safety net for races (e.g. a parallel renewal somewhere else).
+#
+# Markers are deliberately specific. We did NOT include the substring
+# ``_acme-challenge`` here because it appears in unrelated errors too
+# (e.g. "your account is suspended; the _acme-challenge zone is blocked")
+# and would cause us to retry against errors that won't be fixed by
+# deleting records.
 _CLOUDFLARE_RECORD_EXISTS_MARKERS: tuple[str, ...] = (
   "An identical record already exists",
   "Record already exists",
   "DNS Validation Error",
-  "An A, AAAA, or CNAME record",  # rare interaction
-  "_acme-challenge",                # last-ditch — name is in the error
+  "An A, AAAA, or CNAME record",  # rare interaction (CNAME blocks TXT)
 )
 
 
@@ -118,12 +127,16 @@ def _run_certbot_with_cloudflare_recovery(command: list[str], zone_id: str, zone
   # which we are about to recreate from scratch anyway.
   try:
     _cleanup_cloudflare_acme_txt_records(zone_id, zone_token, domain)
-  except Exception:  # pragma: no cover — logged + tolerated
+  except Exception as exc:
     # If the cleanup itself fails (e.g. transient network), don't abort
     # the cert issuance — fall through to certbot which will surface the
     # real error if any. The reactive recovery path below still catches
-    # the case where the records weren't deletable in time.
-    pass
+    # the case where the records weren't deletable in time. We log so a
+    # human investigating recurring ACME failures has a breadcrumb.
+    LOGGER.warning(
+      "acme: proactive cleanup for %s failed (%s: %s); continuing with certbot",
+      domain, type(exc).__name__, exc,
+    )
 
   try:
     subprocess.run(command, check=True)
