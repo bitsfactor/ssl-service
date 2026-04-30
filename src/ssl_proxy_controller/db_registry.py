@@ -1,6 +1,6 @@
 """Multi-database registry — the list of Postgres DSNs the admin
 knows about, **persisted to a YAML file** so it survives admin
-restarts and the start-admin launcher script can read it before the
+restarts and the start.command launcher script can read it before the
 admin process even comes up.
 
 File location: ``~/.ssl-service/databases.yaml`` (overridable via the

@@ -17,7 +17,9 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
+import time
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime, timezone
 from http import HTTPStatus
@@ -60,6 +62,10 @@ _DOMAIN_RE = re.compile(
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# Process start time, surfaced via /api/admin/version so the UI can detect
+# when a self-restart has finished (started_at changes after restart).
+_admin_started_at = datetime.now(tz=UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -3399,6 +3405,69 @@ def _build_router(ctx: AdminContext) -> _Router:
     connection pool — no restart needed."""
     return databases_activate_handler(request)
 
+  def admin_restart_handler(_request: _Request) -> _Response:
+    """Re-exec the running admin process so a fresh start picks up
+    edited config / new code without needing an external kill+start.
+
+    Implementation: schedule ``os.execv(sys.executable, sys.argv)``
+    on a background thread after a short delay, so the JSON response
+    can fully flush back to the client first. The replacement process
+    inherits the same PID and the same parent terminal.
+
+    Caveats: any in-flight HTTP request gets terminated. Connection
+    pools are closed gracefully before the exec."""
+    _require_readwrite(ctx)
+    delay = 1.5
+    cur_pid = os.getpid()
+    LOGGER.info("admin.restart requested via API; current pid=%d, delay=%.1fs",
+                cur_pid, delay)
+
+    def _do_restart() -> None:
+      try:
+        time.sleep(delay)
+      except Exception:
+        pass
+      # Close DB pool gracefully so connections aren't orphaned.
+      try:
+        ctx.database.close()
+      except Exception:
+        LOGGER.exception("admin.restart: database.close() failed (continuing)")
+      # The admin is launched via `python -m ssl_proxy_controller ...`,
+      # which makes ``sys.argv[0]`` the path to ``__main__.py``. Re-execing
+      # ``[python, __main__.py, ...]`` would invoke that script directly
+      # and break its relative imports (``from .controller import main``).
+      # Detect that case and rebuild argv to use ``-m`` again.
+      argv0 = sys.argv[0] or ""
+      rest = list(sys.argv[1:])
+      pkg_root = Path(__file__).resolve().parent
+      if Path(argv0).resolve().parent == pkg_root and Path(argv0).name == "__main__.py":
+        new_argv = [sys.executable, "-m", pkg_root.name, *rest]
+      else:
+        new_argv = [sys.executable, argv0, *rest]
+      LOGGER.info("admin.restart: execv-ing %s", new_argv)
+      try:
+        os.execv(sys.executable, new_argv)
+      except Exception:
+        LOGGER.exception("admin.restart: execv failed; the admin will exit")
+        os._exit(1)
+
+    threading.Thread(target=_do_restart, daemon=False, name="admin-restart").start()
+    return _json_response(HTTPStatus.OK, {
+      "restart": "scheduled",
+      "delay_seconds": delay,
+      "current_pid": cur_pid,
+    })
+
+  def admin_version_handler(_request: _Request) -> _Response:
+    """Lightweight signal the UI can poll after a restart request to
+    detect that the new process has come up: returns the start time
+    of the running admin. Different start_at across two requests
+    means a restart happened."""
+    return _json_response(HTTPStatus.OK, {
+      "started_at": _to_jsonable(_admin_started_at),
+      "pid": os.getpid(),
+    })
+
   def databases_push_dsn_handler(request: _Request) -> _Response:
     """Re-deploy ssl-service to every node that has a row for it,
     using the admin's currently-active DSN as SSL_SERVICE_PG_DSN
@@ -3584,6 +3653,8 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("POST",   "/api/databases/push-dsn-to-nodes", with_auth(databases_push_dsn_handler))
   router.add("POST",   "/api/sync/analyze", with_auth(sync_analyze_handler))
   router.add("POST",   "/api/sync/apply", with_auth(sync_apply_handler))
+  router.add("POST",   "/api/admin/restart", with_auth(admin_restart_handler))
+  router.add("GET",    "/api/admin/version", with_auth(admin_version_handler))
   router.add("GET", "/api/services/{name}/nodes", with_auth(service_nodes_handler))
   router.add("POST", "/api/services/{name}/refresh", with_auth(service_refresh_handler))
   router.add("GET", "/api/services", with_auth(services_list_handler))

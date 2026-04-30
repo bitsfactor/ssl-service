@@ -1,0 +1,101 @@
+# =============================================================================
+# Service deployment manifest — read by the ssl-service admin platform.
+#
+# Drop this file at the root of your repo. The platform clones the repo
+# on the target node, reads this file, validates required env, writes a
+# fresh `.env`, then runs `docker compose up -d --build`. Healthcheck is
+# verified before the deploy is marked successful; on failure the
+# platform rolls back to the previous revision.
+#
+# This is the *only* contract a repo has to satisfy. Everything else
+# (Dockerfile, docker-compose.yml, scripts/) is pure Docker / shell.
+# =============================================================================
+
+# ---- identity ---------------------------------------------------------------
+
+# Service name. Must match the entry in the platform's services table.
+# Used as docker compose project name → containers get prefixed with this.
+service: my-api
+
+# How the platform should run this service. Right now only "compose" is
+# supported; future "k3s" / "systemd" tiers slot in here.
+runtime: compose
+
+# ---- compose layout ---------------------------------------------------------
+
+# Path to the compose file inside the repo. Default: docker-compose.yml.
+compose_file: docker-compose.yml
+
+# Where on the target node the repo gets cloned and the service runs from.
+# `{name}` is substituted with the service name.
+install_dir_template: /opt/{name}
+
+# ---- environment ------------------------------------------------------------
+
+# Variables that MUST be supplied at deploy time. The platform refuses
+# to deploy if any of these are empty in the effective env.
+required_env:
+  - DATABASE_URL
+  - JWT_SECRET
+
+# Default values, pre-filled in the deploy form. Operator can override
+# per-deploy. Anything here that is also in `required_env` counts as
+# satisfied.
+defaults:
+  PORT: "8080"
+  LOG_LEVEL: info
+  TZ: Asia/Shanghai
+
+# Sensitive values that should be loaded from the platform's
+# system_config (not committed to the repo). Each entry resolves to
+# system_config[<key>] at deploy time.
+secrets: []
+  # - env: DATABASE_URL
+  #   from: system_config:database_urls.production
+
+# ---- ports / proxy ----------------------------------------------------------
+
+# Container ports the service exposes. Used to render the deploy
+# preview, and (if you also use ssl-service for HTTPS) the platform
+# will offer to create a route with caddy.
+exposed_ports:
+  - 8080
+
+# ---- healthcheck (required) -------------------------------------------------
+
+# After `docker compose up -d`, the platform repeatedly probes this URL
+# from inside the target node. Deployment is marked successful only
+# when one of these probes returns the expected status.
+healthcheck:
+  url: http://localhost:${PORT}/health
+  expect_status: 200
+  timeout_seconds: 30
+  retries: 6
+  interval_seconds: 5
+
+# ---- dependencies (optional) ------------------------------------------------
+
+# Other services on the same node that must be running before this one
+# is started. The platform validates / waits.
+depends_on: []
+  # - redis
+  # - postgres
+
+# ---- escape hatches (optional) ----------------------------------------------
+
+# Shell scripts run on the target node by the deploy orchestrator.
+# Use only when env + compose can't express what you need (e.g. running
+# a one-shot DB migration). Both stdout/stderr are captured and stored
+# in the deployment log.
+hooks:
+  pre_deploy: scripts/pre_deploy.sh        # before docker compose up
+  post_deploy: scripts/post_deploy.sh      # after compose up + healthcheck
+  on_first_deploy: scripts/first_deploy.sh # only on the very first deploy
+
+# ---- volumes (optional) -----------------------------------------------------
+
+# Directories the platform creates and chowns before docker compose up.
+# Use these as your bind mounts in docker-compose.yml.
+volumes:
+  - /opt/{name}/data
+  - /opt/{name}/logs

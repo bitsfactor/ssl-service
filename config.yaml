@@ -35,3 +35,9 @@ acme:
 
 logging:
   level: INFO
+
+admin:
+  enabled: false
+  bind: 127.0.0.1
+  port: 8088
+  token: ""

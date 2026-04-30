@@ -1,0 +1,302 @@
+
+==========================================
+STEP: 0. ping overview
+==========================================
+{
+    "mode": "readwrite",
+    "acme_email": "dev@example.com",
+    "acme_staging": true,
+    "poll_interval_seconds": 30,
+    "renew_before_days": 30,
+    "retry_backoff_seconds": 3600,
+    "counts": {
+        "routes_total": 14,
+        "routes_enabled": 14,
+        "routes_disabled": 0,
+        "certificates_total": 14,
+        "certificates_expiring_soon": 0,
+        "certificates_expired": 0,
+        "certificate_status": {
+            "active": 14
+        },
+        "zones_total": 3
+    },
+    "paths": {
+
+==========================================
+STEP: 1. wipe existing static_ips (best-effort)
+==========================================
+existing ids: 1 2 5
+
+==========================================
+STEP: 2. bulk parse + commit (regex fallback, no AI key)
+==========================================
+{
+    "mode": "regex",
+    "parsed": [
+        {
+            "ip": "1.1.1.1",
+            "port": 443,
+            "protocol": "https",
+            "country": "United States",
+            "provider": "Cloudflare",
+            "label": null,
+            "raw": "1.1.1.1:443 https Cloudflare \u7f8e\u56fd"
+        },
+        {
+            "ip": "8.8.8.8",
+            "port": null,
+            "protocol": "tcp",
+            "country": "United States",
+            "provider": "GCP",
+            "label": null,
+            "raw": "8.8.8.8 google US"
+        },
+        {
+            "ip": "13.230.45.67",
+            "port": 8443,
+            "protocol": "trojan",
+            "country": "Japan",
+            "provider": "AWS",
+            "label": null,
+            "raw": "trojan://abc@13.230.45.67:8443 Japan AWS"
+        },
+        {
+            "ip": "45.32.20.10",
+            "port": 9999,
+            "protocol": "shadowsocks",
+            "country": "Singapore",
+            "provider": "Vultr",
+            "label": null,
+            "raw": "ss://def@45.32.20.10:9999 \u65b0\u52a0\u5761 Vultr"
+        },
+        {
+            "ip": "2606:4700:4700::1111",
+            "port": 53,
+            "protocol": "tcp",
+            "country": "United States",
+            "provider": "Cloudflare",
+            "label": null,
+            "raw": "[2606:4700:4700::1111]:53 Cloudflare DNS US"
+        }
+    ],
+    "committed": [
+        {
+            "id": 6,
+            "ip": "1.1.1.1",
+            "port": 443,
+            "protocol": "https",
+            "country": "United States",
+            "provider": "Cloudflare",
+            "label": null,
+            "notes": null,
+            "static_info": {},
+            "loop_test_seconds": null,
+            "last_test_at": null,
+            "last_test_success": null,
+            "last_test_latency_ms": null,
+            "last_test_error": null,
+            "last_probe_at": null,
+            "created_at": "2026-04-29T03:39:56.315230Z",
+            "updated_at": "2026-04-29T03:39:56.315230Z"
+        },
+        {
+            "id": 7,
+            "ip": "8.8.8.8",
+            "port": null,
+            "protocol": "tcp",
+            "country": "United States",
+            "provider": "GCP",
+            "label": null,
+            "notes": null,
+            "static_info": {},
+            "loop_test_seconds": null,
+            "last_test_at": null,
+            "last_test_success": null,
+            "last_test_latency_ms": null,
+            "last_test_error": null,
+            "last_probe_at": null,
+            "created_at": "2026-04-29T03:39:59.503738Z",
+            "updated_at": "2026-04-29T03:39:59.503738Z"
+        },
+        {
+            "id": 8,
+            "ip": "13.230.45.67",
+            "port": 8443,
+            "protocol": "trojan",
+            "country": "Japan",
+            "provider": "AWS",
+            "label": null,
+            "notes": null,
+            "static_info": {},
+            "loop_test_seconds": null,
+            "last_test_at": null,
+            "last_test_success": null,
+            "last_test_latency_ms": null,
+            "last_test_error": null,
+            "last_probe_at": null,
+            "created_at": "2026-04-29T03:40:02.107562Z",
+            "updated_at": "2026-04-29T03:40:02.107562Z"
+        },
+        {
+            "id": 9,
+            "ip": "45.32.20.10",
+            "port": 9999,
+            "protocol": "shadowsocks",
+            "country": "Singapore",
+            "provider": "Vultr",
+            "label": null,
+            "notes": null,
+            "static_info": {},
+            "loop_test_seconds": null,
+            "last_test_at": null,
+            "last_test_success": null,
+            "last_test_latency_ms": null,
+            "last_test_error": null,
+            "last_probe_at": null,
+            "created_at": "2026-04-29T03:40:05.908187Z",
+            "updated_at": "2026-04-29T03:40:05.908187Z"
+        },
+        {
+            "id": 10,
+            "ip": "2606:4700:4700::1111",
+            "port": 53,
+            "protocol": "tcp",
+            "country": "United States",
+            "provider": "Cloudflare",
+            "label": null,
+            "notes": null,
+            "static_info": {},
+            "loop_test_seconds": null,
+            "last_test_at": null,
+            "last_test_success": null,
+            "last_test_latency_ms": null,
+            "last_test_error": null,
+            "last_probe_at": null,
+            "created_at": "2026-04-29T03:40:08.504051Z",
+            "updated_at": "2026-04-29T03:40:08.504051Z"
+        }
+    ],
+    "errors": []
+}
+
+==========================================
+STEP: 3. list — sort=country
+==========================================
+  id=  8 13.230.45.67           :8443  trojan     Japan          AWS           
+  id=  9 45.32.20.10            :9999  shadowsocks Singapore      Vultr         
+  id=  6 1.1.1.1                :443   https      United States  Cloudflare    
+  id= 10 2606:4700:4700::1111   :53    tcp        United States  Cloudflare    
+  id=  7 8.8.8.8                :-     tcp        United States  GCP           
+
+==========================================
+STEP: 4. list — sort=provider
+==========================================
+  id=  8 13.230.45.67           :8443  trojan     Japan          AWS           
+  id=  6 1.1.1.1                :443   https      United States  Cloudflare    
+  id= 10 2606:4700:4700::1111   :53    tcp        United States  Cloudflare    
+  id=  7 8.8.8.8                :-     tcp        United States  GCP           
+  id=  9 45.32.20.10            :9999  shadowsocks Singapore      Vultr         
+
+==========================================
+STEP: 5. test-all
+==========================================
+  total=5 ok=4 fail=1 at=2026-04-29T03:40:49.817332Z
+  [OK  ] 13.230.45.67           :8443  lat=2ms      err=
+  [OK  ] 45.32.20.10            :9999  lat=0ms      err=
+  [OK  ] 1.1.1.1                :443   lat=1ms      err=
+  [FAIL] 2606:4700:4700::1111   :53    lat=-        err=OSError: [Errno 65] No route to host
+  [OK  ] 8.8.8.8                :-     lat=-        err=
+
+==========================================
+STEP: 6. single test connectivity (1.1.1.1)
+==========================================
+{
+    "id": 6,
+    "ip": "1.1.1.1",
+    "port": 443,
+    "protocol": "https",
+    "kind": "manual",
+    "result": {
+        "success": true,
+        "latency_ms": 2,
+        "error": null,
+        "kind": "tcp"
+    }
+}
+
+==========================================
+STEP: 7. probe info (1.1.1.1) — geo + streaming unlock
+==========================================
+{
+    "id": 6,
+    "ip": "1.1.1.1",
+    "static_info": {
+        "geo": {
+            "ip": "1.1.1.1",
+            "country": "Australia",
+            "country_code": "AU",
+            "region": "QLD",
+            "city": "South Brisbane",
+            "org": "APNIC and Cloudflare DNS Resolver project",
+            "asn": "AS13335 Cloudflare, Inc.",
+            "lat": -27.4766,
+            "lon": 153.0166,
+            "raw_source": "http://ip-api.com/json/1.1.1.1"
+        },
+        "unlock": [
+            {
+                "service": "Netflix",
+                "status": "full",
+                "code": 200
+            },
+            {
+                "service": "YouTube Premium",
+                "status": "available",
+                "code": 200
+            },
+            {
+                "service": "ChatGPT",
+                "status": "available",
+                "code": 200,
+                "country_code": "US"
+            },
+            {
+                "service": "Disney+",
+                "status": "available",
+                "code": 200
+            }
+        ],
+        "probed_from": "admin host (vantage point)",
+        "probed_at": 1777434072
+    }
+}
+
+==========================================
+STEP: 8. detail with recent_results
+==========================================
+  ip: 1.1.1.1
+  country: United States provider: Cloudflare
+  static_info keys: ['geo', 'unlock', 'probed_at', 'probed_from']
+  recent_results: 3
+    2026-04-29T03:41:17.664123Z kind=probe success=True latency=None err=
+    2026-04-29T03:40:57.546032Z kind=manual success=True latency=2 err=
+    2026-04-29T03:40:35.019587Z kind=test_all success=True latency=1 err=
+
+==========================================
+STEP: 9. update IP (set notes)
+==========================================
+  notes: Cloudflare public DNS
+  label: cf-1111
+  loop_test_seconds: 15
+
+==========================================
+STEP: 10. results history
+==========================================
+  3 results
+    2026-04-29T03:41:17.664123Z kind=probe success=True latency=None
+    2026-04-29T03:40:57.546032Z kind=manual success=True latency=2
+    2026-04-29T03:40:35.019587Z kind=test_all success=True latency=1
+
+ALL TESTS COMPLETE — log: /tmp/ssl-service-static-ips-test.log
+Press Cmd-W to close this window.

@@ -5174,6 +5174,60 @@
   }
 
   // ---------------------------------------------------------------------------
+  // restartAdminFlow — POSTs /api/admin/restart and polls /api/admin/version
+  // until the started_at timestamp changes (= a new process is up).
+  // Replaces the old workflow of sshing in and running .command files.
+  // ---------------------------------------------------------------------------
+  async function restartAdminFlow(triggerBtn) {
+    if (!confirm("Restart the admin process now?\n\n" +
+                 "Any in-flight requests get terminated. The page will " +
+                 "auto-recover when the new process is up.")) return;
+
+    // Snapshot the current version so we can detect the swap.
+    let before = null;
+    try { before = await api("GET", "/api/admin/version"); }
+    catch (err) {
+      alert("Cannot read /api/admin/version (need newer admin build): " + err.message);
+      return;
+    }
+
+    triggerBtn.disabled = true;
+    const originalLabel = triggerBtn.textContent;
+    triggerBtn.textContent = "Restarting…";
+
+    try {
+      await api("POST", "/api/admin/restart", {});
+    } catch (err) {
+      // Some browsers see the closed connection before the JSON body arrives;
+      // tolerate that and rely on the version-poll loop to confirm.
+      console.warn("restart POST returned", err);
+    }
+
+    // Poll up to ~30s for the new started_at to appear.
+    const start = Date.now();
+    let upAt = null;
+    while (Date.now() - start < 30_000) {
+      await new Promise(r => setTimeout(r, 700));
+      try {
+        const now = await api("GET", "/api/admin/version");
+        if (now && now.started_at && before && now.started_at !== before.started_at) {
+          upAt = now;
+          break;
+        }
+      } catch (_e) { /* admin still down, keep polling */ }
+    }
+
+    triggerBtn.disabled = false;
+    triggerBtn.textContent = originalLabel;
+    if (upAt) {
+      // Force a full page reload so the new build's HTML/JS is picked up too.
+      location.reload();
+    } else {
+      alert("Admin did not come back up within 30s. Check the host logs.");
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Databases — multi-DB registry + cross-DB sync. The currently-
   // connected DSN is auto-registered; users can add more, edit labels
   // and DSNs, mark a "primary on next restart", and sync between any
@@ -5182,6 +5236,10 @@
   async function renderDatabasesView(root) {
     setActiveNav("databases");
     root.innerHTML = "";
+    const restartBtn = h("button", { class: "btn", id: "btn-restart-admin",
+      title: "Re-exec the admin process to pick up new code without ssh+command files" },
+      "Restart admin");
+    restartBtn.addEventListener("click", () => restartAdminFlow(restartBtn));
     root.appendChild(h("div", { class: "page-header" },
       h("div", null,
         h("h1", null, "Databases"),
@@ -5190,6 +5248,7 @@
           "config between any two of them. The currently-connected database ",
           "is auto-registered on first load."),
       ),
+      h("div", { class: "row", style: "gap: 8px" }, restartBtn),
     ));
 
     // ---- Card 1: registry list ----
@@ -5707,22 +5766,54 @@
       // so the user can't pick the wrong action.
       const haveChanges = (t.insert || 0) + (t.overwrite || 0) > 0;
       if (targetMissingCount === 0 && haveChanges) {
+        // Mode picker. 'merge' (default) = source wins on PK conflict.
+        // 'insert_only' = skip overwrites entirely; only add new rows.
+        const modeMerge = h("input", { type: "radio", name: "sync-mode",
+          value: "merge", id: "sm-merge", checked: true });
+        const modeInsert = h("input", { type: "radio", name: "sync-mode",
+          value: "insert_only", id: "sm-insert" });
+        const modeBox = h("div", {
+          style: "background: var(--surface-alt); padding: 10px 12px; border-radius: 6px; margin-top: 16px;",
+        },
+          h("div", { style: "font-weight: 600; margin-bottom: 6px; font-size: 13px" },
+            "Conflict mode"),
+          h("label", { style: "display: block; cursor: pointer; padding: 3px 0", for: "sm-merge" },
+            modeMerge,
+            h("strong", { style: "margin-left: 6px" }, "Merge"),
+            h("span", { class: "muted", style: "margin-left: 8px; font-size: 12px" },
+              `(default — overwrite ${t.overwrite || 0} target rows + insert ${t.insert || 0})`)),
+          h("label", { style: "display: block; cursor: pointer; padding: 3px 0", for: "sm-insert" },
+            modeInsert,
+            h("strong", { style: "margin-left: 6px" }, "Insert only"),
+            h("span", { class: "muted", style: "margin-left: 8px; font-size: 12px" },
+              `(skip overwrites — only insert ${t.insert || 0} new rows; existing target rows stay untouched)`)),
+        );
+        analysisBody.appendChild(modeBox);
+
         const apply = h("button", { class: "btn btn-danger",
-          style: "margin-top: 16px", onclick: async () => {
-            const msg =
-              `Sync data from '${fromLabel}' to '${toLabel}'?\n\n` +
-              `${t.insert || 0} new rows will be inserted.\n` +
-              `${t.overwrite || 0} EXISTING rows will be OVERWRITTEN.\n` +
-              `${t.preserve_only_in_target || 0} target-only rows will be kept.\n\n` +
-              `This writes to '${toLabel}'. Irreversible.`;
+          style: "margin-top: 12px", onclick: async () => {
+            const mode = (document.querySelector('input[name="sync-mode"]:checked') || modeMerge).value;
+            const isInsertOnly = mode === "insert_only";
+            const msg = isInsertOnly
+              ? `Sync data from '${fromLabel}' to '${toLabel}' (INSERT ONLY)?\n\n` +
+                `${t.insert || 0} new rows will be inserted.\n` +
+                `${t.overwrite || 0} overlapping rows will be SKIPPED (target keeps its version).\n` +
+                `${t.preserve_only_in_target || 0} target-only rows will be kept.\n\n` +
+                `This writes to '${toLabel}'.`
+              : `Sync data from '${fromLabel}' to '${toLabel}' (MERGE)?\n\n` +
+                `${t.insert || 0} new rows will be inserted.\n` +
+                `${t.overwrite || 0} EXISTING rows will be OVERWRITTEN by source.\n` +
+                `${t.preserve_only_in_target || 0} target-only rows will be kept.\n\n` +
+                `This writes to '${toLabel}'. Irreversible.`;
             if (!confirm(msg)) return;
             apply.disabled = true; apply.textContent = "Syncing data…";
             try {
               const r = await api("POST", "/api/sync/apply",
-                { from_id: analysis.from_id, to_id: analysis.to_id });
+                { from_id: analysis.from_id, to_id: analysis.to_id, mode });
               const ok = (r.results || []).reduce((a, b) => a + (b.rows_applied || 0), 0);
               const fail = (r.errors || []).length;
-              toast(fail === 0 ? "success" : "info", "Data synced",
+              toast(fail === 0 ? "success" : "info",
+                isInsertOnly ? "Data synced (insert-only)" : "Data synced",
                 `${ok} rows applied · ${fail} table(s) failed`);
               await refresh();
               analysisCard.style.display = "none";

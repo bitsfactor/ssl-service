@@ -1,0 +1,35 @@
+# Compose file run by the platform via `docker compose up -d --build`.
+#
+# Conventions enforced by the platform:
+#   * Project name is set automatically to the service name, so
+#     containers come up as <service>-<service>-1.
+#   * The `.env` file is freshly written by the platform before each
+#     deploy, sourced from .deploy.yaml `defaults` + per-deploy
+#     overrides + secrets. Don't commit a real `.env` to the repo.
+#   * `restart: unless-stopped` is recommended so containers survive
+#     reboots without the platform having to redeploy.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${SERVICE_NAME:-my-api}:local
+    container_name: ${SERVICE_NAME:-my-api}
+    restart: unless-stopped
+    environment:
+      PORT: "${PORT}"
+      LOG_LEVEL: "${LOG_LEVEL}"
+      TZ: "${TZ}"
+      DATABASE_URL: "${DATABASE_URL}"
+      JWT_SECRET: "${JWT_SECRET}"
+    ports:
+      - "${PORT}:${PORT}"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:${PORT}/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6

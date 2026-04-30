@@ -54,10 +54,16 @@ def discover_tables(conn: psycopg.Connection) -> list[TableSpec]:
   (we can't safely upsert into them)."""
   out: list[TableSpec] = []
   with conn.cursor() as cur:
+    # NOTE: information_schema.key_column_usage.column_name is of type
+    # ``sql_identifier`` (a domain over ``name``), and psycopg doesn't
+    # have a built-in text codec for that type — it falls back to
+    # returning the array as a raw PG literal string like ``{col1,col2}``.
+    # Cast each element to ``text`` BEFORE array_agg so the array comes
+    # back to Python as a real list of strings.
     cur.execute("""
       SELECT t.table_name,
              COALESCE(
-               (SELECT array_agg(kcu.column_name ORDER BY kcu.ordinal_position)
+               (SELECT array_agg(kcu.column_name::text ORDER BY kcu.ordinal_position)
                 FROM information_schema.table_constraints tc
                 JOIN information_schema.key_column_usage kcu
                   ON kcu.constraint_schema = tc.constraint_schema
@@ -73,7 +79,15 @@ def discover_tables(conn: psycopg.Connection) -> list[TableSpec]:
       ORDER BY t.table_name
     """)
     for row in cur.fetchall():
-      pk = tuple(row.get("pk_cols") or [])
+      raw_pk = row.get("pk_cols")
+      # Defensive: even after the ::text cast, if some psycopg version
+      # ever hands us back the literal "{col1,col2}" string, parse it.
+      if isinstance(raw_pk, str):
+        s = raw_pk.strip()
+        if s.startswith("{") and s.endswith("}"):
+          s = s[1:-1]
+        raw_pk = [p for p in (x.strip().strip('"') for x in s.split(",")) if p]
+      pk = tuple(raw_pk or [])
       if not pk:
         LOGGER.warning("discover: skipping %s (no PRIMARY KEY)", row["table_name"])
         continue
@@ -238,8 +252,7 @@ def test_target_connection(dsn: str) -> dict[str, Any]:
 def _select_table(cur: psycopg.Cursor, spec: TableSpec) -> dict[tuple, dict]:
   """Return {pk_tuple: row_dict} for the table. PK tuple lets us key
   composite-PK tables transparently."""
-  where = f" WHERE {spec.filter_where}" if spec.filter_where else ""
-  cur.execute(f"SELECT * FROM {spec.name}{where}")
+  cur.execute(f"SELECT * FROM {spec.name}")
   out: dict[tuple, dict] = {}
   for row in cur.fetchall():
     pk = tuple(row[c] for c in spec.pk_cols)
@@ -482,9 +495,15 @@ def _build_upsert_sql(
   pk_clause = ", ".join(pk_cols)
   ph = ", ".join(["%s"] * len(cols))
   if mode == "insert_only":
+    # Bare ``ON CONFLICT DO NOTHING`` (no column list) catches violations
+    # of ANY unique constraint, not just the PK. Tables like
+    # ``route_upstreams`` have a separate UNIQUE on (domain, target)
+    # that the PK-targeted form would miss, so the insert would still
+    # error out. Insert-only is "skip duplicates by any definition",
+    # so the un-targeted form is the right semantics.
     return (
       f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({ph}) "
-      f"ON CONFLICT ({pk_clause}) DO NOTHING"
+      f"ON CONFLICT DO NOTHING"
     )
   set_clauses = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c not in pk_cols)
   if not set_clauses:
