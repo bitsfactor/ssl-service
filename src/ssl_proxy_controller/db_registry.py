@@ -12,7 +12,7 @@ File shape::
     active_id: aabbccdd
     databases:
       - id: aabbccdd
-        label: "Primary (config.yaml)"
+        label: "Primary"
         dsn: "postgresql://…"
       - id: ffeeddcc
         label: "one"
@@ -20,10 +20,14 @@ File shape::
 
 Semantics:
 
-- ``active_id`` is the DSN the admin should connect to. The launcher
-  script reads this and writes the right DSN into the runtime
-  config.yaml. The admin process itself can also re-read this file
-  and swap its connection pool live (see ``Database.swap_to``).
+- ``active_id`` is the DSN the admin should connect to. The dev
+  launcher (``start.command``) reads this when generating the local
+  YAML config; in container deploys the resolver token
+  ``database:<id>`` lets ``service.default_env`` reference an entry
+  here without ever round-tripping the cleartext DSN through the
+  browser. The admin process itself can also re-read this registry
+  file at runtime and swap its connection pool live (see
+  ``Database.swap_to``).
 - ``databases`` is the full list. ids are 12-char hex tokens, stable
   across edits.
 
@@ -167,7 +171,10 @@ def ensure_bootstrap(database, current_dsn: str) -> list[dict]:
     if current_dsn and not _find_by_dsn(data["databases"], current_dsn):
       data["databases"].append({
         "id": _new_id(),
-        "label": "Primary (config.yaml)",
+        # Generic label — the seed entry is whatever DSN the admin
+        # process is currently bound to (env or config.yaml on dev).
+        # Operator can rename it from the Databases UI.
+        "label": "Primary",
         "dsn": current_dsn,
         "added_at": _now_iso(),
       })

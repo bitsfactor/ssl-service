@@ -365,7 +365,7 @@
       </div>
     </div>
     <h2>Sign in</h2>
-    <p>Enter the admin token configured in <span class="mono">config.yaml</span> under <span class="mono">admin.token</span>.</p>
+    <p>Enter the admin token from <span class="mono">SSL_SERVICE_ADMIN_TOKEN</span> (deployed) or <span class="mono">admin.token</span> in your local <span class="mono">config.yaml</span>.</p>
     <form id="login-form">
       <div class="field">
         <label for="login-token">Admin token</label>
@@ -5951,7 +5951,10 @@
     root.appendChild(h("div", { class: "page-header" },
       h("div", null,
         h("h1", null, "Settings"),
-        h("p", { class: "lede" }, "Runtime configuration summary. Editing is done in ", h("span", { class: "mono" }, "config.yaml"), "."),
+        h("p", { class: "lede" }, "Runtime configuration summary. Edit via env vars (",
+          h("span", { class: "mono" }, "SSL_SERVICE_*"),
+          ") on deployed nodes, or via local ",
+          h("span", { class: "mono" }, "config.yaml"), " in dev mode."),
       ),
       h("div", { class: "row" }, h("button", { class: "btn", onclick: () => renderSettingsView(root) }, "Refresh")),
     ));

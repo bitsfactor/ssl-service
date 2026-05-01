@@ -242,7 +242,11 @@ emit LOADAVG 'cat /proc/loadavg 2>/dev/null'
 emit SERVICE_ACTIVE 'systemctl is-active ssl-service 2>/dev/null || systemctl is-active ssl-proxy-controller 2>/dev/null || echo none'
 emit SERVICE_VERSION 'cat /opt/ssl-service/VERSION 2>/dev/null || cat /root/ssl-service/VERSION 2>/dev/null || true'
 emit SERVICE_INSTALLED 'test -d /opt/ssl-service && echo yes; test -d /root/ssl-service && echo yes; command -v ssl-service >/dev/null 2>&1 && echo yes; true'
-emit SERVICE_MODE 'grep -E "^\s*mode:" /opt/ssl-service/config.yaml /root/ssl-service/config.yaml /etc/ssl-service/config.yaml 2>/dev/null | head -1 | awk -F: "{print \$3}" | tr -d " " '
+# Service mode discovery: env-deployed containers expose it via the
+# .env file we wrote at install_dir; legacy bare-metal installs still
+# have it inside config.yaml. Try .env first (the modern path) then
+# fall back to the YAML for older boxes.
+emit SERVICE_MODE 'grep -E "^SSL_SERVICE_MODE=" /opt/ssl-service/.env /root/ssl-service/.env 2>/dev/null | head -1 | sed -E "s/.*=//" | tr -d "\"\\047 " || grep -E "^\s*mode:" /opt/ssl-service/config.yaml /root/ssl-service/config.yaml /etc/ssl-service/config.yaml 2>/dev/null | head -1 | awk -F: "{print \$3}" | tr -d " " '
 emit SERVICE_GIT 'cd /opt/ssl-service 2>/dev/null && git rev-parse --short HEAD; cd /root/ssl-service 2>/dev/null && git rev-parse --short HEAD; true'
 emit DOCKER_INSTALLED 'command -v docker >/dev/null 2>&1 && echo yes || echo no'
 emit ALL_CONTAINERS 'command -v docker >/dev/null 2>&1 && docker ps -a --no-trunc --format "{{json .}}" 2>/dev/null || true'

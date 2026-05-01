@@ -22,7 +22,7 @@ REPO_URL="${REPO_URL:-https://github.com/bitsfactor/ssl-service}"
 BRANCH="${BRANCH:-main}"
 
 if [[ -z "${ADMIN_TOKEN}" ]]; then
-  printf 'ERROR: set ADMIN_TOKEN (the same value as admin.token in config.yaml)\n' >&2
+  printf 'ERROR: set ADMIN_TOKEN (the value of SSL_SERVICE_ADMIN_TOKEN env, or admin.token in your local config.yaml)\n' >&2
   exit 1
 fi
 

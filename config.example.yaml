@@ -1,3 +1,19 @@
+# =============================================================================
+# config.example.yaml — used by the LOCAL DEV launcher (start.command).
+#
+# Container deploys (via the admin platform) NO LONGER use this file:
+# they read everything directly from `SSL_SERVICE_*` env vars passed
+# in via .env. See `src/ssl_proxy_controller/config.py::load_config_from_env`
+# for the env-var schema.
+#
+# This file is here for:
+#   - local development (`start.command` writes a populated copy of
+#     this file to /tmp/ssl-service-dev-pg-config.yaml and starts the
+#     admin against it via `python -m ssl_proxy_controller --config ...`)
+#   - legacy bare-metal installs that scripts/setup.sh provisions onto
+#     systemd (no docker)
+# =============================================================================
+
 mode: readonly
 
 postgres:
