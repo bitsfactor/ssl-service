@@ -594,6 +594,74 @@ CREATE TABLE IF NOT EXISTS xout_node_assignments (
 CREATE INDEX IF NOT EXISTS idx_xout_assignments_preset
   ON xout_node_assignments (preset_id);
 
+-- xout tokens (= xout users) -------------------------------------------
+-- One row per logical user. The ``uuid`` is the stable VLESS client id
+-- and is reused on every node — that's the value that makes a vless://
+-- subscription URL keep working when the operator re-deploys. Mark
+-- exactly one row as ``is_default`` (partial unique index enforces it);
+-- newly-deployed xout instances seed their first user from that row.
+CREATE TABLE IF NOT EXISTS xout_tokens (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  uuid TEXT NOT NULL UNIQUE,
+  password TEXT,
+  is_default BOOLEAN NOT NULL DEFAULT FALSE,
+  monthly_quota_gb INTEGER NOT NULL DEFAULT 1000
+    CHECK (monthly_quota_gb >= 0 AND monthly_quota_gb <= 1000000),
+  monthly_reset_day INTEGER NOT NULL DEFAULT 1
+    CHECK (monthly_reset_day BETWEEN 1 AND 28),
+  notes TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_xout_tokens_default_unique
+  ON xout_tokens ((1)) WHERE is_default;
+
+DROP TRIGGER IF EXISTS xout_tokens_touch_updated_at ON xout_tokens;
+CREATE TRIGGER xout_tokens_touch_updated_at
+BEFORE UPDATE ON xout_tokens
+FOR EACH ROW
+EXECUTE FUNCTION touch_updated_at();
+
+-- Which tokens are provisioned on which nodes. last_seen_at is updated
+-- by sync-tokens whenever the actual xout container has the token's
+-- UUID listed in /data/preset.json.resolved (= we're sure it's live).
+-- The base64/clash subscription strings are computed at sync time and
+-- cached so the UI can read them without re-rendering.
+CREATE TABLE IF NOT EXISTS xout_node_tokens (
+  node_name TEXT NOT NULL REFERENCES nodes(name) ON DELETE CASCADE ON UPDATE CASCADE,
+  token_id  BIGINT NOT NULL REFERENCES xout_tokens(id) ON DELETE CASCADE,
+  provisioned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_seen_at   TIMESTAMPTZ,
+  base64_subscription TEXT,
+  clash_subscription  TEXT,
+  PRIMARY KEY (node_name, token_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_xout_node_tokens_token
+  ON xout_node_tokens (token_id);
+
+-- Per-day traffic accumulator. We record one row per (node, token, day);
+-- the operator-pulled stats from each xout container's StatsService get
+-- snapshotted into here on every "Sync traffic" call. Daily granularity
+-- keeps storage tiny and is enough for "this-month total" + "lifetime
+-- total" rollups.
+CREATE TABLE IF NOT EXISTS xout_traffic_daily (
+  node_name TEXT NOT NULL REFERENCES nodes(name) ON DELETE CASCADE ON UPDATE CASCADE,
+  token_id  BIGINT NOT NULL REFERENCES xout_tokens(id) ON DELETE CASCADE,
+  day DATE NOT NULL,
+  uplink_bytes   BIGINT NOT NULL DEFAULT 0,
+  downlink_bytes BIGINT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (node_name, token_id, day)
+);
+
+CREATE INDEX IF NOT EXISTS idx_xout_traffic_daily_day
+  ON xout_traffic_daily (day);
+CREATE INDEX IF NOT EXISTS idx_xout_traffic_daily_token
+  ON xout_traffic_daily (token_id);
+
 -- Init defaults ----------------------------------------------------------
 -- The Initialize-a-node flow needs two pieces of credential material:
 --   1. an SSH private key it can drop into ~/.ssh on the new VPS so it can

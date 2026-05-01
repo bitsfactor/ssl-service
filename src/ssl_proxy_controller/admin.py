@@ -4067,14 +4067,46 @@ def _build_router(ctx: AdminContext) -> _Router:
     # direct / http / socks / vless — already concrete
     return ob
 
-  def _xout_resolve_preset(preset: dict) -> list[dict]:
+  def _xout_resolve_preset(preset: dict, *, node_name: str | None = None) -> list[dict]:
     """Walk preset['inbounds'] and replace each referential outbound
-    with its concrete form. Returns a fresh list (the saved preset
-    keeps the references)."""
+    with its concrete form. For VLESS inbounds, also bake in the user
+    list from xout_node_tokens for this node (or, if no rows yet,
+    fall back to the default token). The preset's own 'users' field
+    is ignored when a node-specific assignment exists — the platform
+    is the source of truth, not the preset row."""
+    # Fetch tokens to fold in. If node_name is None we fall back to default.
+    tokens_for_node: list[dict] = []
+    if node_name:
+      try:
+        tokens_for_node = ctx.database.list_xout_node_tokens_for_node(node_name)
+      except Exception:
+        tokens_for_node = []
+    if not tokens_for_node:
+      default_tok = None
+      try:
+        default_tok = ctx.database.get_default_xout_token()
+      except Exception:
+        default_tok = None
+      if default_tok is not None:
+        tokens_for_node = [{
+          "token_id": default_tok["id"],
+          "token_name": default_tok["name"],
+          "token_uuid": default_tok["uuid"],
+        }]
+
     out: list[dict] = []
     for ib in (preset.get("inbounds") or []):
       ib2 = dict(ib)
       ib2["outbound"] = _xout_resolve_outbound(ib.get("outbound") or {"type": "direct"})
+      if ib2.get("protocol") == "vless" and tokens_for_node:
+        # Replace whatever the preset's users field said with the
+        # platform-tracked token list. Stable UUIDs = client subs survive
+        # across redeploys.
+        ib2["users"] = [
+          {"name": t.get("token_name") or "user",
+           "uuid": t.get("token_uuid") or t.get("uuid")}
+          for t in tokens_for_node
+        ]
       out.append(ib2)
     return out
 
@@ -4194,7 +4226,7 @@ def _build_router(ctx: AdminContext) -> _Router:
 
     # Expand referential outbounds (static_ip / xout_inbound) NOW so the
     # rendered preset.json carries concrete host/port/auth.
-    resolved_inbounds = _xout_resolve_preset(preset)
+    resolved_inbounds = _xout_resolve_preset(preset, node_name=node_name)
 
     import json as _json
     preset_json = _json.dumps(resolved_inbounds, indent=2)
@@ -4258,6 +4290,507 @@ def _build_router(ctx: AdminContext) -> _Router:
         })
     return _json_response(HTTPStatus.OK, {"targets": out})
 
+  # ---------- xout tokens (= users) ----------
+
+  def _gen_uuid_str() -> str:
+    import uuid as _uuid
+    return str(_uuid.uuid4())
+
+  def _build_subscriptions_for_token(token: dict, node_assignments: dict[str, dict]) -> dict:
+    """Build the aggregated VLESS / HTTP / SOCKS subscription URIs for
+    one token across all nodes that have this token assigned. Returns
+    {raw: [uri,...], plain: 'uri\nuri\n...', base64: '...', clash: 'yaml-string'}."""
+    import base64 as _b64
+    uris: list[str] = []
+    for node_name, info in node_assignments.items():
+      preset = info.get("preset")
+      node = info.get("node")
+      if not preset or not node:
+        continue
+      for ib in (preset.get("inbounds") or []):
+        proto = ib.get("protocol")
+        port = ib.get("port")
+        tag = ib.get("tag", "")
+        host = node.host
+        if proto == "vless":
+          reality = ib.get("reality") or {}
+          sni = reality.get("sni", "")
+          pub = reality.get("public_key", "") or reality.get("pubkey", "")
+          sid = reality.get("short_id", "")
+          if not pub:
+            # Public key isn't in our DB yet; the resolved version on
+            # the node has it but we read presets from xout_presets
+            # which stores 'auto'. Skip this URI entry — sync-tokens
+            # populates the cached subscription on a later pass.
+            continue
+          frag = f"{node_name}-{tag}"
+          uri = (
+            f"vless://{token['uuid']}@{host}:{port}"
+            f"?encryption=none&security=reality&type=tcp&flow="
+            f"&sni={sni}&pbk={pub}&sid={sid}&fp=chrome#{frag}"
+          )
+          uris.append(uri)
+        elif proto == "http":
+          # http://user:pass@host:port  (Basic-auth style; most clients accept)
+          # Per-token semantics: http inbound auth is at the inbound level
+          # (not per-user). We embed the inbound's auth, NOT the token's
+          # password — they're conceptually different in xray's model.
+          auth = ib.get("auth") or {}
+          if auth.get("user"):
+            uri = f"http://{auth['user']}:{auth.get('pass','')}@{host}:{port}#{node_name}-{tag}"
+          else:
+            uri = f"http://{host}:{port}#{node_name}-{tag}"
+          uris.append(uri)
+        elif proto == "socks":
+          auth = ib.get("auth") or {}
+          if auth.get("user"):
+            uri = f"socks://{auth['user']}:{auth.get('pass','')}@{host}:{port}#{node_name}-{tag}"
+          else:
+            uri = f"socks://{host}:{port}#{node_name}-{tag}"
+          uris.append(uri)
+
+    plain = "\n".join(uris) + "\n" if uris else ""
+    b64 = _b64.b64encode(plain.encode("utf-8")).decode("ascii") if plain else ""
+
+    # Minimal Clash config — proxy nodes only, no rules. Clients merge
+    # this into their main rule set. Each entry is a YAML object.
+    clash_lines: list[str] = ["proxies:"]
+    for node_name, info in node_assignments.items():
+      preset = info.get("preset")
+      node = info.get("node")
+      if not preset or not node:
+        continue
+      for ib in (preset.get("inbounds") or []):
+        proto = ib.get("protocol")
+        port = ib.get("port")
+        tag = ib.get("tag", "")
+        host = node.host
+        if proto == "vless":
+          reality = ib.get("reality") or {}
+          if not (reality.get("public_key") or reality.get("pubkey")):
+            continue
+          clash_lines.extend([
+            f"  - name: \"{node_name}-{tag}\"",
+            f"    type: vless",
+            f"    server: {host}",
+            f"    port: {port}",
+            f"    uuid: {token['uuid']}",
+            f"    network: tcp",
+            f"    tls: true",
+            f"    udp: true",
+            f"    flow: \"\"",
+            f"    servername: {reality.get('sni','')}",
+            f"    reality-opts:",
+            f"      public-key: {reality.get('public_key') or reality.get('pubkey','')}",
+            f"      short-id: \"{reality.get('short_id','')}\"",
+            f"    client-fingerprint: chrome",
+          ])
+        elif proto == "http":
+          auth = ib.get("auth") or {}
+          clash_lines.extend([
+            f"  - name: \"{node_name}-{tag}\"",
+            f"    type: http",
+            f"    server: {host}",
+            f"    port: {port}",
+            f"    username: {auth.get('user','')}",
+            f"    password: {auth.get('pass','')}",
+          ])
+        elif proto == "socks":
+          auth = ib.get("auth") or {}
+          clash_lines.extend([
+            f"  - name: \"{node_name}-{tag}\"",
+            f"    type: socks5",
+            f"    server: {host}",
+            f"    port: {port}",
+            f"    username: {auth.get('user','')}",
+            f"    password: {auth.get('pass','')}",
+            f"    udp: true",
+          ])
+    clash = "\n".join(clash_lines) + ("\n" if len(clash_lines) > 1 else "")
+
+    return {
+      "raw": uris,
+      "plain": plain,
+      "base64": b64,
+      "clash": clash,
+    }
+
+  def xout_tokens_list_handler(_request: _Request) -> _Response:
+    return _json_response(HTTPStatus.OK,
+      {"tokens": ctx.database.list_token_deployment_summary()})
+
+  def xout_tokens_create_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    p = request.json_body() or {}
+    name = (p.get("name") or "").strip()
+    if not name or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", name):
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "name is required and must be alphanumeric (with - or _)",
+                      code="invalid_name")
+    uuid = (p.get("uuid") or "").strip() or _gen_uuid_str()
+    if not re.match(
+      r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      uuid,
+    ):
+      raise HttpError(HTTPStatus.BAD_REQUEST, "uuid is not a valid UUID",
+                      code="invalid_uuid")
+    password = (p.get("password") or "").strip() or None
+    quota = int(p.get("monthly_quota_gb") or 1000)
+    reset_day = int(p.get("monthly_reset_day") or 1)
+    if not (1 <= reset_day <= 28):
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "monthly_reset_day must be between 1 and 28",
+                      code="invalid_reset_day")
+    notes = (p.get("notes") or "").strip() or None
+    try:
+      out = ctx.database.insert_xout_token(
+        name=name, uuid=uuid, password=password,
+        monthly_quota_gb=quota, monthly_reset_day=reset_day, notes=notes,
+      )
+    except Exception as exc:
+      msg = str(exc).lower()
+      if "duplicate key" in msg or "unique constraint" in msg:
+        raise HttpError(HTTPStatus.CONFLICT,
+                        "name or uuid already in use",
+                        code="name_in_use") from exc
+      raise
+    return _json_response(HTTPStatus.CREATED, out)
+
+  def xout_tokens_get_handler(request: _Request) -> _Response:
+    tid = int(request.path_params["id"])
+    rec = ctx.database.get_xout_token(tid)
+    if rec is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
+                      code="token_not_found")
+    rec["nodes"] = ctx.database.list_xout_node_tokens_for_token(tid)
+    return _json_response(HTTPStatus.OK, rec)
+
+  def xout_tokens_patch_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    tid = int(request.path_params["id"])
+    p = request.json_body() or {}
+    fields: dict[str, Any] = {}
+    if "name" in p:
+      n = (p["name"] or "").strip()
+      if not n or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", n):
+        raise HttpError(HTTPStatus.BAD_REQUEST, "invalid name", code="invalid_name")
+      fields["name"] = n
+    if "password" in p:
+      fields["password"] = (p["password"] or "").strip() or None
+    if "monthly_quota_gb" in p:
+      try:
+        fields["monthly_quota_gb"] = int(p["monthly_quota_gb"])
+      except (TypeError, ValueError):
+        raise HttpError(HTTPStatus.BAD_REQUEST, "monthly_quota_gb must be int",
+                        code="invalid_quota") from None
+    if "monthly_reset_day" in p:
+      try:
+        rd = int(p["monthly_reset_day"])
+      except (TypeError, ValueError):
+        raise HttpError(HTTPStatus.BAD_REQUEST, "monthly_reset_day must be int",
+                        code="invalid_reset_day") from None
+      if not (1 <= rd <= 28):
+        raise HttpError(HTTPStatus.BAD_REQUEST, "monthly_reset_day must be 1-28",
+                        code="invalid_reset_day")
+      fields["monthly_reset_day"] = rd
+    if "notes" in p:
+      fields["notes"] = (p["notes"] or "").strip() or None
+    rec = ctx.database.update_xout_token(tid, fields)
+    if rec is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
+                      code="token_not_found")
+    return _json_response(HTTPStatus.OK, rec)
+
+  def xout_tokens_delete_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    tid = int(request.path_params["id"])
+    if not ctx.database.delete_xout_token(tid):
+      raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
+                      code="token_not_found")
+    return _json_response(HTTPStatus.OK, {"deleted": True})
+
+  def xout_tokens_set_default_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    tid = int(request.path_params["id"])
+    rec = ctx.database.set_default_xout_token(tid)
+    if rec is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
+                      code="token_not_found")
+    return _json_response(HTTPStatus.OK, rec)
+
+  def xout_tokens_subscription_handler(request: _Request) -> _Response:
+    """Aggregated subscription content for one token across every node
+    that has it provisioned. Reads from xout_node_tokens (filled by
+    sync-tokens) for the cached base64/clash strings; if those are
+    missing for a node, generates on-the-fly from the assigned preset.
+    """
+    tid = int(request.path_params["id"])
+    token = ctx.database.get_xout_token(tid)
+    if token is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
+                      code="token_not_found")
+    rows = ctx.database.list_xout_node_tokens_for_token(tid)
+    node_assignments: dict[str, dict] = {}
+    for r in rows:
+      node = ctx.database.get_node(r["node_name"])
+      if node is None: continue
+      a = ctx.database.get_xout_assignment(r["node_name"])
+      if a is None: continue
+      preset = ctx.database.get_xout_preset(a["preset_id"])
+      if preset is None: continue
+      node_assignments[r["node_name"]] = {"node": node, "preset": preset,
+                                          "cached": r}
+    subs = _build_subscriptions_for_token(token, node_assignments)
+    return _json_response(HTTPStatus.OK, {
+      "token": {"id": token["id"], "name": token["name"], "uuid": token["uuid"]},
+      "nodes": list(node_assignments.keys()),
+      **subs,
+    })
+
+  def xout_tokens_publish_handler(request: _Request) -> _Response:
+    """Mark this token as provisioned on the requested nodes.
+    Body: {nodes: [...]}.
+    Idempotent — token's UUID is stable so existing client subscriptions
+    keep working. After this writes the junction rows, the operator
+    triggers a re-deploy on each affected node (the deploy step bakes
+    every assigned token into the rendered preset.json's vless inbound
+    user list)."""
+    _require_readwrite(ctx)
+    tid = int(request.path_params["id"])
+    token = ctx.database.get_xout_token(tid)
+    if token is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
+                      code="token_not_found")
+    p = request.json_body() or {}
+    raw_nodes = p.get("nodes") or []
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "nodes must be a non-empty list",
+                      code="nodes_required")
+    out = []
+    for n in raw_nodes:
+      nn = _normalize_node_name(str(n))
+      if ctx.database.get_node(nn) is None:
+        out.append({"node": nn, "ok": False, "error": "node not found"})
+        continue
+      ctx.database.upsert_xout_node_token(nn, tid)
+      out.append({"node": nn, "ok": True})
+    return _json_response(HTTPStatus.OK, {
+      "token_id": tid, "results": out,
+      "message": "Token recorded on selected nodes. Deploy each from the Xout channel to bake it into preset.json.",
+    })
+
+  def xout_node_traffic_summary_handler(request: _Request) -> _Response:
+    """Per-node traffic rollup: this-month total + lifetime + per-token
+    breakdown. Used by the per-node 'Verify traffic' modal."""
+    name = _normalize_node_name(request.path_params["name"])
+    node = ctx.database.get_node(name)
+    if node is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {name}",
+                      code="node_not_found")
+    from datetime import date as _date
+    today = _date.today()
+    month_start = today.replace(day=1)
+    summary_total = ctx.database.sum_traffic_for_node(name)
+    summary_month = ctx.database.sum_traffic_for_node(name, since=month_start)
+    # Per-token rollups for nodes assigned to this node
+    rows = ctx.database.list_xout_node_tokens_for_node(name)
+    per_token = []
+    for r in rows:
+      tot = ctx.database.sum_traffic_for_token(r["token_id"])
+      mon = ctx.database.sum_traffic_for_token(r["token_id"], since=month_start)
+      per_token.append({
+        "token_id": r["token_id"], "token_name": r.get("token_name"),
+        "total_bytes": tot["total"], "month_bytes": mon["total"],
+        "last_seen_at": _to_jsonable(r.get("last_seen_at")),
+      })
+    # Residual: 1000 GB default (ish) — we use the largest assigned token's
+    # quota since the operator likely sets policy at token level.
+    quota_bytes = 1000 * 1024**3
+    if rows:
+      max_quota_gb = max(
+        (ctx.database.get_xout_token(r["token_id"]) or {}).get("monthly_quota_gb") or 0
+        for r in rows
+      )
+      if max_quota_gb > 0:
+        quota_bytes = int(max_quota_gb) * 1024**3
+    return _json_response(HTTPStatus.OK, {
+      "node": name,
+      "total_bytes": summary_total["total"],
+      "month_bytes": summary_month["total"],
+      "month_quota_bytes": quota_bytes,
+      "month_residual_bytes": max(0, quota_bytes - summary_month["total"]),
+      "per_token": per_token,
+    })
+
+  def xout_sync_traffic_handler(request: _Request) -> _Response:
+    """Pull live byte counters from each requested node's Xray stats API
+    and snapshot them into xout_traffic_daily. Stats are cumulative
+    since the last container restart, so what we store is 'best known
+    for today' — re-runs within the same day overwrite the row."""
+    _require_readwrite(ctx)
+    p = request.json_body() or {}
+    raw_nodes = p.get("nodes")
+    if isinstance(raw_nodes, list) and raw_nodes:
+      target_names = [_normalize_node_name(str(n)) for n in raw_nodes]
+    else:
+      assignments = ctx.database.list_xout_assignments()
+      target_names = [a["node_name"] for a in assignments]
+    if not target_names:
+      return _json_response(HTTPStatus.OK,
+        {"results": [], "message": "no xout nodes to sync"})
+
+    from datetime import date as _date
+    today = _date.today()
+    tokens_by_uuid = {t["uuid"]: t for t in ctx.database.list_xout_tokens()}
+    tokens_by_name = {t["name"]: t for t in ctx.database.list_xout_tokens()}
+
+    results: list[dict[str, Any]] = []
+    for nn in target_names:
+      node = ctx.database.get_node(nn)
+      if node is None:
+        results.append({"node": nn, "ok": False, "error": "not found"})
+        continue
+      try:
+        cmd = (
+          'docker exec xout xray api statsquery '
+          '--server 127.0.0.1:10085 --pattern "user>>>" 2>&1 || true'
+        )
+        rc = nodes_mod.run_command(node, cmd, timeout=30.0,
+                                    linked_keys=_ssh_credentials_for_node(ctx, nn))
+      except Exception as exc:
+        results.append({"node": nn, "ok": False, "error": str(exc)[:200]})
+        continue
+      out = rc.stdout or ""
+      # Parse JSON-ish output: lines look like
+      #   { "name": "user>>>alice>>>traffic>>>uplink", "value": "1234" }
+      # in pretty-printed multi-line JSON. Easiest: regex.
+      stat_re = re.compile(
+        r'"name"\s*:\s*"user>>>([^>"]+)>>>traffic>>>(uplink|downlink)"\s*,\s*"value"\s*:\s*"?(\d+)"?',
+      )
+      matches = stat_re.findall(out)
+      # Aggregate per (token, direction)
+      per_token: dict[str, dict[str, int]] = {}
+      for tname, direction, val in matches:
+        per_token.setdefault(tname, {"up": 0, "down": 0})
+        if direction == "uplink":
+          per_token[tname]["up"] += int(val)
+        else:
+          per_token[tname]["down"] += int(val)
+
+      written = 0
+      for tname, byt in per_token.items():
+        # token email in xray IS the token name (we set it on insert)
+        tok = tokens_by_name.get(tname) or tokens_by_uuid.get(tname)
+        if tok is None:
+          continue
+        ctx.database.upsert_xout_traffic_daily(
+          nn, tok["id"], today,
+          uplink_bytes=byt["up"], downlink_bytes=byt["down"],
+        )
+        # also bump last_seen_at
+        ctx.database.upsert_xout_node_token(nn, tok["id"], last_seen_at=True)
+        written += 1
+      results.append({"node": nn, "ok": True,
+                      "tokens_seen": len(per_token),
+                      "tokens_written": written,
+                      "raw_lines": len(matches)})
+    return _json_response(HTTPStatus.OK, {"results": results})
+
+  def xout_sync_tokens_handler(request: _Request) -> _Response:
+    """Reconcile token presence on each requested node by reading the
+    rendered preset on disk (``/data/preset.json.resolved``). For each
+    UUID found in any vless inbound's ``users[]``, look up the matching
+    xout_tokens row and ensure an xout_node_tokens junction exists. Then
+    rebuild + cache the per-token base64 / clash subscription strings so
+    the UI's 'Get subscription content' returns instant results.
+
+    Body: {nodes: [...]} (optional — defaults to all assigned nodes).
+    Returns per-node {ok, tokens_present, tokens_linked}.
+    """
+    _require_readwrite(ctx)
+    p = request.json_body() or {}
+    raw_nodes = p.get("nodes")
+    if isinstance(raw_nodes, list) and raw_nodes:
+      target_names = [_normalize_node_name(str(n)) for n in raw_nodes]
+    else:
+      assignments = ctx.database.list_xout_assignments()
+      target_names = [a["node_name"] for a in assignments]
+    if not target_names:
+      return _json_response(HTTPStatus.OK,
+        {"results": [], "message": "no xout nodes to sync"})
+
+    tokens_by_uuid = {t["uuid"]: t for t in ctx.database.list_xout_tokens()}
+    results: list[dict[str, Any]] = []
+
+    for nn in target_names:
+      node = ctx.database.get_node(nn)
+      if node is None:
+        results.append({"node": nn, "ok": False, "error": "not found"})
+        continue
+      try:
+        cmd = (
+          "set -e; "
+          "for f in /data/preset.json.resolved /data/preset.json; do "
+          "  if [ -f \"$f\" ]; then cat \"$f\"; exit 0; fi; "
+          "done; echo '{}'"
+        )
+        rc = nodes_mod.run_command(node, cmd, timeout=15.0,
+                                    linked_keys=_ssh_credentials_for_node(ctx, nn))
+      except Exception as exc:
+        results.append({"node": nn, "ok": False, "error": str(exc)[:200]})
+        continue
+      raw = (rc.stdout or "").strip() or "{}"
+      try:
+        data = json.loads(raw)
+      except Exception:
+        # Container may have rendered template literals or be missing —
+        # don't fail the whole sync, just report.
+        results.append({"node": nn, "ok": False,
+                        "error": f"could not parse preset on node ({len(raw)} bytes)"})
+        continue
+
+      uuids_present: set[str] = set()
+      for ib in (data.get("inbounds") or []):
+        if ib.get("protocol") != "vless":
+          continue
+        for u in (ib.get("users") or []):
+          uid = (u.get("uuid") or "").strip()
+          if uid:
+            uuids_present.add(uid)
+
+      linked = 0
+      tokens_for_this_node: list[dict] = []
+      for uid in uuids_present:
+        tok = tokens_by_uuid.get(uid)
+        if tok is None:
+          continue
+        ctx.database.upsert_xout_node_token(nn, tok["id"], last_seen_at=True)
+        linked += 1
+        tokens_for_this_node.append(tok)
+
+      # Rebuild the cached subscription strings for each token on this
+      # node by handing _build_subscriptions_for_token a single-node
+      # assignment dict — the cached value is per-(node,token), so we
+      # filter the URI list to lines tagged with this node.
+      a = ctx.database.get_xout_assignment(nn)
+      preset = ctx.database.get_xout_preset(a["preset_id"]) if a else None
+      if preset:
+        for tok in tokens_for_this_node:
+          subs = _build_subscriptions_for_token(
+            tok, {nn: {"node": node, "preset": preset}},
+          )
+          ctx.database.upsert_xout_node_token(
+            nn, tok["id"],
+            base64_subscription=subs.get("base64"),
+            clash_subscription=subs.get("clash"),
+          )
+
+      results.append({"node": nn, "ok": True,
+                      "tokens_present": len(uuids_present),
+                      "tokens_linked": linked})
+    return _json_response(HTTPStatus.OK, {"results": results})
+
   def xout_node_test_handler(request: _Request) -> _Response:
     """End-to-end proxy traffic check on the actual deployed node.
     For each http/socks inbound: ssh in and run ``curl`` through it
@@ -4288,7 +4821,7 @@ def _build_router(ctx: AdminContext) -> _Router:
 
     # Re-resolve outbounds so we use current static_ip / xout_inbound
     # values — the preset itself only stores references.
-    resolved = _xout_resolve_preset(preset)
+    resolved = _xout_resolve_preset(preset, node_name=node_name)
 
     payload = request.json_body() if request.body else {}
     test_url = (payload.get("url") or "http://www.gstatic.com/generate_204").strip()
@@ -4813,6 +5346,18 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("GET",    "/api/xout/nodes",                   with_auth(xout_nodes_list_handler))
   router.add("POST",   "/api/xout/nodes/{node_name}/deploy", with_auth(xout_node_deploy_handler))
   router.add("GET",    "/api/xout/outbound-targets",         with_auth(xout_outbound_targets_handler))
+  router.add("GET",    "/api/xout/tokens",                   with_auth(xout_tokens_list_handler))
+  router.add("POST",   "/api/xout/tokens",                   with_auth(xout_tokens_create_handler))
+  router.add("GET",    "/api/xout/tokens/{id}",              with_auth(xout_tokens_get_handler))
+  router.add("PATCH",  "/api/xout/tokens/{id}",              with_auth(xout_tokens_patch_handler))
+  router.add("DELETE", "/api/xout/tokens/{id}",              with_auth(xout_tokens_delete_handler))
+  router.add("PUT",    "/api/xout/tokens/{id}/default",      with_auth(xout_tokens_set_default_handler))
+  router.add("GET",    "/api/xout/tokens/{id}/subscription", with_auth(xout_tokens_subscription_handler))
+  router.add("POST",   "/api/xout/tokens/{id}/publish",      with_auth(xout_tokens_publish_handler))
+  router.add("POST",   "/api/xout/sync-traffic",             with_auth(xout_sync_traffic_handler))
+  router.add("POST",   "/api/xout/sync-tokens",              with_auth(xout_sync_tokens_handler))
+  router.add("GET",    "/api/xout/nodes/{name}/traffic-summary",
+             with_auth(xout_node_traffic_summary_handler))
   router.add("POST",   "/api/xout/nodes/{node_name}/test",   with_auth(xout_node_test_handler))
   router.add("GET",  "/api/services/{name}/nodes/{node_name}/config",
              with_auth(service_node_config_get_handler))

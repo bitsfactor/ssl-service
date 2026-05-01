@@ -5835,16 +5835,66 @@
     presetsCard.appendChild(presetsBody);
     root.appendChild(presetsCard);
 
-    // Card 2: Nodes
+    // Card 2: Tokens (= users — UUID is the user identity baked into vless)
+    const tokensCard = h("div", { class: "card" });
+    tokensCard.appendChild(h("div", { class: "card-header" },
+      h("h2", null, "Tokens"),
+      h("button", { class: "btn btn-primary",
+        onclick: () => openXoutTokenEditor(null, refresh) }, "+ Add token")));
+    const tokensBody = h("div", { class: "card-body" });
+    tokensCard.appendChild(tokensBody);
+    root.appendChild(tokensCard);
+
+    // Card 3: Nodes
     const nodesCard = h("div", { class: "card" });
+    const syncTrafficBtn = h("button", { class: "btn btn-sm",
+      title: "Pull live traffic stats from selected nodes (or all)",
+      onclick: () => bulkSyncTraffic() }, "Sync traffic");
+    const syncTokensBtn = h("button", { class: "btn btn-sm",
+      title: "Reconcile tokens-on-disk with database (selected nodes or all)",
+      onclick: () => bulkSyncTokens() }, "Sync tokens");
     nodesCard.appendChild(h("div", { class: "card-header" },
       h("h2", null, "Deployed nodes"),
-      h("span", { class: "hint", id: "xout-nodes-count" }, "")));
+      h("div", { class: "row", style: "gap: 6px; flex: 1; justify-content: flex-end" },
+        h("span", { class: "hint", id: "xout-nodes-count" }, ""),
+        syncTrafficBtn, syncTokensBtn)));
     const nodesBody = h("div", { class: "card-body" });
     nodesCard.appendChild(nodesBody);
     root.appendChild(nodesCard);
 
     let cachedPresets = [];
+    let cachedTokens  = [];
+    let cachedNodes   = [];
+
+    // Returns the names of the currently checked-on nodes in the Deployed
+    // nodes table — empty array means "no selection, fall back to all".
+    function selectedNodeNames() {
+      return Array.from(nodesBody.querySelectorAll(".xout-node-cb:checked"))
+        .map((cb) => cb.dataset.node);
+    }
+
+    async function bulkSyncTraffic() {
+      const nodes = selectedNodeNames();
+      try {
+        const r = await api("POST", "/api/xout/sync-traffic", { nodes });
+        const okCount = (r.results || []).filter((x) => x.ok).length;
+        toast("success", "Traffic synced", `${okCount}/${(r.results || []).length} nodes`);
+        refresh();
+      } catch (err) {
+        toast("error", "Sync traffic failed", err.message);
+      }
+    }
+    async function bulkSyncTokens() {
+      const nodes = selectedNodeNames();
+      try {
+        const r = await api("POST", "/api/xout/sync-tokens", { nodes });
+        const okCount = (r.results || []).filter((x) => x.ok).length;
+        toast("success", "Tokens reconciled", `${okCount}/${(r.results || []).length} nodes`);
+        refresh();
+      } catch (err) {
+        toast("error", "Sync tokens failed", err.message);
+      }
+    }
 
     const renderPresets = (presets) => {
       presetsBody.innerHTML = "";
@@ -5895,8 +5945,97 @@
       presetsBody.appendChild(wrap);
     };
 
+    const renderTokens = (tokens) => {
+      tokensBody.innerHTML = "";
+      cachedTokens = tokens;
+      if (!tokens.length) {
+        tokensBody.appendChild(h("div", { class: "empty" },
+          h("div", { class: "title" }, "No tokens yet"),
+          h("div", { class: "sub" },
+            "Add one — its UUID becomes the seed user baked into newly-deployed xout instances.")));
+        return;
+      }
+      const tbl = h("table", { class: "data" });
+      tbl.appendChild(h("thead", null, h("tr", null,
+        h("th", null, "Name"),
+        h("th", null, "UUID"),
+        h("th", null, "Default"),
+        h("th", null, "Nodes"),
+        h("th", null, "This month"),
+        h("th", null, "Total"),
+        h("th", null, "Quota"),
+        h("th", null, ""))));
+      const tb = h("tbody");
+      for (const t of tokens) {
+        const isDefault = !!t.is_default;
+        const monthBytes = Number(t.month_bytes || 0);
+        const totalBytes = Number(t.total_bytes || 0);
+        const quotaGB    = Number(t.monthly_quota_gb || 0);
+        const quotaBytes = quotaGB * 1024 * 1024 * 1024;
+        const monthPctRaw = quotaBytes > 0 ? (monthBytes / quotaBytes) * 100 : 0;
+        const monthPct = Math.min(100, Math.max(0, monthPctRaw));
+        const overQuota = quotaBytes > 0 && monthBytes >= quotaBytes;
+        const usageBar = h("div", {
+          style: "background: var(--surface-2); border-radius: 3px; overflow: hidden; height: 5px; min-width: 80px"
+        }, h("div", {
+          style: `width: ${monthPct.toFixed(1)}%; height: 5px; background: ${
+            overQuota ? "var(--danger)" : (monthPct > 80 ? "var(--warning,#d97706)" : "var(--accent,#2563eb)")
+          };`
+        }));
+        const monthCell = h("div", null,
+          h("div", { class: "mono", style: "font-size: 12px" },
+            fmtXoutBytes(monthBytes), " / ", quotaGB > 0 ? `${quotaGB} GB` : "∞"),
+          usageBar);
+        tb.appendChild(h("tr", null,
+          h("td", { class: "mono" }, t.name),
+          h("td", { class: "mono", style: "font-size: 11px",
+                   title: t.uuid }, t.uuid.slice(0, 8) + "…"),
+          h("td", null, isDefault
+            ? h("span", { class: "badge ok" }, h("span", { class: "dot" }), "default")
+            : h("span", { class: "muted" }, "—")),
+          h("td", { class: "mono" }, String(t.node_count || 0)),
+          h("td", null, monthCell),
+          h("td", { class: "mono", style: "font-size: 12px" }, fmtXoutBytes(totalBytes)),
+          h("td", { class: "muted", style: "font-size: 12px" },
+            `${quotaGB} GB / ${t.monthly_reset_day || 1}d`),
+          h("td", null,
+            h("div", { class: "row", style: "gap: 4px; flex-wrap: wrap" },
+              h("button", { class: "btn btn-sm",
+                onclick: () => openXoutTokenEditor(t, refresh) }, "Edit"),
+              isDefault
+                ? h("span", { class: "muted", style: "font-size: 11px; padding: 2px 4px" }, "")
+                : h("button", { class: "btn btn-sm",
+                    onclick: async () => {
+                      try {
+                        await api("PUT", `/api/xout/tokens/${t.id}/default`);
+                        toast("success", "Default token", t.name);
+                        refresh();
+                      } catch (err) { toast("error", "Set default failed", err.message); }
+                    } }, "Set default"),
+              h("button", { class: "btn btn-sm",
+                onclick: () => openPublishTokenModal(t, cachedNodes, refresh) }, "Publish"),
+              h("button", { class: "btn btn-sm",
+                onclick: () => openTokenSubscriptionModal(t) }, "Subscription"),
+              h("button", { class: "btn btn-sm btn-danger",
+                onclick: async () => {
+                  if (!confirm(`Delete token "${t.name}"?\nThis will also remove it from all nodes — clients using its UUID will stop working.`)) return;
+                  try {
+                    await api("DELETE", `/api/xout/tokens/${t.id}`);
+                    toast("success", "Token deleted", t.name);
+                    refresh();
+                  } catch (err) { toast("error", "Delete failed", err.message); }
+                } }, "Delete"))),
+        ));
+      }
+      tbl.appendChild(tb);
+      const wrap = h("div", { class: "table-wrap" });
+      wrap.appendChild(tbl);
+      tokensBody.appendChild(wrap);
+    };
+
     const renderNodes = (nodes) => {
       nodesBody.innerHTML = "";
+      cachedNodes = nodes;
       const counter = document.getElementById("xout-nodes-count");
       if (counter) counter.textContent = `${nodes.length} node${nodes.length === 1 ? "" : "s"}`;
       if (!nodes.length) {
@@ -5907,7 +6046,12 @@
         return;
       }
       const tbl = h("table", { class: "data" });
+      const headSelectAll = h("input", { type: "checkbox", title: "Select all",
+        onchange: (e) => {
+          for (const cb of nodesBody.querySelectorAll(".xout-node-cb")) cb.checked = e.target.checked;
+        }});
       tbl.appendChild(h("thead", null, h("tr", null,
+        h("th", { style: "width: 30px" }, headSelectAll),
         h("th", null, "Node"),
         h("th", null, "Container"),
         h("th", null, "Health"),
@@ -5928,7 +6072,10 @@
           if (n.healthcheck_ok === false) return h("span", { class: "badge danger" }, "✗");
           return h("span", { class: "muted" }, "—");
         })();
+        const cb = h("input", { type: "checkbox", class: "xout-node-cb" });
+        cb.dataset.node = n.node_name;
         tb.appendChild(h("tr", null,
+          h("td", null, cb),
           h("td", { class: "mono" }, n.node_name),
           h("td", null, stateBadge),
           h("td", null, healthBadge),
@@ -5936,13 +6083,17 @@
           h("td", { class: "muted", style: "font-size: 12px" },
             n.last_observed_at ? fmtRelative(n.last_observed_at) : "never"),
           h("td", null,
-            h("div", { class: "row", style: "gap: 4px" },
+            h("div", { class: "row", style: "gap: 4px; flex-wrap: wrap" },
               h("button", { class: "btn btn-sm",
                 onclick: () => openXoutDeployModal(n.node_name, cachedPresets, refresh) },
                 "Deploy"),
               h("button", { class: "btn btn-sm", title: "Run proxy traffic test from inside the node",
                 onclick: () => openXoutTestModal(n.node_name) },
-                "Test"))),
+                "Test"),
+              h("button", { class: "btn btn-sm",
+                title: "Show this node's tokens, this-month traffic and residual quota",
+                onclick: () => openVerifyTrafficModal(n.node_name) },
+                "Verify traffic"))),
         ));
       }
       tbl.appendChild(tb);
@@ -5953,11 +6104,13 @@
 
     async function refresh() {
       try {
-        const [pr, nr] = await Promise.all([
+        const [pr, tr, nr] = await Promise.all([
           api("GET", "/api/xout/presets"),
+          api("GET", "/api/xout/tokens"),
           api("GET", "/api/xout/nodes"),
         ]);
         renderPresets(pr.presets || []);
+        renderTokens(tr.tokens || []);
         renderNodes(nr.nodes || []);
       } catch (err) {
         presetsBody.innerHTML = "";
@@ -5969,8 +6122,19 @@
     }
 
     presetsBody.appendChild(h("div", { class: "muted", style: "padding: 8px 0;" }, "Loading…"));
+    tokensBody.appendChild(h("div", { class: "muted", style: "padding: 8px 0;" }, "Loading…"));
     nodesBody.appendChild(h("div", { class: "muted", style: "padding: 8px 0;" }, "Loading…"));
     refresh();
+  }
+
+  // Pretty-print byte counts.  GB threshold at 1024^3, MB at 1024^2 — we
+  // don't go below KB because xray traffic is always at least kilobytes.
+  function fmtXoutBytes(b) {
+    if (!b || b < 1024) return (b || 0) + " B";
+    if (b < 1024 * 1024) return (b / 1024).toFixed(1) + " KB";
+    if (b < 1024 * 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + " MB";
+    if (b < 1024 ** 4) return (b / 1024 ** 3).toFixed(2) + " GB";
+    return (b / 1024 ** 4).toFixed(2) + " TB";
   }
 
   // Modal: pick a preset to deploy on a single node.
@@ -6094,6 +6258,307 @@
     Modal.open({ title: `Test xout on ${nodeName}`, body,
       footer: h("div", { class: "row" },
         h("button", { class: "btn", onclick: () => openXoutTestModal(nodeName) }, "Re-run"),
+        h("div", { style: "flex: 1" }),
+        h("button", { class: "btn btn-primary", onclick: () => Modal.close() }, "Close")) });
+  }
+
+  // Modal: create or edit a token. UUID is auto-generated on create and
+  // shown read-only on edit (rotating it would break clients' subs).
+  async function openXoutTokenEditor(existing, onDone) {
+    const isEdit = !!(existing && existing.id);
+    const body = h("div");
+    const nameInput = h("input", { type: "text",
+      value: existing ? existing.name : "",
+      placeholder: "alice (alphanumeric, - _ allowed)",
+      style: "width: 100%; padding: 6px 8px;" });
+    const uuidInput = h("input", { type: "text",
+      value: existing ? existing.uuid : "(generated on save)",
+      readOnly: true,
+      style: "width: 100%; padding: 6px 8px; background: var(--surface-2); font-family: monospace;" });
+    const passInput = h("input", { type: "text",
+      value: existing && existing.password ? existing.password : "",
+      placeholder: "(reserved — currently unused)",
+      style: "width: 100%; padding: 6px 8px;" });
+    const quotaInput = h("input", { type: "number", min: 0, max: 1000000,
+      value: existing ? (existing.monthly_quota_gb || 1000) : 1000,
+      style: "padding: 6px 8px; width: 120px;" });
+    const resetInput = h("input", { type: "number", min: 1, max: 28,
+      value: existing ? (existing.monthly_reset_day || 1) : 1,
+      style: "padding: 6px 8px; width: 80px;" });
+    const notesInput = h("textarea", {
+      placeholder: "optional notes (who is this for, etc.)",
+      style: "width: 100%; padding: 6px 8px; min-height: 60px; font-family: inherit;"
+    }, existing ? (existing.notes || "") : "");
+
+    body.appendChild(h("div", { class: "form-row", style: "margin-bottom: 8px" },
+      h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" }, "Name"),
+      nameInput));
+    body.appendChild(h("div", { class: "form-row", style: "margin-bottom: 8px" },
+      h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" }, "UUID"),
+      uuidInput,
+      h("div", { class: "muted", style: "font-size: 11px; margin-top: 4px" },
+        isEdit ? "UUID is permanent — clients keep their subscription URLs." : "Auto-generated on save.")));
+    body.appendChild(h("div", { class: "form-row", style: "margin-bottom: 8px" },
+      h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" }, "Password"),
+      passInput));
+    body.appendChild(h("div", { class: "row", style: "gap: 12px; margin-bottom: 8px" },
+      h("div", { class: "form-row", style: "flex: 1" },
+        h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" },
+          "Monthly quota (GB)"), quotaInput),
+      h("div", { class: "form-row", style: "flex: 1" },
+        h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" },
+          "Reset day (1-28)"), resetInput)));
+    body.appendChild(h("div", { class: "form-row", style: "margin-bottom: 8px" },
+      h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" }, "Notes"),
+      notesInput));
+    const errorEl = h("div", { class: "muted", style: "color: var(--danger); margin-top: 8px;" });
+    body.appendChild(errorEl);
+
+    const footer = h("div", { class: "row", style: "gap: 8px" },
+      h("div", { style: "flex: 1" }),
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { class: "btn btn-primary",
+        onclick: async (e) => {
+          e.preventDefault();
+          const payload = {
+            name: nameInput.value.trim(),
+            password: passInput.value.trim() || null,
+            monthly_quota_gb: parseInt(quotaInput.value, 10),
+            monthly_reset_day: parseInt(resetInput.value, 10),
+            notes: notesInput.value.trim() || null,
+          };
+          if (!payload.name) {
+            errorEl.textContent = "name is required";
+            return;
+          }
+          e.target.disabled = true;
+          e.target.textContent = isEdit ? "Saving…" : "Creating…";
+          try {
+            if (isEdit) {
+              await api("PATCH", `/api/xout/tokens/${existing.id}`, payload);
+              toast("success", "Token updated", payload.name);
+            } else {
+              await api("POST", "/api/xout/tokens", payload);
+              toast("success", "Token created", payload.name);
+            }
+            Modal.close();
+            if (onDone) onDone();
+          } catch (err) {
+            errorEl.textContent = err.message || "request failed";
+            e.target.disabled = false;
+            e.target.textContent = isEdit ? "Save" : "Create";
+          }
+        } }, isEdit ? "Save" : "Create"));
+    Modal.open({ title: isEdit ? `Edit token: ${existing.name}` : "Add token",
+                 body, footer });
+  }
+
+  // Modal: pick which nodes to publish a token to. Idempotent — re-publishing
+  // is safe; clients keep their subscription URL because UUID is stable.
+  async function openPublishTokenModal(token, nodes, onDone) {
+    if (!nodes || !nodes.length) {
+      toast("error", "No deployed xout nodes",
+            "Deploy xout to at least one node first.");
+      return;
+    }
+    // Pre-fetch the token's current node assignments to pre-check the boxes.
+    let assigned = new Set();
+    try {
+      const r = await api("GET", `/api/xout/tokens/${token.id}`);
+      for (const n of (r.nodes || [])) assigned.add(n.node_name);
+    } catch (_) { /* ignore */ }
+
+    const list = h("div", { style: "display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow-y: auto;" });
+    for (const n of nodes) {
+      const cb = h("input", { type: "checkbox" });
+      cb.dataset.node = n.node_name;
+      if (assigned.has(n.node_name)) cb.checked = true;
+      const stateChip = (n.container_state || "").toLowerCase() === "running"
+        ? h("span", { class: "badge ok", style: "font-size: 10px" }, "running")
+        : h("span", { class: "badge muted", style: "font-size: 10px" }, n.container_state || "—");
+      list.appendChild(h("label", { class: "row",
+        style: "gap: 8px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; cursor: pointer" },
+        cb,
+        h("span", { class: "mono", style: "flex: 1" }, n.node_name),
+        h("span", { class: "muted", style: "font-size: 11px" }, n.preset_name || "(no preset)"),
+        stateChip));
+    }
+    const errorEl = h("div", { class: "muted", style: "color: var(--danger); margin-top: 8px;" });
+    const body = h("div", null,
+      h("p", { class: "muted" },
+        `Pick which nodes should serve token "${token.name}". `,
+        "Pre-checked = currently assigned. Re-deploy each affected node to bake it into preset.json."),
+      list, errorEl);
+
+    const footer = h("div", { class: "row", style: "gap: 8px" },
+      h("div", { style: "flex: 1" }),
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { class: "btn btn-primary",
+        onclick: async (e) => {
+          e.preventDefault();
+          const picks = Array.from(list.querySelectorAll("input[type=checkbox]:checked"))
+            .map((cb) => cb.dataset.node);
+          if (!picks.length) {
+            errorEl.textContent = "pick at least one node";
+            return;
+          }
+          e.target.disabled = true;
+          e.target.textContent = "Publishing…";
+          try {
+            const r = await api("POST", `/api/xout/tokens/${token.id}/publish`,
+              { nodes: picks });
+            const okN = (r.results || []).filter((x) => x.ok).length;
+            toast("success", "Token published", `${okN}/${picks.length} nodes`);
+            Modal.close();
+            if (onDone) onDone();
+          } catch (err) {
+            errorEl.textContent = err.message || "request failed";
+            e.target.disabled = false;
+            e.target.textContent = "Publish";
+          }
+        } }, "Publish"));
+    Modal.open({ title: `Publish token: ${token.name}`, body, footer });
+  }
+
+  // Modal: show this token's aggregated subscription content (raw URIs +
+  // base64 + Clash YAML). Each section has a copy button.
+  async function openTokenSubscriptionModal(token) {
+    const body = h("div");
+    body.appendChild(h("div", { class: "muted", style: "padding: 12px;" }, "Loading subscription…"));
+    Modal.open({ title: `Subscription: ${token.name}`, body });
+
+    let r;
+    try {
+      r = await api("GET", `/api/xout/tokens/${token.id}/subscription`);
+    } catch (err) {
+      body.innerHTML = "";
+      body.appendChild(h("div", { class: "muted", style: "color: var(--danger); padding: 12px" },
+        "Load failed: " + (err.message || "")));
+      return;
+    }
+    body.innerHTML = "";
+
+    const summary = h("div", { class: "row", style: "gap: 12px; margin-bottom: 10px; flex-wrap: wrap" },
+      h("strong", null, `${(r.raw || []).length} URIs`),
+      h("span", { class: "muted" }, `across ${(r.nodes || []).length} node${(r.nodes || []).length === 1 ? "" : "s"}`));
+    body.appendChild(summary);
+
+    const mkSection = (label, content, isYaml) => {
+      const ta = h("textarea", {
+        readOnly: true,
+        style: `width: 100%; padding: 6px 8px; ${isYaml ? "min-height: 200px;" : "min-height: 90px;"} font-family: monospace; font-size: 11px;`,
+      }, content || "");
+      const copyBtn = h("button", { class: "btn btn-sm",
+        onclick: async () => {
+          try {
+            await navigator.clipboard.writeText(content || "");
+            toast("success", "Copied", label);
+          } catch (_) {
+            ta.select();
+            document.execCommand("copy");
+            toast("success", "Copied", label);
+          }
+        }}, "Copy");
+      return h("div", { class: "form-row", style: "margin-bottom: 12px" },
+        h("div", { class: "row", style: "align-items: center; gap: 8px; margin-bottom: 4px" },
+          h("label", { style: "font-weight: 600; font-size: 13px; flex: 1" }, label),
+          copyBtn),
+        ta);
+    };
+
+    body.appendChild(mkSection("Plain URIs (one per line)", r.plain || "", false));
+    body.appendChild(mkSection("Base64 subscription (paste into client subscription URL)",
+      r.base64 || "", false));
+    body.appendChild(mkSection("Clash YAML", r.clash || "", true));
+
+    Modal.open({ title: `Subscription: ${token.name}`, body,
+      footer: h("div", { class: "row" },
+        h("div", { style: "flex: 1" }),
+        h("button", { class: "btn btn-primary", onclick: () => Modal.close() }, "Close")) });
+  }
+
+  // Modal: per-node traffic rollup with per-token breakdown + this-month
+  // residual quota bar.
+  async function openVerifyTrafficModal(nodeName) {
+    const body = h("div");
+    body.appendChild(h("div", { class: "muted", style: "padding: 12px;" }, "Loading…"));
+    Modal.open({ title: `Verify traffic: ${nodeName}`, body });
+
+    let r;
+    try {
+      r = await api("GET", `/api/xout/nodes/${encodeURIComponent(nodeName)}/traffic-summary`);
+    } catch (err) {
+      body.innerHTML = "";
+      body.appendChild(h("div", { class: "muted", style: "color: var(--danger); padding: 12px" },
+        "Load failed: " + (err.message || "")));
+      return;
+    }
+    body.innerHTML = "";
+
+    const monthBytes = Number(r.month_bytes || 0);
+    const quotaBytes = Number(r.month_quota_bytes || 0);
+    const monthPct = quotaBytes > 0 ? Math.min(100, (monthBytes / quotaBytes) * 100) : 0;
+    const overQuota = quotaBytes > 0 && monthBytes >= quotaBytes;
+
+    body.appendChild(h("div", { class: "row", style: "gap: 16px; margin-bottom: 12px; flex-wrap: wrap" },
+      h("div", null,
+        h("div", { class: "muted", style: "font-size: 11px" }, "This month"),
+        h("div", { class: "mono", style: "font-size: 16px" }, fmtXoutBytes(monthBytes))),
+      h("div", null,
+        h("div", { class: "muted", style: "font-size: 11px" }, "Quota"),
+        h("div", { class: "mono", style: "font-size: 16px" }, fmtXoutBytes(quotaBytes))),
+      h("div", null,
+        h("div", { class: "muted", style: "font-size: 11px" }, "Residual"),
+        h("div", { class: "mono",
+          style: `font-size: 16px; color: ${overQuota ? "var(--danger)" : "inherit"}; font-family: monospace` },
+          fmtXoutBytes(Math.max(0, Number(r.month_residual_bytes || 0))))),
+      h("div", null,
+        h("div", { class: "muted", style: "font-size: 11px" }, "Lifetime"),
+        h("div", { class: "mono", style: "font-size: 16px" }, fmtXoutBytes(Number(r.total_bytes || 0))))));
+    body.appendChild(h("div", {
+      style: "background: var(--surface-2); border-radius: 4px; overflow: hidden; height: 8px; margin-bottom: 16px"
+    }, h("div", {
+      style: `width: ${monthPct.toFixed(1)}%; height: 8px; background: ${overQuota ? "var(--danger)" : (monthPct > 80 ? "#d97706" : "var(--accent,#2563eb)")};`
+    })));
+
+    if (!(r.per_token || []).length) {
+      body.appendChild(h("div", { class: "muted", style: "padding: 12px" },
+        "No tokens recorded for this node yet. Run 'Sync traffic' or 'Sync tokens' first."));
+    } else {
+      const tbl = h("table", { class: "data" });
+      tbl.appendChild(h("thead", null, h("tr", null,
+        h("th", null, "Token"), h("th", null, "This month"),
+        h("th", null, "Total"), h("th", null, "Last seen"))));
+      const tb = h("tbody");
+      for (const pt of r.per_token) {
+        tb.appendChild(h("tr", null,
+          h("td", { class: "mono" }, pt.token_name || `#${pt.token_id}`),
+          h("td", { class: "mono", style: "font-size: 12px" }, fmtXoutBytes(Number(pt.month_bytes || 0))),
+          h("td", { class: "mono", style: "font-size: 12px" }, fmtXoutBytes(Number(pt.total_bytes || 0))),
+          h("td", { class: "muted", style: "font-size: 12px" },
+            pt.last_seen_at ? fmtRelative(pt.last_seen_at) : "never")));
+      }
+      tbl.appendChild(tb);
+      const wrap = h("div", { class: "table-wrap" });
+      wrap.appendChild(tbl);
+      body.appendChild(wrap);
+    }
+
+    Modal.open({ title: `Verify traffic: ${nodeName}`, body,
+      footer: h("div", { class: "row" },
+        h("button", { class: "btn", title: "Pull latest stats from this node",
+          onclick: async (e) => {
+            e.target.disabled = true;
+            e.target.textContent = "Syncing…";
+            try {
+              await api("POST", "/api/xout/sync-traffic", { nodes: [nodeName] });
+              openVerifyTrafficModal(nodeName);
+            } catch (err) {
+              toast("error", "Sync failed", err.message);
+              e.target.disabled = false;
+              e.target.textContent = "Sync this node";
+            }
+          }}, "Sync this node"),
         h("div", { style: "flex: 1" }),
         h("button", { class: "btn btn-primary", onclick: () => Modal.close() }, "Close")) });
   }

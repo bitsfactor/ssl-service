@@ -2734,6 +2734,291 @@ class Database:
       "applied_by": row.get("applied_by"),
     }
 
+  # ---------- xout tokens (= users) ----------
+
+  @staticmethod
+  def _row_to_xout_token(row: dict) -> dict:
+    return {
+      "id": int(row["id"]),
+      "name": row["name"],
+      "uuid": row["uuid"],
+      "password": row.get("password"),
+      "is_default": bool(row.get("is_default")),
+      "monthly_quota_gb": int(row.get("monthly_quota_gb") or 1000),
+      "monthly_reset_day": int(row.get("monthly_reset_day") or 1),
+      "notes": row.get("notes"),
+      "created_at": row.get("created_at"),
+      "updated_at": row.get("updated_at"),
+    }
+
+  _XOUT_TOKEN_COLS = (
+    "id, name, uuid, password, is_default, monthly_quota_gb, "
+    "monthly_reset_day, notes, created_at, updated_at"
+  )
+
+  def list_xout_tokens(self) -> list[dict]:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"SELECT {self._XOUT_TOKEN_COLS} FROM xout_tokens ORDER BY name ASC"
+        )
+        return [self._row_to_xout_token(r) for r in cursor.fetchall()]
+
+  def get_xout_token(self, token_id: int) -> dict | None:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"SELECT {self._XOUT_TOKEN_COLS} FROM xout_tokens WHERE id = %s",
+          (int(token_id),),
+        )
+        row = cursor.fetchone()
+        return None if row is None else self._row_to_xout_token(row)
+
+  def get_default_xout_token(self) -> dict | None:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"SELECT {self._XOUT_TOKEN_COLS} FROM xout_tokens WHERE is_default LIMIT 1"
+        )
+        row = cursor.fetchone()
+        return None if row is None else self._row_to_xout_token(row)
+
+  def insert_xout_token(
+    self, *, name: str, uuid: str, password: str | None = None,
+    monthly_quota_gb: int = 1000, monthly_reset_day: int = 1,
+    notes: str | None = None,
+  ) -> dict:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"""
+          INSERT INTO xout_tokens (name, uuid, password, monthly_quota_gb,
+            monthly_reset_day, notes, created_at, updated_at)
+          VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+          RETURNING {self._XOUT_TOKEN_COLS}
+          """,
+          (name, uuid, password, int(monthly_quota_gb),
+           int(monthly_reset_day), notes),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    return self._row_to_xout_token(row)
+
+  def update_xout_token(self, token_id: int, fields: dict) -> dict | None:
+    allowed = {"name", "password", "monthly_quota_gb", "monthly_reset_day", "notes"}
+    sets = []
+    params: dict = {"id": int(token_id)}
+    for k, v in fields.items():
+      if k not in allowed:
+        continue
+      sets.append(f"{k} = %({k})s")
+      params[k] = v
+    if not sets:
+      return self.get_xout_token(token_id)
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"""UPDATE xout_tokens SET {', '.join(sets)}, updated_at = NOW()
+              WHERE id = %(id)s
+              RETURNING {self._XOUT_TOKEN_COLS}""",
+          params,
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    return None if row is None else self._row_to_xout_token(row)
+
+  def delete_xout_token(self, token_id: int) -> bool:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute("DELETE FROM xout_tokens WHERE id = %s", (int(token_id),))
+        deleted = cursor.rowcount
+      connection.commit()
+    return deleted > 0
+
+  def set_default_xout_token(self, token_id: int) -> dict | None:
+    """Mark exactly this row as the default; clear it on every other row.
+    Used by 'newly-deployed xout instance seeds the first user from the
+    default token' and by the operator's explicit toggle in the UI."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute("UPDATE xout_tokens SET is_default = FALSE WHERE is_default")
+        cursor.execute(
+          f"""UPDATE xout_tokens SET is_default = TRUE, updated_at = NOW()
+              WHERE id = %s
+              RETURNING {self._XOUT_TOKEN_COLS}""",
+          (int(token_id),),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    return None if row is None else self._row_to_xout_token(row)
+
+  # ---- node-token junction ----
+
+  def list_xout_node_tokens_for_node(self, node_name: str) -> list[dict]:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """SELECT nt.node_name, nt.token_id, nt.provisioned_at, nt.last_seen_at,
+                    nt.base64_subscription, nt.clash_subscription,
+                    t.name AS token_name, t.uuid AS token_uuid
+             FROM xout_node_tokens nt JOIN xout_tokens t ON t.id = nt.token_id
+             WHERE nt.node_name = %s ORDER BY t.name""",
+          (node_name,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+  def list_xout_node_tokens_for_token(self, token_id: int) -> list[dict]:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """SELECT node_name, token_id, provisioned_at, last_seen_at,
+                    base64_subscription, clash_subscription
+             FROM xout_node_tokens WHERE token_id = %s ORDER BY node_name""",
+          (int(token_id),),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+  def upsert_xout_node_token(
+    self, node_name: str, token_id: int, *,
+    base64_subscription: str | None = None,
+    clash_subscription: str | None = None,
+    last_seen_at: bool = False,
+  ) -> dict:
+    seen_clause = "last_seen_at = NOW()," if last_seen_at else ""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"""
+          INSERT INTO xout_node_tokens (node_name, token_id, provisioned_at,
+            last_seen_at, base64_subscription, clash_subscription)
+          VALUES (%s, %s, NOW(), {('NOW()' if last_seen_at else 'NULL')}, %s, %s)
+          ON CONFLICT (node_name, token_id) DO UPDATE SET
+            {seen_clause}
+            base64_subscription = COALESCE(EXCLUDED.base64_subscription, xout_node_tokens.base64_subscription),
+            clash_subscription  = COALESCE(EXCLUDED.clash_subscription,  xout_node_tokens.clash_subscription)
+          RETURNING node_name, token_id, provisioned_at, last_seen_at,
+                    base64_subscription, clash_subscription
+          """,
+          (node_name, int(token_id), base64_subscription, clash_subscription),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    return dict(row) if row else {}
+
+  def delete_xout_node_token(self, node_name: str, token_id: int) -> bool:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          "DELETE FROM xout_node_tokens WHERE node_name = %s AND token_id = %s",
+          (node_name, int(token_id)),
+        )
+        deleted = cursor.rowcount
+      connection.commit()
+    return deleted > 0
+
+  # ---- traffic ----
+
+  def upsert_xout_traffic_daily(
+    self, node_name: str, token_id: int, day, *,
+    uplink_bytes: int, downlink_bytes: int,
+  ) -> None:
+    """Snapshot the raw cumulative byte counters (since container last
+    started) into the daily row. Caller passes deltas — we just store
+    the latest seen value for that day."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          INSERT INTO xout_traffic_daily (node_name, token_id, day,
+            uplink_bytes, downlink_bytes, updated_at)
+          VALUES (%s, %s, %s, %s, %s, NOW())
+          ON CONFLICT (node_name, token_id, day) DO UPDATE SET
+            uplink_bytes = EXCLUDED.uplink_bytes,
+            downlink_bytes = EXCLUDED.downlink_bytes,
+            updated_at = NOW()
+          """,
+          (node_name, int(token_id), day, int(uplink_bytes), int(downlink_bytes)),
+        )
+      connection.commit()
+
+  def sum_traffic_for_token(self, token_id: int, *, since=None) -> dict:
+    """Return totals for one token (across nodes + days). ``since`` is an
+    optional date — pass the start of the current month for 'this-month'.
+    """
+    where = "WHERE token_id = %s"
+    params: list = [int(token_id)]
+    if since is not None:
+      where += " AND day >= %s"
+      params.append(since)
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"""SELECT COALESCE(SUM(uplink_bytes + downlink_bytes), 0) AS total,
+                     COALESCE(SUM(uplink_bytes), 0) AS up,
+                     COALESCE(SUM(downlink_bytes), 0) AS down
+              FROM xout_traffic_daily {where}""",
+          params,
+        )
+        row = cursor.fetchone()
+        return {"total": int(row["total"] or 0),
+                "up": int(row["up"] or 0),
+                "down": int(row["down"] or 0)}
+
+  def sum_traffic_for_node(self, node_name: str, *, since=None) -> dict:
+    where = "WHERE node_name = %s"
+    params: list = [node_name]
+    if since is not None:
+      where += " AND day >= %s"
+      params.append(since)
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"""SELECT COALESCE(SUM(uplink_bytes + downlink_bytes), 0) AS total
+              FROM xout_traffic_daily {where}""",
+          params,
+        )
+        row = cursor.fetchone()
+        return {"total": int(row["total"] or 0)}
+
+  def list_token_deployment_summary(self) -> list[dict]:
+    """One row per token, with a count of nodes it's deployed to plus
+    aggregated this-month and lifetime traffic. Used as the Tokens
+    table's row payload."""
+    from datetime import date as _date
+    today = _date.today()
+    month_start = today.replace(day=1)
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          SELECT t.id, t.name, t.uuid, t.password, t.is_default,
+                 t.monthly_quota_gb, t.monthly_reset_day, t.notes,
+                 t.created_at, t.updated_at,
+                 COALESCE(nt.node_count, 0) AS node_count,
+                 COALESCE(tot.total, 0) AS total_bytes,
+                 COALESCE(mon.total, 0) AS month_bytes
+          FROM xout_tokens t
+          LEFT JOIN (SELECT token_id, COUNT(*) AS node_count FROM xout_node_tokens GROUP BY token_id) nt
+            ON nt.token_id = t.id
+          LEFT JOIN (SELECT token_id, SUM(uplink_bytes + downlink_bytes) AS total
+                     FROM xout_traffic_daily GROUP BY token_id) tot
+            ON tot.token_id = t.id
+          LEFT JOIN (SELECT token_id, SUM(uplink_bytes + downlink_bytes) AS total
+                     FROM xout_traffic_daily WHERE day >= %s GROUP BY token_id) mon
+            ON mon.token_id = t.id
+          ORDER BY t.name
+          """,
+          (month_start,),
+        )
+        out = []
+        for r in cursor.fetchall():
+          d = self._row_to_xout_token(r)
+          d["node_count"] = int(r.get("node_count") or 0)
+          d["total_bytes"] = int(r.get("total_bytes") or 0)
+          d["month_bytes"] = int(r.get("month_bytes") or 0)
+          out.append(d)
+        return out
+
   def try_advisory_lock(self, connection: psycopg.Connection, key: str) -> bool:
     with connection.cursor() as cursor:
       cursor.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS locked", (key,))
