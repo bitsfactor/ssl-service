@@ -4816,6 +4816,101 @@ def _build_router(ctx: AdminContext) -> _Router:
       "per_token": per_token,
     })
 
+  def xout_node_subscription_handler(request: _Request) -> _Response:
+    """Aggregated subscription content for ONE node across every token
+    that has been published to it. Returns the same shape as the
+    per-token subscription endpoint (raw / plain / base64 / clash).
+
+    Per-token cached strings (populated by sync-tokens, which reads
+    /data/preset.json.resolved) are preferred. Tokens whose cache is
+    stale fall through to an on-the-fly build from the stored preset
+    (which silently drops vless URIs whose Reality public_key is still
+    'auto' — the operator should run 'Sync tokens' on this node first
+    to populate the cache).
+    """
+    name = _normalize_node_name(request.path_params["name"])
+    node = ctx.database.get_node(name)
+    if node is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {name}",
+                      code="node_not_found")
+    rows = ctx.database.list_xout_node_tokens_for_node(name)
+
+    cached_b64_chunks: list[str] = []
+    cached_clash_chunks: list[str] = []
+    nodes_cached_for: list[str] = []  # which token names had cache hits
+    nodes_uncached_for: list[str] = []
+
+    # On-the-fly builds need the assigned preset for THIS node — fetch
+    # once, reuse for every token that lacks a cache.
+    a = ctx.database.get_xout_assignment(name)
+    preset = ctx.database.get_xout_preset(a["preset_id"]) if a else None
+
+    fly_plain_parts: list[str] = []
+    fly_clash_parts: list[str] = []
+    seen_tokens: list[dict] = []
+
+    for r in rows:
+      tok = ctx.database.get_xout_token(r["token_id"])
+      if tok is None: continue
+      seen_tokens.append({"id": tok["id"], "name": tok["name"]})
+      cached_b64 = r.get("base64_subscription")
+      cached_clash = r.get("clash_subscription")
+      if cached_b64 or cached_clash:
+        if cached_b64: cached_b64_chunks.append(cached_b64)
+        if cached_clash: cached_clash_chunks.append(cached_clash)
+        nodes_cached_for.append(tok["name"])
+      elif preset is not None:
+        # Build per-token URIs against this single node only — same
+        # helper as the token-subscription endpoint.
+        subs = _build_subscriptions_for_token(
+          tok, {name: {"node": node, "preset": preset}},
+        )
+        if subs.get("plain"):
+          fly_plain_parts.append(subs["plain"])
+        if subs.get("clash"):
+          fly_clash_parts.append(subs["clash"])
+        nodes_uncached_for.append(tok["name"])
+
+    import base64 as _b64
+    plain_parts: list[str] = []
+    for chunk in cached_b64_chunks:
+      try:
+        plain_parts.append(_b64.b64decode(chunk).decode("utf-8"))
+      except Exception:
+        pass
+    plain_parts.extend(fly_plain_parts)
+    plain = "".join(plain_parts)
+    b64 = _b64.b64encode(plain.encode("utf-8")).decode("ascii") if plain else ""
+
+    clash_parts: list[str] = []
+    for i, chunk in enumerate(cached_clash_chunks):
+      if i == 0:
+        clash_parts.append(chunk.rstrip("\n"))
+      else:
+        body = "\n".join(line for line in chunk.splitlines()
+                         if line.strip() and line.strip() != "proxies:")
+        if body:
+          clash_parts.append(body)
+    for body in fly_clash_parts:
+      if clash_parts:
+        body = "\n".join(line for line in body.splitlines()
+                         if line.strip() and line.strip() != "proxies:")
+      if body:
+        clash_parts.append(body.rstrip("\n"))
+    clash = ("\n".join(clash_parts) + "\n") if clash_parts else ""
+
+    raw = [u for u in plain.split("\n") if u]
+    return _json_response(HTTPStatus.OK, {
+      "node": name,
+      "tokens": seen_tokens,
+      "tokens_cached": nodes_cached_for,
+      "tokens_uncached": nodes_uncached_for,
+      "raw": raw,
+      "plain": plain,
+      "base64": b64,
+      "clash": clash,
+    })
+
   def xout_sync_traffic_handler(request: _Request) -> _Response:
     """Pull live byte counters from each requested node's Xray stats API
     and snapshot them into xout_traffic_daily. Stats are cumulative
@@ -5591,6 +5686,8 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("POST",   "/api/xout/sync-tokens",              with_auth(xout_sync_tokens_handler))
   router.add("GET",    "/api/xout/nodes/{name}/traffic-summary",
              with_auth(xout_node_traffic_summary_handler))
+  router.add("GET",    "/api/xout/nodes/{name}/subscription",
+             with_auth(xout_node_subscription_handler))
   router.add("POST",   "/api/xout/nodes/{node_name}/test",   with_auth(xout_node_test_handler))
   router.add("GET",  "/api/services/{name}/nodes/{node_name}/config",
              with_auth(service_node_config_get_handler))
