@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
+# ssl-service container entrypoint.
+#
+# Environment-driven: the controller reads SSL_SERVICE_* env vars
+# directly (see ssl_proxy_controller.config.load_config_from_env), so
+# we don't need a config.yaml file. Caddy's bootstrap Caddyfile is
+# tiny and identical for every deploy, so we just write it inline.
 set -euo pipefail
 
-CONFIG_PATH="/app/config/config.yaml"
-STATE_DIR="/app/state"
-LOG_DIR="/app/logs"
+STATE_DIR="${SSL_SERVICE_STATE_DIR:-/app/state}"
+LOG_DIR="${SSL_SERVICE_LOG_DIR:-/app/logs}"
 GENERATED_DIR="${STATE_DIR}/generated"
 RUNTIME_STATE_DIR="${STATE_DIR}/state"
 CERTS_DIR="${STATE_DIR}/certs"
 CADDYFILE_PATH="${GENERATED_DIR}/Caddyfile"
 
 mkdir -p "${GENERATED_DIR}" "${RUNTIME_STATE_DIR}" "${CERTS_DIR}" "${LOG_DIR}"
-
-if [[ ! -f "${CONFIG_PATH}" ]]; then
-  printf 'ERROR: config not found: %s\n' "${CONFIG_PATH}" >&2
-  exit 1
-fi
 
 if [[ ! -f "${CADDYFILE_PATH}" ]]; then
   cat > "${CADDYFILE_PATH}" <<'EOF'
@@ -26,7 +26,9 @@ fi
 
 /usr/bin/caddy run --environ --config "${CADDYFILE_PATH}" --adapter caddyfile &
 CADDY_PID=$!
-python -m ssl_proxy_controller --config "${CONFIG_PATH}" &
+# No --config: controller falls through to load_config_from_env(),
+# reading SSL_SERVICE_* directly from the env passed in by compose.
+python -m ssl_proxy_controller &
 CONTROLLER_PID=$!
 
 cleanup() {

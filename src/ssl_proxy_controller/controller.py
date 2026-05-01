@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 from .acme import issue_certificate
 from .admin import AdminServer
 from .caddy import reload_caddy, render_caddyfile, state_payload
-from .config import AppConfig, load_config
+from .config import AppConfig, load_config, load_config_from_env
 from .db import CertificateRecord, Database, RouteRecord
 
 
@@ -240,7 +240,11 @@ class Controller:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="ssl proxy controller")
-  parser.add_argument("--config", required=True, help="path to YAML config")
+  # --config is optional; when absent (typical for deployed containers)
+  # we build an AppConfig directly from SSL_SERVICE_* environment vars.
+  # Local dev still uses --config to point at a YAML file.
+  parser.add_argument("--config", required=False, default=None,
+                      help="path to YAML config (omit for env-only)")
   parser.add_argument("--once", action="store_true", help="run one sync iteration and exit")
   parser.add_argument(
     "--admin-only",
@@ -272,7 +276,12 @@ def configure_logging(config: AppConfig) -> None:
 
 def main(argv: list[str] | None = None) -> int:
   args = parse_args(argv or sys.argv[1:])
-  config = load_config(args.config)
+  if args.config:
+    config = load_config(args.config)
+  else:
+    # Env-only mode for deployed containers — the platform writes
+    # SSL_SERVICE_* env vars via the .env file passed to compose.
+    config = load_config_from_env()
   configure_logging(config)
 
   controller = Controller(config)

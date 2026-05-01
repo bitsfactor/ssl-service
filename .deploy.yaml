@@ -49,20 +49,21 @@ exposed_ports:
   - 8088
 
 # Healthcheck — the admin polls this from inside the target node after
-# `compose up` finishes. Deploy is only marked successful once one probe
-# returns 200.
+# `compose up` finishes. We hit Caddy's local admin port (always
+# running regardless of SSL_SERVICE_ENABLE_WEB_UI) rather than the
+# Python admin HTTP server (which is only up when WEB_UI=true).
 healthcheck:
-  url: http://localhost:8088/api/healthz
+  url: http://localhost:2019/config/
   expect_status: 200
   timeout_seconds: 60
   retries: 12
   interval_seconds: 5
 
-# Persistent dirs the platform pre-creates (used as bind mounts below).
+# Persistent dirs the platform pre-creates (used as bind mounts in
+# docker-compose.yml). config/ is gone — env-only now.
 volumes:
   - /opt/{name}/state
   - /opt/{name}/logs
-  - /opt/{name}/config
 
 depends_on: []
 hooks: {}

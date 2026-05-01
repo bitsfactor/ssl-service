@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -192,6 +193,108 @@ def load_config(path: str | Path) -> AppConfig:
     raise ValueError("admin.port must be <= 65535")
   if config.admin.enabled and not config.admin.token.strip():
     raise ValueError("admin.token is required when admin.enabled is true")
+  return config
+
+
+_DEFAULT_CADDY_RELOAD = [
+  "/usr/bin/caddy",
+  "reload",
+  "--config", "/app/state/generated/Caddyfile",
+  "--adapter", "caddyfile",
+]
+
+
+def load_config_from_env(env: dict[str, str] | None = None) -> AppConfig:
+  """Build an AppConfig from environment variables.
+
+  Used by deployed containers — the platform writes a fresh ``.env``
+  on every deploy, docker-compose passes it to the container, and the
+  app reads everything directly from there. No ``config.yaml`` file
+  involved.
+
+  Variables (all optional unless marked **required**):
+
+    SSL_SERVICE_MODE              **required** — "readonly" | "readwrite"
+    SSL_SERVICE_PG_DSN            **required**
+
+    SSL_SERVICE_ENABLE_WEB_UI     "true" | "false" (default false). When
+                                  false the admin HTTP server is not
+                                  started, so SSL_SERVICE_ADMIN_TOKEN
+                                  doesn't need to be set.
+    SSL_SERVICE_ADMIN_BIND        default "127.0.0.1"
+    SSL_SERVICE_ADMIN_PORT        default 8088
+    SSL_SERVICE_ADMIN_TOKEN       required iff ENABLE_WEB_UI=true
+
+    SSL_SERVICE_LOG_LEVEL         default INFO
+    SSL_SERVICE_ACME_EMAIL        required iff MODE=readwrite
+    SSL_SERVICE_ACME_STAGING      default false
+    SSL_SERVICE_ACME_DNS_PROVIDER default cloudflare
+    SSL_SERVICE_RENEW_BEFORE_DAYS default 30
+    SSL_SERVICE_POLL_INTERVAL_SECONDS  default 30
+  """
+  e = env if env is not None else os.environ
+
+  def _get(name: str, default: str = "") -> str:
+    v = e.get(name)
+    return default if v is None else v
+
+  def _get_int(name: str, default: int) -> int:
+    raw = e.get(name)
+    if raw is None or raw == "":
+      return default
+    try:
+      return int(raw)
+    except ValueError:
+      raise ValueError(f"{name} must be an integer (got {raw!r})") from None
+
+  mode_raw = _get("SSL_SERVICE_MODE")
+  if not mode_raw:
+    raise ValueError("SSL_SERVICE_MODE is required (readonly|readwrite)")
+  dsn = _get("SSL_SERVICE_PG_DSN")
+  if not dsn:
+    raise ValueError("SSL_SERVICE_PG_DSN is required")
+
+  config = AppConfig(
+    mode=_normalize_mode(mode_raw),
+    postgres=PostgresConfig(dsn=dsn),
+    sync=SyncConfig(
+      poll_interval_seconds=_get_int("SSL_SERVICE_POLL_INTERVAL_SECONDS", 30),
+      renew_before_days=_get_int("SSL_SERVICE_RENEW_BEFORE_DAYS", 30),
+    ),
+    paths=PathsConfig(
+      state_dir=Path(_get("SSL_SERVICE_STATE_DIR", "/app/state")),
+      log_dir=Path(_get("SSL_SERVICE_LOG_DIR", "/app/logs")),
+    ),
+    caddy=CaddyConfig(
+      admin_url=_get("SSL_SERVICE_CADDY_ADMIN_URL", "http://127.0.0.1:2019"),
+      reload_command=list(_DEFAULT_CADDY_RELOAD),
+    ),
+    acme=AcmeConfig(
+      email=_get("SSL_SERVICE_ACME_EMAIL", ""),
+      staging=_normalize_bool(_get("SSL_SERVICE_ACME_STAGING", "false")),
+      challenge_type="dns-01",
+      dns_provider=_normalize_dns_provider(
+        _get("SSL_SERVICE_ACME_DNS_PROVIDER", "cloudflare")),
+      dns_propagation_seconds=_get_int("SSL_SERVICE_ACME_DNS_PROPAGATION_SECONDS", 30),
+    ),
+    logging=LoggingConfig(
+      level=_get("SSL_SERVICE_LOG_LEVEL", "INFO"),
+    ),
+    admin=AdminConfig(
+      enabled=_normalize_bool(_get("SSL_SERVICE_ENABLE_WEB_UI", "false")),
+      bind=_get("SSL_SERVICE_ADMIN_BIND", "127.0.0.1"),
+      port=_get_int("SSL_SERVICE_ADMIN_PORT", 8088),
+      token=_get("SSL_SERVICE_ADMIN_TOKEN", ""),
+    ),
+  )
+  if config.mode == "readwrite" and not config.acme.email.strip():
+    raise ValueError("SSL_SERVICE_ACME_EMAIL is required in readwrite mode")
+  if config.admin.enabled and not config.admin.token.strip():
+    raise ValueError("SSL_SERVICE_ADMIN_TOKEN is required when "
+                     "SSL_SERVICE_ENABLE_WEB_UI=true")
+  config.admin.port = _require_int("SSL_SERVICE_ADMIN_PORT", config.admin.port, minimum=1)
+  if config.admin.port > 65535:
+    raise ValueError("SSL_SERVICE_ADMIN_PORT must be <= 65535")
   return config
 
 
