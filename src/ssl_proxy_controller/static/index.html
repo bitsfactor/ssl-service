@@ -2920,8 +2920,19 @@
       detail = resp;
     } catch (err) { toast("error", "Could not load node", err.message); return; }
 
-    // Load local SSH key list as wizard step 1 options.
+    // Load both registries:
+    //  - adminKeys: SSH keys saved in the SSH Keys channel (preferred).
+    //               Operator manages these in /#/ssh-keys; one can be
+    //               marked as the init-default. They live in the DB.
+    //  - localKeys: legacy fallback — files in the operator's local
+    //               ~/.ssh on the Mac. Useful when the operator hasn't
+    //               registered keys yet but already has them on disk.
+    let adminKeys = [];
     let localKeys = [];
+    try {
+      const r = await api("GET", "/api/ssh-keys");
+      adminKeys = r.ssh_keys || r.keys || [];
+    } catch (err) { /* non-fatal */ }
     try {
       localKeys = (await api("GET", "/api/host/ssh-keys")).keys || [];
     } catch (err) { /* non-fatal — user can paste manually */ }
@@ -2974,9 +2985,76 @@
         h("p", { class: "muted", style: "font-size: 13px; margin: 4px 0 12px" },
           "This private key will be installed at /root/.ssh/ on the target server so it can git-clone your private repos."),
       ));
+
+      // ── Section A: SSH Keys registry (the channel the user manages
+      // in the admin UI). Default is the row marked init_default.
+      if (adminKeys.length) {
+        const list = h("div", { style: "display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px" });
+        list.appendChild(h("div", { class: "muted", style: "font-size: 12px" },
+          "Pick from your ", h("strong", null, "SSH Keys"), " registry:"));
+        // Sort: init_default first, then by name.
+        const sorted = adminKeys.slice().sort((a, b) =>
+          (b.is_init_default ? 1 : 0) - (a.is_init_default ? 1 : 0)
+          || (a.name || "").localeCompare(b.name || ""));
+        for (const k of sorted) {
+          const useBtn = h("button", { class: "btn btn-sm",
+            onclick: async (e) => {
+              e.preventDefault();
+              try {
+                // GET /api/ssh-keys/{id} returns the full row including
+                // the private_key body. List endpoint masks it for
+                // safety so we have to re-fetch.
+                const full = await api("GET", `/api/ssh-keys/${k.id}`);
+                const body = full.private_key || full.private_key_pem || "";
+                if (!body) {
+                  toast("error", "Empty key body", k.name);
+                  return;
+                }
+                state.git_private_key = body;
+                document.getElementById("wiz-key").value = body;
+                toast("success", "Loaded", k.name);
+              } catch (err) { toast("error", "Failed to read", err.message); }
+            } }, k.is_init_default ? `Use ${k.name} ★` : `Use ${k.name}`);
+          if (k.is_init_default) {
+            useBtn.setAttribute("style", "background: var(--accent,#2563eb); color: white; border-color: var(--accent,#2563eb)");
+          }
+          list.appendChild(h("div", { class: "row", style: "gap: 8px; align-items: center" },
+            useBtn,
+            h("span", { class: "muted mono", style: "font-size: 11.5px" },
+              `${k.key_type || k.type || "?"}  ${k.fingerprint || ""}`),
+            k.is_init_default
+              ? h("span", { class: "badge ok", style: "font-size: 10px" }, "default")
+              : null,
+          ));
+        }
+        // Auto-fill the default on first render so the operator can
+        // just hit Next without clicking anything.
+        if (!state.git_private_key) {
+          const dflt = sorted.find((k) => k.is_init_default);
+          if (dflt) {
+            api("GET", `/api/ssh-keys/${dflt.id}`).then((full) => {
+              const body = full.private_key || full.private_key_pem || "";
+              if (body && !state.git_private_key) {
+                state.git_private_key = body;
+                const ta = document.getElementById("wiz-key");
+                if (ta && !ta.value.trim()) ta.value = body;
+              }
+            }).catch(() => {});
+          }
+        }
+        wrap.appendChild(list);
+      } else {
+        wrap.appendChild(h("div", { class: "muted", style: "font-size: 12px; margin-bottom: 8px; padding: 8px; background: var(--surface-2); border-radius: 4px" },
+          "No keys in your SSH Keys registry yet. Add one in ",
+          h("a", { href: "#/ssh-keys", style: "color: var(--accent,#2563eb)" }, "SSH Keys"),
+          " (and mark one as init-default), or pick from your Mac below."));
+      }
+
+      // ── Section B: Mac local files (legacy fallback)
       if (localKeys.length) {
         const list = h("div", { style: "display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px" });
-        list.appendChild(h("div", { class: "muted", style: "font-size: 12px" }, "Pick a key from your Mac:"));
+        list.appendChild(h("div", { class: "muted", style: "font-size: 12px; margin-top: 6px" },
+          "Or pick a file from your Mac (~/.ssh):"));
         for (const k of localKeys) {
           list.appendChild(h("div", { class: "row", style: "gap: 8px" },
             h("button", { class: "btn btn-sm", onclick: async (e) => {
@@ -2993,10 +3071,8 @@
           ));
         }
         wrap.appendChild(list);
-      } else {
-        wrap.appendChild(h("div", { class: "muted", style: "font-size: 12px; margin-bottom: 8px" },
-          "No keys auto-detected at ~/.ssh — paste one manually below."));
       }
+
       wrap.appendChild(h("div", { class: "field" },
         h("label", null, "Private key body"),
         h("textarea", { id: "wiz-key", class: "textarea mono", rows: "10",
