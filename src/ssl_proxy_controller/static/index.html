@@ -4308,11 +4308,44 @@
 
     if (manifest) {
       const required = new Set(manifest.required_env || []);
-      const sortedKeys = Array.from(envKeys).sort();
-      for (const key of sortedKeys) {
+      // Priority order: required first, then a small curated "core"
+      // group of the most-edited knobs, then everything else
+      // alphabetically. Keeps the operator's eyeballs on the values
+      // they actually need to touch — typing has-defaults stuff falls
+      // to the bottom under a hint that they can ignore it.
+      const corePriority = [
+        "SSL_SERVICE_ENABLE_WEB_UI",
+        "SSL_SERVICE_ADMIN_TOKEN",
+        "SSL_SERVICE_MODE",
+        "SSL_SERVICE_PG_DSN",
+      ];
+      const allKeys = Array.from(envKeys);
+      const requiredKeys = allKeys.filter((k) => required.has(k))
+        .sort((a, b) => corePriority.indexOf(a) - corePriority.indexOf(b)
+          || a.localeCompare(b));
+      const coreKeys = allKeys.filter((k) => !required.has(k) && corePriority.includes(k))
+        .sort((a, b) => corePriority.indexOf(a) - corePriority.indexOf(b));
+      const otherKeys = allKeys.filter((k) => !required.has(k) && !corePriority.includes(k))
+        .sort();
+
+      for (const key of requiredKeys) {
         const manifestDefault = (manifest.defaults || {})[key] || "";
-        const saved = savedEnv[key] || "";
-        buildRow(key, manifestDefault, saved, required.has(key));
+        buildRow(key, manifestDefault, savedEnv[key] || "", true);
+      }
+      for (const key of coreKeys) {
+        const manifestDefault = (manifest.defaults || {})[key] || "";
+        buildRow(key, manifestDefault, savedEnv[key] || "", false);
+      }
+      // Visual divider before the "advanced" section
+      if (otherKeys.length) {
+        envBody.appendChild(h("tr", null,
+          h("td", { colspan: "3",
+            style: "padding: 8px 0 4px; font-size: 11px; color: var(--muted); border-bottom: 1px dashed var(--border)" },
+            "Advanced (manifest defaults — usually no need to override)")));
+      }
+      for (const key of otherKeys) {
+        const manifestDefault = (manifest.defaults || {})[key] || "";
+        buildRow(key, manifestDefault, savedEnv[key] || "", false);
       }
     } else {
       // No manifest yet (new service or fetch failed) — fall back to a
