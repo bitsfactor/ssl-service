@@ -6395,11 +6395,22 @@
         stateChip));
     }
     const errorEl = h("div", { class: "muted", style: "color: var(--danger); margin-top: 8px;" });
+    // Deploy-after-publish toggle. Default ON because the typical flow
+    // is "I just changed which tokens this node serves, please apply
+    // it now" — leaving it off requires the operator to remember to
+    // hit Deploy on every affected node.
+    const deployCb = h("input", { type: "checkbox", checked: true });
     const body = h("div", null,
       h("p", { class: "muted" },
         `Pick which nodes should serve token "${token.name}". `,
-        "Pre-checked = currently assigned. Re-deploy each affected node to bake it into preset.json."),
-      list, errorEl);
+        "Pre-checked = currently assigned. With auto-deploy on, the new token list is baked into preset.json on each picked node immediately."),
+      list,
+      h("label", { class: "row", style: "gap: 6px; margin-top: 10px; align-items: center" },
+        deployCb,
+        h("span", null, "Re-deploy affected nodes after publish"),
+        h("span", { class: "muted", style: "font-size: 11px" },
+          "(uncheck if you want to batch deploys yourself)")),
+      errorEl);
 
     const footer = h("div", { class: "row", style: "gap: 8px" },
       h("div", { style: "flex: 1" }),
@@ -6407,19 +6418,26 @@
       h("button", { class: "btn btn-primary",
         onclick: async (e) => {
           e.preventDefault();
-          const picks = Array.from(list.querySelectorAll("input[type=checkbox]:checked"))
-            .map((cb) => cb.dataset.node);
+          const picks = Array.from(list.querySelectorAll("input[type=checkbox]:checked:not(:disabled)"))
+            .filter((cb) => cb !== deployCb)
+            .map((cb) => cb.dataset.node)
+            .filter(Boolean);
           if (!picks.length) {
             errorEl.textContent = "pick at least one node";
             return;
           }
           e.target.disabled = true;
-          e.target.textContent = "Publishing…";
+          e.target.textContent = deployCb.checked ? "Publishing + deploying…" : "Publishing…";
           try {
             const r = await api("POST", `/api/xout/tokens/${token.id}/publish`,
-              { nodes: picks });
+              { nodes: picks, deploy: deployCb.checked });
             const okN = (r.results || []).filter((x) => x.ok).length;
-            toast("success", "Token published", `${okN}/${picks.length} nodes`);
+            const dN  = (r.deploy_results || []).filter((x) => x.ok).length;
+            const dT  = (r.deploy_results || []).length;
+            const msg = deployCb.checked
+              ? `${okN}/${picks.length} nodes  ·  ${dN}/${dT} deploys ok`
+              : `${okN}/${picks.length} nodes  ·  remember to Deploy each one`;
+            toast("success", "Token published", msg);
             Modal.close();
             if (onDone) onDone();
           } catch (err) {

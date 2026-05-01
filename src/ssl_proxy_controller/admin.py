@@ -4462,6 +4462,11 @@ def _build_router(ctx: AdminContext) -> _Router:
     ):
       raise HttpError(HTTPStatus.BAD_REQUEST, "uuid is not a valid UUID",
                       code="invalid_uuid")
+    # xray and most VLESS clients expect lowercase UUIDs; mixed-case is
+    # legal RFC4122 but causes spurious 'unknown user' errors when the
+    # subscription URL has a different case from the server's stored
+    # value. Normalize on insert so we never have to reason about it.
+    uuid = uuid.lower()
     password = (p.get("password") or "").strip() or None
     try:
       quota = int(p.get("monthly_quota_gb") or 1000)
@@ -4674,12 +4679,14 @@ def _build_router(ctx: AdminContext) -> _Router:
 
   def xout_tokens_publish_handler(request: _Request) -> _Response:
     """Mark this token as provisioned on the requested nodes.
-    Body: {nodes: [...]}.
-    Idempotent — token's UUID is stable so existing client subscriptions
-    keep working. After this writes the junction rows, the operator
-    triggers a re-deploy on each affected node (the deploy step bakes
-    every assigned token into the rendered preset.json's vless inbound
-    user list)."""
+    Body: ``{nodes: [...], deploy: true|false}`` (deploy defaults to
+    false). Idempotent — token's UUID is stable so existing client
+    subscriptions keep working.
+
+    With ``deploy: true`` we also re-run the per-node deploy step so
+    the new token is baked into ``/data/preset.json`` immediately.
+    Without it, the publish only writes the junction rows and the
+    operator must trigger Deploy on each affected node manually."""
     _require_readwrite(ctx)
     tid = int(request.path_params["id"])
     token = ctx.database.get_xout_token(tid)
@@ -4692,17 +4699,58 @@ def _build_router(ctx: AdminContext) -> _Router:
       raise HttpError(HTTPStatus.BAD_REQUEST,
                       "nodes must be a non-empty list",
                       code="nodes_required")
+    auto_deploy = bool(p.get("deploy"))
+    seen_pub: set[str] = set()
     out = []
     for n in raw_nodes:
       nn = _normalize_node_name(str(n))
+      if nn in seen_pub: continue
+      seen_pub.add(nn)
       if ctx.database.get_node(nn) is None:
         out.append({"node": nn, "ok": False, "error": "node not found"})
         continue
       ctx.database.upsert_xout_node_token(nn, tid)
       out.append({"node": nn, "ok": True})
+
+    deploy_results: list[dict] = []
+    if auto_deploy:
+      # Trigger per-node deploy via the same code path as the Deploy
+      # button. Each one re-renders preset.json with the freshly-assigned
+      # token list. We swallow per-node failures into the result so a
+      # single bad node doesn't 500 the publish.
+      ok_nodes = [r["node"] for r in out if r["ok"]]
+      for nn in ok_nodes:
+        try:
+          a = ctx.database.get_xout_assignment(nn)
+          if a is None:
+            deploy_results.append({"node": nn, "ok": False,
+                                    "error": "no preset assigned"})
+            continue
+          preset = ctx.database.get_xout_preset(a["preset_id"])
+          if preset is None:
+            deploy_results.append({"node": nn, "ok": False,
+                                    "error": "preset gone"})
+            continue
+          import json as _json
+          resolved_inbounds = _xout_resolve_preset(preset, node_name=nn)
+          dr = deploy_service_to_nodes(ctx, "xout", {
+            "nodes": [nn], "triggered_by": "token-publish",
+            "extra_files": {"data/preset.json": _json.dumps(resolved_inbounds, indent=2)},
+          })
+          first = ((dr or {}).get("results") or [{}])[0]
+          deploy_results.append({"node": nn, "ok": bool(first.get("ok")),
+                                  "exit_code": first.get("exit_code"),
+                                  "error": first.get("error")})
+        except Exception as exc:
+          deploy_results.append({"node": nn, "ok": False, "error": str(exc)[:200]})
+
     return _json_response(HTTPStatus.OK, {
-      "token_id": tid, "results": out,
-      "message": "Token recorded on selected nodes. Deploy each from the Xout channel to bake it into preset.json.",
+      "token_id": tid,
+      "results": out,
+      "deploy_results": deploy_results,
+      "message": ("Token recorded + redeployed on selected nodes."
+                  if auto_deploy
+                  else "Token recorded on selected nodes. Deploy each from the Xout channel to bake it into preset.json."),
     })
 
   def xout_node_traffic_summary_handler(request: _Request) -> _Response:
@@ -4879,12 +4927,12 @@ def _build_router(ctx: AdminContext) -> _Router:
           "  if [ -f \"$f\" ]; then cat \"$f\"; exit 0; fi; "
           "done; echo '{}'"
         )
-        rc = nodes_mod.run_command(node, cmd, timeout=15.0,
+        rc = nodes_mod.run_command(node, cmd, timeout=30.0,
                                     linked_keys=_ssh_credentials_for_node(ctx, nn))
       except Exception as exc:
         results.append({"node": nn, "ok": False, "error": str(exc)[:200]})
         continue
-      raw = (rc.stdout or "").strip() or "{}"
+      raw = (rc.stdout or "").strip() or "[]"
       try:
         data = json.loads(raw)
       except Exception:
@@ -4894,11 +4942,26 @@ def _build_router(ctx: AdminContext) -> _Router:
                         "error": f"could not parse preset on node ({len(raw)} bytes)"})
         continue
 
+      # The on-disk shape is a JSON ARRAY of inbound objects (entrypoint
+      # writes it that way; see scripts/container-entrypoint.sh).
+      # Some older internal callers pass {"inbounds":[...]} so support
+      # both — list-shape unwraps to itself, dict-shape unwraps via key.
+      if isinstance(data, list):
+        inbounds_list = data
+      elif isinstance(data, dict):
+        inbounds_list = data.get("inbounds") or []
+      else:
+        results.append({"node": nn, "ok": False,
+                        "error": f"unexpected preset shape: {type(data).__name__}"})
+        continue
+
       uuids_present: set[str] = set()
-      for ib in (data.get("inbounds") or []):
+      for ib in inbounds_list:
+        if not isinstance(ib, dict): continue
         if ib.get("protocol") != "vless":
           continue
         for u in (ib.get("users") or []):
+          if not isinstance(u, dict): continue
           uid = (u.get("uuid") or "").strip()
           if uid:
             uuids_present.add(uid)
@@ -4918,10 +4981,7 @@ def _build_router(ctx: AdminContext) -> _Router:
       # node. The stored preset has placeholders (e.g. public_key:
       # "auto"); the resolved file has the real generated values, so
       # only it produces working subscription URIs.
-      resolved_preset = {
-        "name": (data.get("name") or "resolved"),
-        "inbounds": data.get("inbounds") or [],
-      }
+      resolved_preset = {"name": "resolved", "inbounds": inbounds_list}
       for tok in tokens_for_this_node:
         subs = _build_subscriptions_for_token(
           tok, {nn: {"node": node, "preset": resolved_preset}},
