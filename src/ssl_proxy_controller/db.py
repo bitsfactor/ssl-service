@@ -2852,9 +2852,17 @@ class Database:
   def set_default_xout_token(self, token_id: int) -> dict | None:
     """Mark exactly this row as the default; clear it on every other row.
     Used by 'newly-deployed xout instance seeds the first user from the
-    default token' and by the operator's explicit toggle in the UI."""
+    default token' and by the operator's explicit toggle in the UI.
+
+    Two operators clicking 'Set default' on different tokens at the
+    same time would race against the partial unique index — losing
+    transaction would error. We grab a transaction-scoped advisory
+    lock first so the second caller waits instead of failing."""
     with self.connect() as connection:
       with connection.cursor() as cursor:
+        # Lock key chosen by hashing a stable string; same hashtext()
+        # call for every caller so they all serialize on the same lock.
+        cursor.execute("SELECT pg_advisory_xact_lock(hashtext('xout_tokens.is_default'))")
         cursor.execute("UPDATE xout_tokens SET is_default = FALSE WHERE is_default")
         cursor.execute(
           f"""UPDATE xout_tokens SET is_default = TRUE, updated_at = NOW()

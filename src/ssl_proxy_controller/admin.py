@@ -4098,15 +4098,23 @@ def _build_router(ctx: AdminContext) -> _Router:
     for ib in (preset.get("inbounds") or []):
       ib2 = dict(ib)
       ib2["outbound"] = _xout_resolve_outbound(ib.get("outbound") or {"type": "direct"})
-      if ib2.get("protocol") == "vless" and tokens_for_node:
-        # Replace whatever the preset's users field said with the
-        # platform-tracked token list. Stable UUIDs = client subs survive
-        # across redeploys.
-        ib2["users"] = [
-          {"name": t.get("token_name") or "user",
-           "uuid": t.get("token_uuid") or t.get("uuid")}
-          for t in tokens_for_node
-        ]
+      if ib2.get("protocol") == "vless":
+        if tokens_for_node:
+          # Replace whatever the preset's users field said with the
+          # platform-tracked token list. Stable UUIDs = client subs
+          # survive across redeploys.
+          ib2["users"] = [
+            {"name": t.get("token_name") or "user",
+             "uuid": t.get("token_uuid") or t.get("uuid")}
+            for t in tokens_for_node
+          ]
+        elif not (ib2.get("users") or []):
+          # Empty users[] makes xray reject the inbound at startup.
+          # Synthesize a placeholder so the container at least starts
+          # — the entrypoint resolves the "auto" UUID into a stable one
+          # via /data/auto-secrets.json on first run. Operator can then
+          # publish a real token and redeploy.
+          ib2["users"] = [{"name": "default", "uuid": "auto"}]
       out.append(ib2)
     return out
 
@@ -4451,9 +4459,13 @@ def _build_router(ctx: AdminContext) -> _Router:
     _require_readwrite(ctx)
     p = request.json_body() or {}
     name = (p.get("name") or "").strip()
-    if not name or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", name):
+    # Allow alphanum + . _ - @ so the operator can use email-style
+    # identifiers (alice@team.example, alice.work). The character must
+    # be ASCII so it survives shell interpolation in the deploy step.
+    # Reject leading punctuation so logs don't get hidden by ANSI tricks.
+    if not name or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,63}$", name):
       raise HttpError(HTTPStatus.BAD_REQUEST,
-                      "name is required and must be alphanumeric (with - or _)",
+                      "name must be 1-64 chars: alphanumeric, dot, underscore, hyphen, @ — and start alphanumeric",
                       code="invalid_name")
     uuid = (p.get("uuid") or "").strip() or _gen_uuid_str()
     if not re.match(
@@ -4519,8 +4531,10 @@ def _build_router(ctx: AdminContext) -> _Router:
     fields: dict[str, Any] = {}
     if "name" in p:
       n = (p["name"] or "").strip()
-      if not n or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", n):
-        raise HttpError(HTTPStatus.BAD_REQUEST, "invalid name", code="invalid_name")
+      if not n or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,63}$", n):
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        "name must be 1-64 chars: alphanumeric, dot, underscore, hyphen, @ — and start alphanumeric",
+                        code="invalid_name")
       fields["name"] = n
     if "password" in p:
       fields["password"] = (p["password"] or "").strip() or None
@@ -4856,6 +4870,19 @@ def _build_router(ctx: AdminContext) -> _Router:
         r'"name"\s*:\s*"user>>>([^>"]+)>>>traffic>>>(uplink|downlink)"\s*,\s*"value"\s*:\s*"?(\d+)"?',
       )
       matches = stat_re.findall(out)
+      # If we got NO matches and the output looks like an error
+      # (mentions 'connect', 'refused', 'permission', or 'Error:'),
+      # bubble that up instead of silently reporting 0/0.
+      if not matches:
+        low = out.lower()
+        if any(kw in low for kw in ("connect: connection refused",
+                                     "permission denied",
+                                     "error:", "rpc error", "no such container")):
+          # Trim long stderr to ~300 chars so the response stays small.
+          msg = out.strip()[:300]
+          results.append({"node": nn, "ok": False,
+                          "error": f"xray stats unavailable: {msg}"})
+          continue
       # Aggregate per (token, direction)
       per_token: dict[str, dict[str, int]] = {}
       for tname, direction, val in matches:

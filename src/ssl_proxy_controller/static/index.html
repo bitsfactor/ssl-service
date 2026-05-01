@@ -5961,9 +5961,9 @@
         h("th", null, "UUID"),
         h("th", null, "Default"),
         h("th", null, "Nodes"),
-        h("th", null, "This month"),
+        h("th", { title: "Traffic since the most recent monthly reset day per token" }, "Cycle"),
         h("th", null, "Total"),
-        h("th", null, "Quota"),
+        h("th", { title: "Monthly quota (GB) / reset day-of-month" }, "Quota"),
         h("th", null, ""))));
       const tb = h("tbody");
       for (const t of tokens) {
@@ -5982,7 +5982,9 @@
             overQuota ? "var(--danger)" : (monthPct > 80 ? "var(--warning,#d97706)" : "var(--accent,#2563eb)")
           };`
         }));
-        const monthCell = h("div", null,
+        const monthCell = h("div", {
+          title: t.cycle_start ? `Cycle started ${t.cycle_start}` : ""
+        },
           h("div", { class: "mono", style: "font-size: 12px" },
             fmtXoutBytes(monthBytes), " / ", quotaGB > 0 ? `${quotaGB} GB` : "∞"),
           usageBar);
@@ -6467,10 +6469,26 @@
     }
     body.innerHTML = "";
 
+    const nodeCount = (r.nodes || []).length;
+    const cachedN = (r.nodes_cached || []).length;
+    const uncachedN = (r.nodes_uncached || []).length;
     const summary = h("div", { class: "row", style: "gap: 12px; margin-bottom: 10px; flex-wrap: wrap" },
       h("strong", null, `${(r.raw || []).length} URIs`),
-      h("span", { class: "muted" }, `across ${(r.nodes || []).length} node${(r.nodes || []).length === 1 ? "" : "s"}`));
+      h("span", { class: "muted" }, `across ${nodeCount} node${nodeCount === 1 ? "" : "s"}`),
+      cachedN ? h("span", { class: "badge ok", style: "font-size: 11px",
+        title: "Subscription was rebuilt from the on-disk resolved preset (real Reality keys)" },
+        `${cachedN} synced`) : null,
+      uncachedN ? h("span", { class: "badge", style: "font-size: 11px",
+        title: "On-the-fly fallback used — VLESS URIs may be skipped if the preset still has 'auto' Reality keys. Run 'Sync tokens' to populate the cache." },
+        `${uncachedN} on-the-fly`) : null,
+    );
     body.appendChild(summary);
+    if (!nodeCount) {
+      body.appendChild(h("div", { class: "muted", style: "padding: 12px; background: var(--surface-2); border-radius: 6px; margin-bottom: 10px" },
+        "This token isn't published to any node yet. Click ",
+        h("strong", null, "Publish"),
+        " on the row to assign it to one or more deployed xout nodes."));
+    }
 
     const mkSection = (label, content, isYaml) => {
       const ta = h("textarea", {
