@@ -3676,10 +3676,111 @@ def _build_router(ctx: AdminContext) -> _Router:
         "uuid": ob_uuid, "sni": ob_sni, "pubkey": ob_pub,
         "short_id": str(ob.get("short_id") or ""),
       }
+    elif ob_type == "static_ip":
+      try: sid = int(ob.get("static_ip_id") or 0)
+      except (TypeError, ValueError): sid = 0
+      if sid <= 0:
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"inbound[{idx}].outbound.static_ip_id is required",
+                        code="invalid_inbound")
+      out["outbound"] = {"type": "static_ip", "static_ip_id": sid}
+    elif ob_type == "xout_inbound":
+      target_node = (ob.get("node_name") or "").strip()
+      target_tag  = (ob.get("inbound_tag") or "").strip()
+      if not target_node or not target_tag:
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"inbound[{idx}].outbound.node_name + inbound_tag required",
+                        code="invalid_inbound")
+      out["outbound"] = {
+        "type": "xout_inbound",
+        "node_name": target_node,
+        "inbound_tag": target_tag,
+      }
     else:
       raise HttpError(HTTPStatus.BAD_REQUEST,
-                      f"inbound[{idx}].outbound.type must be direct/http/socks/vless",
+                      f"inbound[{idx}].outbound.type must be direct/http/socks/vless/static_ip/xout_inbound",
                       code="invalid_inbound")
+    return out
+
+  def _xout_resolve_outbound(ob: dict) -> dict:
+    """Expand referential outbound types (static_ip, xout_inbound) into
+    their concrete {host, port, type, ...} shape using current DB state.
+    Called per-deploy so the rendered preset.json reflects the latest
+    addresses / credentials. Direct / explicit http/socks/vless are
+    returned unchanged."""
+    if not isinstance(ob, dict):
+      return {"type": "direct"}
+    t = ob.get("type")
+    if t == "static_ip":
+      sid = int(ob.get("static_ip_id") or 0)
+      rec = ctx.database.get_static_ip(sid)
+      if rec is None:
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"outbound static_ip_id={sid} not found",
+                        code="outbound_unresolved")
+      proto = (rec.protocol or "").lower()
+      if proto in ("socks", "socks5"):
+        out_type = "socks"
+      elif proto in ("http", "https"):
+        out_type = "http"
+      else:
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"static_ip {sid} protocol '{rec.protocol}' is not pickable as an outbound (need http/socks)",
+                        code="outbound_unresolved")
+      if not rec.port or not (1 <= rec.port <= 65535):
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"static_ip {sid} has no usable port",
+                        code="outbound_unresolved")
+      return {"type": out_type, "host": rec.ip, "port": int(rec.port), "user": "", "pass": ""}
+    if t == "xout_inbound":
+      target_node = ob.get("node_name") or ""
+      target_tag  = ob.get("inbound_tag") or ""
+      a = ctx.database.get_xout_assignment(target_node)
+      if a is None:
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"node {target_node!r} has no xout preset assigned",
+                        code="outbound_unresolved")
+      p = ctx.database.get_xout_preset(a["preset_id"])
+      if p is None:
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"xout preset {a['preset_id']} (assigned to {target_node}) is gone",
+                        code="outbound_unresolved")
+      target_ib = next((i for i in (p["inbounds"] or [])
+                        if i.get("tag") == target_tag), None)
+      if target_ib is None:
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"inbound tag {target_tag!r} not found on {target_node}",
+                        code="outbound_unresolved")
+      proto = target_ib.get("protocol")
+      if proto not in ("http", "socks"):
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"only http/socks xout inbounds are pickable as outbounds (got {proto})",
+                        code="outbound_unresolved")
+      node = ctx.database.get_node(target_node)
+      if node is None:
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"node {target_node!r} not found",
+                        code="outbound_unresolved")
+      auth = target_ib.get("auth") or {}
+      return {
+        "type": proto,
+        "host": node.host,
+        "port": int(target_ib.get("port") or 0),
+        "user": str(auth.get("user") or ""),
+        "pass": str(auth.get("pass") or ""),
+      }
+    # direct / http / socks / vless — already concrete
+    return ob
+
+  def _xout_resolve_preset(preset: dict) -> list[dict]:
+    """Walk preset['inbounds'] and replace each referential outbound
+    with its concrete form. Returns a fresh list (the saved preset
+    keeps the references)."""
+    out: list[dict] = []
+    for ib in (preset.get("inbounds") or []):
+      ib2 = dict(ib)
+      ib2["outbound"] = _xout_resolve_outbound(ib.get("outbound") or {"type": "direct"})
+      out.append(ib2)
     return out
 
   def _xout_normalize_inbounds(raw: Any) -> list[dict]:
@@ -3771,9 +3872,10 @@ def _build_router(ctx: AdminContext) -> _Router:
   def xout_node_deploy_handler(request: _Request) -> _Response:
     """Deploy xout to one node using the chosen preset.
     Body: {preset_id: int}
-    Renders the preset's inbounds as /opt/xout/data/preset.json on the
-    target, then runs the standard deploy_service_to_nodes flow with
-    extra_files set."""
+    Resolves any referential outbounds (static_ip, xout_inbound) to their
+    concrete addresses, renders the inbounds array as
+    /opt/xout/data/preset.json on the target, then runs the standard
+    deploy_service_to_nodes flow with extra_files set."""
     _require_readwrite(ctx)
     node_name = _normalize_node_name(request.path_params["node_name"])
     n = ctx.database.get_node(node_name)
@@ -3795,11 +3897,12 @@ def _build_router(ctx: AdminContext) -> _Router:
     # preset even if deploy is still mid-flight.
     ctx.database.upsert_xout_assignment(node_name, preset_id, applied_by="admin")
 
-    # Hand off to deploy_service_to_nodes. It builds the deploy script;
-    # we extend it via the deploy_service_to_nodes payload's extra_files
-    # to drop preset.json into install_dir/data/preset.json.
+    # Expand referential outbounds (static_ip / xout_inbound) NOW so the
+    # rendered preset.json carries concrete host/port/auth.
+    resolved_inbounds = _xout_resolve_preset(preset)
+
     import json as _json
-    preset_json = _json.dumps(preset["inbounds"], indent=2)
+    preset_json = _json.dumps(resolved_inbounds, indent=2)
     return _json_response(HTTPStatus.OK, deploy_service_to_nodes(
       ctx, "xout", {
         "nodes": [node_name],
@@ -3807,6 +3910,58 @@ def _build_router(ctx: AdminContext) -> _Router:
         "extra_files": {"data/preset.json": preset_json},
       },
     ))
+
+  def xout_outbound_targets_handler(_request: _Request) -> _Response:
+    """Unified picker source for the per-inbound Outbound editor: lists
+    every static IP from the registry that is usable as an upstream proxy
+    (http/socks) plus every http/socks inbound that another xout node is
+    currently serving (resolved via xout_node_assignments). VLESS chains
+    aren't auto-pickable because the upstream's Reality public key is
+    auto-generated on the node and not stored in our DB — those still
+    work via the manual editor."""
+    out: list[dict] = []
+    # 1) Static IPs in the registry
+    for ip in ctx.database.list_static_ips():
+      proto = (ip.protocol or "").lower()
+      if proto not in ("http", "https", "socks", "socks5"):
+        continue
+      pick_type = "socks" if proto in ("socks", "socks5") else "http"
+      label_parts = [f"{ip.ip}:{ip.port if ip.port else '?'}"]
+      if ip.country: label_parts.append(ip.country)
+      if ip.label: label_parts.append(ip.label)
+      out.append({
+        "kind": "static_ip",
+        "id": ip.id,
+        "label": " · ".join(label_parts) + f"  ({pick_type})",
+        "protocol": pick_type,
+        "host": ip.ip,
+        "port": ip.port,
+      })
+    # 2) Xout inbounds that are currently assigned to nodes
+    assignments = ctx.database.list_xout_assignments()
+    presets_by_id = {p["id"]: p for p in ctx.database.list_xout_presets()}
+    for a in assignments:
+      p = presets_by_id.get(a["preset_id"])
+      if p is None: continue
+      node = ctx.database.get_node(a["node_name"])
+      if node is None: continue
+      for ib in (p["inbounds"] or []):
+        if ib.get("protocol") not in ("http", "socks"):
+          continue  # vless not auto-pickable (reality pubkey not in DB)
+        auth = ib.get("auth") or {}
+        out.append({
+          "kind": "xout_inbound",
+          "node_name": node.name,
+          "inbound_tag": ib.get("tag"),
+          "preset_name": p["name"],
+          "label": f"{node.name}:{ib.get('port')} ({ib.get('protocol')})  via preset '{p['name']}' / {ib.get('tag')}"
+                   + (" [auth]" if auth.get("user") else ""),
+          "protocol": ib.get("protocol"),
+          "host": node.host,
+          "port": ib.get("port"),
+          "has_auth": bool(auth.get("user")),
+        })
+    return _json_response(HTTPStatus.OK, {"targets": out})
 
   def service_deployments_handler(request: _Request) -> _Response:
     limit = max(1, min(request.query_int("limit", 50), 500))
@@ -4224,6 +4379,7 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("DELETE", "/api/xout/presets/{preset_id}",     with_auth(xout_presets_delete_handler))
   router.add("GET",    "/api/xout/nodes",                   with_auth(xout_nodes_list_handler))
   router.add("POST",   "/api/xout/nodes/{node_name}/deploy", with_auth(xout_node_deploy_handler))
+  router.add("GET",    "/api/xout/outbound-targets",         with_auth(xout_outbound_targets_handler))
   router.add("GET",  "/api/services/{name}/nodes/{node_name}/config",
              with_auth(service_node_config_get_handler))
   router.add("PUT",  "/api/services/{name}/nodes/{node_name}/config",

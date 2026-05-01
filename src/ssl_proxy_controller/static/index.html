@@ -5662,6 +5662,14 @@
 
   // Modal: create or edit a preset (multi-inbound editor).
   async function openXoutPresetEditor(existing, onDone) {
+    // Pre-load picker target list (static IPs + sibling xout inbounds)
+    // so the per-inbound Outbound dropdowns render synchronously.
+    try {
+      const r = await api("GET", "/api/xout/outbound-targets");
+      window._xoutTargets = (r && r.targets) || [];
+    } catch (_) {
+      window._xoutTargets = [];
+    }
     const body = h("div");
     const nameInput = h("input", { type: "text", value: existing ? existing.name : "",
       placeholder: "preset name (unique)", style: "width: 100%; padding: 6px 8px;" });
@@ -5712,17 +5720,29 @@
       const fieldsBox = h("div");
       row.appendChild(fieldsBox);
 
-      // Outbound box
-      const obSel = h("select", { style: "padding: 4px 6px" });
-      for (const t of ["direct", "http", "socks", "vless"]) {
-        const o = h("option", { value: t }, t);
-        if (((seed.outbound || {}).type || "direct") === t) o.selected = true;
+      // Outbound box — visible header + picker types for static IPs and
+      // already-deployed xout inbounds (resolved server-side at deploy
+      // time so addresses + auth stay current).
+      const obTypes = [
+        ["direct",        "Direct (no chain)"],
+        ["static_ip",     "Pick from Static IPs"],
+        ["xout_inbound",  "Pick from another Xout node"],
+        ["http",          "Manual: HTTP proxy"],
+        ["socks",         "Manual: SOCKS proxy"],
+        ["vless",         "Manual: VLESS+Reality"],
+      ];
+      const obSel = h("select", { style: "padding: 4px 6px; min-width: 240px" });
+      const seedObType = (seed.outbound || {}).type || "direct";
+      for (const [v, label] of obTypes) {
+        const o = h("option", { value: v }, label);
+        if (seedObType === v) o.selected = true;
         obSel.appendChild(o);
       }
       const obFieldsBox = h("div");
-      const obBox = h("div", { style: "border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px" },
-        h("div", { class: "row", style: "gap: 8px; align-items: center" },
-          h("span", { class: "muted", style: "font-size: 11px" }, "Outbound"), obSel),
+      const obBox = h("div", { style: "border-top: 1px dashed var(--border); margin-top: 10px; padding-top: 8px; background: var(--surface); padding: 8px; border-radius: 4px" },
+        h("div", { class: "row", style: "gap: 8px; align-items: center; margin-bottom: 4px" },
+          h("strong", { style: "font-size: 12px; color: var(--accent)" }, "Outbound (出口)"),
+          obSel),
         obFieldsBox);
       row.appendChild(obBox);
 
@@ -5772,6 +5792,15 @@
               pubkey: state.obFields.pubkey.value.trim(),
               short_id: state.obFields.short_id.value.trim(),
             };
+          } else if (obType === "static_ip") {
+            const sid = parseInt((state.obFields.pick && state.obFields.pick.value) || "0", 10);
+            out.outbound = { type: "static_ip", static_ip_id: sid };
+          } else if (obType === "xout_inbound") {
+            const v = (state.obFields.pick && state.obFields.pick.value) || "";
+            const sepIdx = v.indexOf("||");
+            const node_name = sepIdx >= 0 ? v.slice(0, sepIdx) : "";
+            const inbound_tag = sepIdx >= 0 ? v.slice(sepIdx + 2) : "";
+            out.outbound = { type: "xout_inbound", node_name, inbound_tag };
           }
           return out;
         },
@@ -5850,6 +5879,48 @@
           obFieldsBox.appendChild(h("div", { class: "row", style: "gap: 6px; margin-top: 4px" },
             h("span", { class: "muted", style: "font-size: 11px; min-width: 80px" }, "Reality"), sni, pubkey, short_id));
           state.obFields = { host, port, uuid, sni, pubkey, short_id };
+        } else if (t === "static_ip") {
+          const pick = h("select", { style: "padding: 4px 6px; flex: 1" });
+          const opts = (window._xoutTargets || []).filter(x => x.kind === "static_ip");
+          if (!opts.length) {
+            pick.appendChild(h("option", { value: "" }, "(no static IPs registered with http/socks protocol)"));
+          } else {
+            const cur = String(sob.static_ip_id || "");
+            for (const o of opts) {
+              const opt = h("option", { value: String(o.id) }, o.label);
+              if (cur === String(o.id)) opt.selected = true;
+              pick.appendChild(opt);
+            }
+          }
+          obFieldsBox.appendChild(h("div", { class: "row", style: "gap: 6px; margin-top: 4px" },
+            h("span", { class: "muted", style: "font-size: 11px; min-width: 80px" }, "Static IP"), pick));
+          obFieldsBox.appendChild(h("div", { class: "muted", style: "font-size: 11px; margin-top: 4px" },
+            "Resolves to {host, port, protocol} from the Static IPs registry at deploy time. ",
+            "Manage entries on the Static IPs page."));
+          state.obFields = { pick };
+        } else if (t === "xout_inbound") {
+          const pick = h("select", { style: "padding: 4px 6px; flex: 1" });
+          const opts = (window._xoutTargets || []).filter(x => x.kind === "xout_inbound");
+          if (!opts.length) {
+            pick.appendChild(h("option", { value: "" }, "(no other xout nodes have http/socks inbounds yet)"));
+          } else {
+            const curKey = `${sob.node_name || ""}||${sob.inbound_tag || ""}`;
+            // Separator "||" — node names + inbound tags only allow
+            // alphanumerics + . _ - so "||" cannot appear naturally.
+            for (const o of opts) {
+              const v = `${o.node_name}||${o.inbound_tag}`;
+              const opt = h("option", { value: v }, o.label);
+              if (curKey === v) opt.selected = true;
+              pick.appendChild(opt);
+            }
+          }
+          obFieldsBox.appendChild(h("div", { class: "row", style: "gap: 6px; margin-top: 4px" },
+            h("span", { class: "muted", style: "font-size: 11px; min-width: 80px" }, "Xout node"), pick));
+          obFieldsBox.appendChild(h("div", { class: "muted", style: "font-size: 11px; margin-top: 4px" },
+            "Chains through another xout deployment's inbound. Resolves to ",
+            h("span", {class: "mono"}, "node_host:inbound_port"),
+            " + that inbound's auth at deploy time."));
+          state.obFields = { pick };
         }
       };
       obSel.addEventListener("change", renderObFields);
