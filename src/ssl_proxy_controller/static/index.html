@@ -2933,11 +2933,17 @@
       aiKeys = r.ai_api_keys || r.keys || [];
     } catch (err) { /* non-fatal */ }
 
+    // Default git identity to node name + bitsfactor.com email when
+    // the node has no stored override. Operator can still edit them
+    // in step 4 — these are just sensible defaults so the operator
+    // doesn't have to type anything for a typical bitsfactor box.
+    const _nodeId = (node.name || "").trim();
     const state = {
       step: 1,
       git_private_key: detail.init_git_private_key || "",
-      git_user_name: detail.init_git_user_name || "",
-      git_user_email: detail.init_git_user_email || "",
+      git_user_name: detail.init_git_user_name || _nodeId,
+      git_user_email: detail.init_git_user_email
+        || (_nodeId ? `${_nodeId}@bitsfactor.com` : ""),
       desired_ssh_port: detail.init_desired_ssh_port || 60101,
       install_codex: detail.init_install_codex !== false,
       codex_base_url: detail.init_codex_base_url || "",
@@ -3183,8 +3189,12 @@
     function renderGitIdentityStep() {
       wrap.appendChild(h("div", { class: "field" },
         h("label", null, "Step 4 · Git identity"),
-        h("p", { class: "muted", style: "font-size: 13px; margin: 4px 0 12px" },
-          "Used by `git config --global user.name` / `user.email` on the server. The git.sh script auto-detects from GitHub if blank."),
+        h("p", { class: "muted", style: "font-size: 13px; margin: 4px 0 4px" },
+          "Used by `git config --global user.name` / `user.email` on the server."),
+        h("div", { class: "muted", style: "font-size: 12px; margin: 4px 0 12px; padding: 8px 10px; background: var(--surface-2); border-radius: 4px; line-height: 1.6" },
+          "Pre-filled from the node name (e.g. ",
+          h("span", { class: "mono", style: "font-size: 11px" }, node.name + " / " + node.name + "@bitsfactor.com"),
+          "). You can override below or clear them — empty fields fall back to git.sh's auto-detection (server's existing config, or GitHub username + noreply email).")
       ));
       wrap.appendChild(h("div", { class: "form-row" },
         h("div", { class: "field" },
