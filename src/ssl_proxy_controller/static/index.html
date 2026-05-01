@@ -4914,7 +4914,7 @@
                       toast("success", "Init default updated", `'${k.name}' is now the init default`);
                       renderAiKeysView(root);
                     } catch (err) { toast("error", "Failed", err.message); }
-                  } }, "Set init default")
+                  } }, "Set Default")
               : null,
             h("button", { class: "btn btn-sm danger",
               onclick: async () => {
@@ -5087,7 +5087,7 @@
               renderSshKeysView(document.getElementById("view-root"));
             } catch (err) { toast("error", "Failed", err.message); }
           }
-        }, "Set init default"));
+        }, "Set Default"));
       }
       actions.appendChild(h("button", { class: "btn btn-sm danger",
         onclick: () => confirmDeleteSshKey(k)
