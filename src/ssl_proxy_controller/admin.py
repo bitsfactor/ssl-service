@@ -3963,6 +3963,144 @@ def _build_router(ctx: AdminContext) -> _Router:
         })
     return _json_response(HTTPStatus.OK, {"targets": out})
 
+  def xout_node_test_handler(request: _Request) -> _Response:
+    """End-to-end proxy traffic check on the actual deployed node.
+    For each http/socks inbound: ssh in and run ``curl`` through it
+    (with the inbound's configured auth) to a known reachable URL.
+    For VLESS: TCP-handshake the port (a real Reality client test would
+    need a local Xray client — out of scope, but the listening-socket
+    check catches the most common 'container restart loop' failure).
+
+    Returns: {results: [{tag, protocol, port, ok, http_code,
+    latency_ms, error, kind}]} where kind is one of 'proxy_get' /
+    'tcp_handshake'."""
+    _require_readwrite(ctx)
+    node_name = _normalize_node_name(request.path_params["node_name"])
+    n = ctx.database.get_node(node_name)
+    if n is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {node_name}",
+                      code="node_not_found")
+    a = ctx.database.get_xout_assignment(node_name)
+    if a is None:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      f"node {node_name} has no xout preset assigned",
+                      code="no_assignment")
+    preset = ctx.database.get_xout_preset(a["preset_id"])
+    if preset is None:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      f"preset {a['preset_id']} (assigned to {node_name}) is gone",
+                      code="preset_not_found")
+
+    # Re-resolve outbounds so we use current static_ip / xout_inbound
+    # values — the preset itself only stores references.
+    resolved = _xout_resolve_preset(preset)
+
+    payload = request.json_body() if request.body else {}
+    test_url = (payload.get("url") or "http://www.gstatic.com/generate_204").strip()
+    if not re.match(r"^https?://[a-zA-Z0-9.\-/_:%?=&]+$", test_url):
+      raise HttpError(HTTPStatus.BAD_REQUEST, "url is not a plain http(s) URL",
+                      code="invalid_url")
+
+    import shlex as _shlex
+    # Marker — we sandwich each test's output between BEGIN_<tag> /
+    # END_<tag> so the parser can demultiplex even if curl produces
+    # weird output.
+    parts: list[str] = ["set -u", "PATH=/usr/bin:/usr/sbin:/bin:/sbin:$PATH"]
+    expected: list[dict] = []
+    for ib in resolved:
+      tag = ib.get("tag", "")
+      proto = ib.get("protocol", "")
+      port = int(ib.get("port") or 0)
+      auth = ib.get("auth") or {}
+      auth_arg = ""
+      if auth.get("user"):
+        u = _shlex.quote(str(auth.get("user", "")))
+        p = _shlex.quote(str(auth.get("pass", "")))
+        auth_arg = f"--proxy-user {u}:{p}"
+      parts.append(f'echo "===BEGIN===<{tag}>"')
+      if proto == "http":
+        parts.append(
+          f'curl -sx http://127.0.0.1:{port} {auth_arg} '
+          f'-o /dev/null -w "http_code=%{{http_code}} time_ms=%{{time_total}}" '
+          f'-m 10 {_shlex.quote(test_url)} 2>&1; echo " curl_exit=$?"')
+        expected.append({"tag": tag, "protocol": "http", "port": port, "kind": "proxy_get"})
+      elif proto == "socks":
+        parts.append(
+          f'curl -s --socks5 127.0.0.1:{port} {auth_arg} '
+          f'-o /dev/null -w "http_code=%{{http_code}} time_ms=%{{time_total}}" '
+          f'-m 10 {_shlex.quote(test_url)} 2>&1; echo " curl_exit=$?"')
+        expected.append({"tag": tag, "protocol": "socks", "port": port, "kind": "proxy_get"})
+      elif proto == "vless":
+        parts.append(
+          f'(timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/{port}" '
+          f'&& echo "tcp_listen=ok") || echo "tcp_listen=fail exit=$?"')
+        expected.append({"tag": tag, "protocol": "vless", "port": port, "kind": "tcp_handshake"})
+      else:
+        parts.append(f'echo "skipped: unsupported protocol {proto}"')
+        expected.append({"tag": tag, "protocol": proto, "port": port, "kind": "skipped"})
+      parts.append(f'echo "===END===<{tag}>"')
+
+    script = "\n".join(parts)
+    try:
+      result = nodes_mod.run_command(
+        n, script, timeout=120.0,
+        linked_keys=_ssh_credentials_for_node(ctx, n.name),
+      )
+    except Exception as exc:
+      raise HttpError(HTTPStatus.BAD_GATEWAY,
+                      f"could not reach {node_name}: {exc}",
+                      code="ssh_failed") from exc
+
+    out = result.stdout or ""
+    results = []
+    for spec in expected:
+      tag = spec["tag"]
+      block_re = re.compile(
+        r"===BEGIN===<" + re.escape(tag) + r">\n(.*?)===END===<" + re.escape(tag) + r">",
+        re.DOTALL,
+      )
+      m = block_re.search(out)
+      block = m.group(1).strip() if m else ""
+      r: dict[str, Any] = dict(spec)
+      r["raw"] = block[:500]
+      if spec["kind"] == "proxy_get":
+        hc = re.search(r"http_code=(\d+)", block)
+        tt = re.search(r"time_ms=([\d.]+)", block)
+        ce = re.search(r"curl_exit=(\d+)", block)
+        r["http_code"] = int(hc.group(1)) if hc else None
+        r["latency_ms"] = int(round(float(tt.group(1)) * 1000)) if tt else None
+        r["curl_exit"] = int(ce.group(1)) if ce else None
+        # OK if curl returned 0 AND http_code is in 2xx/3xx (proxy chain
+        # may legitimately get 204 from gstatic, 200 from anywhere else).
+        r["ok"] = (r["curl_exit"] == 0 and r["http_code"] is not None
+                   and 200 <= r["http_code"] < 400)
+        if not r["ok"]:
+          r["error"] = (
+            f"curl_exit={r['curl_exit']} http_code={r['http_code']}"
+            if r["curl_exit"] != 0 or r["http_code"] is None
+            else f"unexpected status {r['http_code']}"
+          )
+      elif spec["kind"] == "tcp_handshake":
+        r["ok"] = "tcp_listen=ok" in block
+        if not r["ok"]:
+          r["error"] = block.strip() or "no response"
+      else:
+        r["ok"] = False
+        r["error"] = "skipped (protocol not testable)"
+      results.append(r)
+
+    summary = {
+      "node": node_name,
+      "preset_id": preset["id"],
+      "preset_name": preset["name"],
+      "test_url": test_url,
+      "duration_seconds": result.duration_seconds,
+      "ok_count": sum(1 for r in results if r.get("ok")),
+      "fail_count": sum(1 for r in results if not r.get("ok")),
+      "results": results,
+    }
+    return _json_response(HTTPStatus.OK, summary)
+
   def service_deployments_handler(request: _Request) -> _Response:
     limit = max(1, min(request.query_int("limit", 50), 500))
     return _json_response(HTTPStatus.OK, {
@@ -4380,6 +4518,7 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("GET",    "/api/xout/nodes",                   with_auth(xout_nodes_list_handler))
   router.add("POST",   "/api/xout/nodes/{node_name}/deploy", with_auth(xout_node_deploy_handler))
   router.add("GET",    "/api/xout/outbound-targets",         with_auth(xout_outbound_targets_handler))
+  router.add("POST",   "/api/xout/nodes/{node_name}/test",   with_auth(xout_node_test_handler))
   router.add("GET",  "/api/services/{name}/nodes/{node_name}/config",
              with_auth(service_node_config_get_handler))
   router.add("PUT",  "/api/services/{name}/nodes/{node_name}/config",
