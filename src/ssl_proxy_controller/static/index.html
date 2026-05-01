@@ -6131,14 +6131,17 @@
     refresh();
   }
 
-  // Pretty-print byte counts.  GB threshold at 1024^3, MB at 1024^2 — we
-  // don't go below KB because xray traffic is always at least kilobytes.
+  // Pretty-print byte counts. GB threshold at 1024^3, MB at 1024^2 —
+  // we don't go below KB because xray traffic is always at least KB.
+  // Trailing .00 / .0 are stripped so whole-number readings (1000 GB)
+  // render cleanly without the noise of "1000.00 GB".
   function fmtXoutBytes(b) {
+    const fmt = (n, d) => Number(n.toFixed(d)).toString();
     if (!b || b < 1024) return (b || 0) + " B";
-    if (b < 1024 * 1024) return (b / 1024).toFixed(1) + " KB";
-    if (b < 1024 * 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + " MB";
-    if (b < 1024 ** 4) return (b / 1024 ** 3).toFixed(2) + " GB";
-    return (b / 1024 ** 4).toFixed(2) + " TB";
+    if (b < 1024 * 1024) return fmt(b / 1024, 1) + " KB";
+    if (b < 1024 * 1024 * 1024) return fmt(b / 1024 / 1024, 1) + " MB";
+    if (b < 1024 ** 4) return fmt(b / 1024 ** 3, 2) + " GB";
+    return fmt(b / 1024 ** 4, 2) + " TB";
   }
 
   // Modal: pick a preset to deploy on a single node.
@@ -6578,25 +6581,27 @@
     const monthPct = quotaBytes > 0 ? Math.min(100, (monthBytes / quotaBytes) * 100) : 0;
     const overQuota = quotaBytes > 0 && monthBytes >= quotaBytes;
 
-    body.appendChild(h("div", { class: "row", style: "gap: 16px; margin-bottom: 12px; flex-wrap: wrap" },
-      h("div", null,
-        h("div", { class: "muted", style: "font-size: 11px" }, "This month"),
-        h("div", { class: "mono", style: "font-size: 16px" }, fmtXoutBytes(monthBytes))),
-      h("div", null,
-        h("div", { class: "muted", style: "font-size: 11px" }, "Quota"),
-        h("div", { class: "mono", style: "font-size: 16px" }, fmtXoutBytes(quotaBytes))),
-      h("div", null,
-        h("div", { class: "muted", style: "font-size: 11px" }, "Residual"),
-        h("div", { class: "mono",
-          style: `font-size: 16px; color: ${overQuota ? "var(--danger)" : "inherit"}; font-family: monospace` },
-          fmtXoutBytes(Math.max(0, Number(r.month_residual_bytes || 0))))),
-      h("div", null,
-        h("div", { class: "muted", style: "font-size: 11px" }, "Lifetime"),
-        h("div", { class: "mono", style: "font-size: 16px" }, fmtXoutBytes(Number(r.total_bytes || 0))))));
+    // 4-column grid for the summary stats — equal-width cells aligns
+    // labels and values regardless of their text length.
+    const statBlock = (label, value, opts = {}) => h("div",
+      { style: "display: block" },
+      h("div", { class: "muted", style: "font-size: 11px; margin-bottom: 2px" }, label),
+      h("div", { style: `font-family: monospace; font-size: 16px; ${opts.color ? "color: " + opts.color : ""}` }, value));
     body.appendChild(h("div", {
-      style: "background: var(--surface-2); border-radius: 4px; overflow: hidden; height: 8px; margin-bottom: 16px"
+      style: "display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 10px",
+    },
+      statBlock("This month", fmtXoutBytes(monthBytes)),
+      statBlock("Quota",      fmtXoutBytes(quotaBytes)),
+      statBlock("Residual",   fmtXoutBytes(Math.max(0, Number(r.month_residual_bytes || 0))),
+                { color: overQuota ? "var(--danger)" : "" }),
+      statBlock("Lifetime",   fmtXoutBytes(Number(r.total_bytes || 0))),
+    ));
+    // Always show the bar; when empty it reads as "0 used". Border so
+    // the rail is visible even when surface-2 is close to the modal bg.
+    body.appendChild(h("div", {
+      style: "background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; height: 8px; margin-bottom: 16px"
     }, h("div", {
-      style: `width: ${monthPct.toFixed(1)}%; height: 8px; background: ${overQuota ? "var(--danger)" : (monthPct > 80 ? "#d97706" : "var(--accent,#2563eb)")};`
+      style: `width: ${monthPct.toFixed(1)}%; height: 8px; background: ${overQuota ? "var(--danger)" : (monthPct > 80 ? "#d97706" : "var(--accent,#2563eb)")}; transition: width 200ms ease;`
     })));
 
     if (!(r.per_token || []).length) {
