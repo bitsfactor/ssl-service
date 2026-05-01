@@ -6303,27 +6303,54 @@
       style: "width: 100%; padding: 6px 8px; min-height: 60px; font-family: inherit;"
     }, existing ? (existing.notes || "") : "");
 
-    body.appendChild(h("div", { class: "form-row", style: "margin-bottom: 8px" },
-      h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" }, "Name"),
-      nameInput));
-    body.appendChild(h("div", { class: "form-row", style: "margin-bottom: 8px" },
-      h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" }, "UUID"),
-      uuidInput,
-      h("div", { class: "muted", style: "font-size: 11px; margin-top: 4px" },
-        isEdit ? "UUID is permanent — clients keep their subscription URLs." : "Auto-generated on save.")));
-    body.appendChild(h("div", { class: "form-row", style: "margin-bottom: 8px" },
-      h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" }, "Password"),
-      passInput));
-    body.appendChild(h("div", { class: "row", style: "gap: 12px; margin-bottom: 8px" },
-      h("div", { class: "form-row", style: "flex: 1" },
-        h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" },
-          "Monthly quota (GB)"), quotaInput),
-      h("div", { class: "form-row", style: "flex: 1" },
-        h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" },
-          "Reset day (1-28)"), resetInput)));
-    body.appendChild(h("div", { class: "form-row", style: "margin-bottom: 8px" },
-      h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" }, "Notes"),
-      notesInput));
+    // Block-layout fields (display: block overrides the .form-row
+    // 2-column grid so label/input/hint stack vertically). Each field
+    // is a single-column block: label on top, input below, optional
+    // hint at the bottom — same look and feel as the rest of the app
+    // but without the grid splitting mid-field.
+    const fieldLabel = (text) => h("label", {
+      style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px",
+    }, text);
+    const fieldHint = (text) => h("div", { class: "muted",
+      style: "font-size: 11px; margin-top: 4px" }, text);
+    const fieldBlock = (style = "") => h("div", {
+      style: "display: block; margin-bottom: 12px; " + style,
+    });
+    const f1 = fieldBlock();
+    f1.appendChild(fieldLabel("Name"));
+    f1.appendChild(nameInput);
+    body.appendChild(f1);
+
+    const f2 = fieldBlock();
+    f2.appendChild(fieldLabel("UUID"));
+    f2.appendChild(uuidInput);
+    f2.appendChild(fieldHint(isEdit
+      ? "UUID is permanent — clients keep their subscription URLs."
+      : "Auto-generated on save."));
+    body.appendChild(f2);
+
+    const f3 = fieldBlock();
+    f3.appendChild(fieldLabel("Password"));
+    f3.appendChild(passInput);
+    body.appendChild(f3);
+
+    // Two-column row for quota + reset day — uses the existing
+    // .form-row grid (which already is 1fr 1fr).
+    const f4 = h("div", { class: "form-row", style: "margin-bottom: 12px" });
+    const q = h("div", { style: "display: block" });
+    q.appendChild(fieldLabel("Monthly quota (GB)"));
+    q.appendChild(quotaInput);
+    const rd = h("div", { style: "display: block" });
+    rd.appendChild(fieldLabel("Reset day (1-28)"));
+    rd.appendChild(resetInput);
+    f4.appendChild(q);
+    f4.appendChild(rd);
+    body.appendChild(f4);
+
+    const f5 = fieldBlock();
+    f5.appendChild(fieldLabel("Notes"));
+    f5.appendChild(notesInput);
+    body.appendChild(f5);
     const errorEl = h("div", { class: "muted", style: "color: var(--danger); margin-top: 8px;" });
     body.appendChild(errorEl);
 
@@ -6493,7 +6520,7 @@
     const mkSection = (label, content, isYaml) => {
       const ta = h("textarea", {
         readOnly: true,
-        style: `width: 100%; padding: 6px 8px; ${isYaml ? "min-height: 200px;" : "min-height: 90px;"} font-family: monospace; font-size: 11px;`,
+        style: `width: 100%; padding: 6px 8px; ${isYaml ? "min-height: 200px;" : "min-height: 90px;"} font-family: monospace; font-size: 11px; box-sizing: border-box;`,
       }, content || "");
       const copyBtn = h("button", { class: "btn btn-sm",
         onclick: async () => {
@@ -6506,7 +6533,11 @@
             toast("success", "Copied", label);
           }
         }}, "Copy");
-      return h("div", { class: "form-row", style: "margin-bottom: 12px" },
+      // display: block overrides the .form-row 2-column grid that
+      // Modal CSS would otherwise apply. We want each section to be
+      // a vertical stack: label + Copy button on one row, then the
+      // textarea below filling the full width.
+      return h("div", { style: "display: block; margin-bottom: 14px" },
         h("div", { class: "row", style: "align-items: center; gap: 8px; margin-bottom: 4px" },
           h("label", { style: "font-weight: 600; font-size: 13px; flex: 1" }, label),
           copyBtn),
@@ -6574,7 +6605,8 @@
     } else {
       const tbl = h("table", { class: "data" });
       tbl.appendChild(h("thead", null, h("tr", null,
-        h("th", null, "Token"), h("th", null, "This month"),
+        h("th", null, "Token"),
+        h("th", { title: "Traffic since this token's reset day" }, "Cycle"),
         h("th", null, "Total"), h("th", null, "Last seen"))));
       const tb = h("tbody");
       for (const pt of r.per_token) {
