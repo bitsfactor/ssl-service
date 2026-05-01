@@ -4130,8 +4130,29 @@
     return out;
   }
 
-  function openServiceModal(existing, onSaved) {
+  async function openServiceModal(existing, onSaved) {
     const isEdit = !!existing;
+    // For Edit: pull the parsed manifest so we know which envs the
+    // service supports, and pull the Databases registry so the PG_DSN
+    // row can be a dropdown instead of free text.
+    let manifest = null;
+    let databases = [];
+    if (isEdit) {
+      try {
+        if (existing.has_manifest && existing.deploy_yaml) {
+          manifest = parseInlineManifest(existing);
+        } else {
+          const r = await api("POST",
+            `/api/services/${encodeURIComponent(existing.name)}/manifest`,
+            { save: true });
+          manifest = r.manifest;
+        }
+      } catch (_) { manifest = null; }
+      try {
+        const r = await api("GET", "/api/databases");
+        databases = r.databases || r.entries || [];
+      } catch (_) { databases = []; }
+    }
     const form = h("form");
     form.appendChild(h("div", { class: "form-row" },
       h("div", { class: "field" },
@@ -4175,12 +4196,104 @@
           value: existing ? existing.install_dir_template : "/opt/{name}" }),
       ),
     ));
-    form.appendChild(h("div", { class: "field" },
-      h("label", null, "Default env (KEY=value, one per line)"),
-      h("textarea", { id: "svc-env", class: "textarea mono", rows: "6",
-        placeholder: "POSTGRES_DSN=postgresql://...\nADMIN_TOKEN=replace-me" },
-        existing ? envDictToText(existing.default_env || {}) : ""),
-    ));
+    // Per-row default-env editor — same UX as the Deploy modal.
+    // Required vars highlighted red; SSL_SERVICE_PG_DSN is rendered
+    // as a dropdown sourced from the Databases registry.
+    const envWrap = h("div", { class: "field" },
+      h("label", null, "Default env",
+        h("span", { class: "hint" }, " — saved per-service; auto-applied at every deploy")));
+    const envTable = h("table", { class: "data", style: "width: 100%; font-size: 12.5px;" });
+    envTable.appendChild(h("thead", null, h("tr", null,
+      h("th", null, "Variable"),
+      h("th", null, "Manifest default"),
+      h("th", null, "Saved value"),
+    )));
+    const envBody = h("tbody");
+    const savedEnv = (existing && existing.default_env) || {};
+
+    // Union of: required_env, manifest defaults, anything already saved.
+    const envKeys = new Set();
+    if (manifest) {
+      for (const k of (manifest.required_env || [])) envKeys.add(k);
+      for (const k of Object.keys(manifest.defaults || {})) envKeys.add(k);
+    }
+    for (const k of Object.keys(savedEnv)) envKeys.add(k);
+
+    // Each row owns its own input element so we can read all of them
+    // back on Save. We capture them in this dict instead of relying on
+    // global IDs.
+    const envInputs = {};
+
+    const buildRow = (key, manifestDefault, savedValue, isRequired) => {
+      let valueCell;
+      if (key === "SSL_SERVICE_PG_DSN" && databases.length) {
+        // Dropdown: each option's value IS the full DSN; label shows
+        // the registry entry's name + a redacted DSN.
+        const sel = h("select", { class: "input mono",
+          style: "width: 100%; font-size: 11.5px",
+          "data-env-key": key });
+        sel.appendChild(h("option", { value: "" },
+          savedValue ? "(custom — typed below)" : "(none — pick a database)"));
+        const redact = (dsn) => (dsn || "").replace(/:[^:@/]*@/, ":****@");
+        for (const db of databases) {
+          const dsn = db.dsn || "";
+          const isActive = !!db.is_active;
+          const opt = h("option", { value: dsn },
+            `${db.name || db.id}${isActive ? "  ★ active" : ""}  —  ${redact(dsn).slice(0, 80)}`);
+          if (savedValue && savedValue === dsn) opt.selected = true;
+          sel.appendChild(opt);
+        }
+        // Free-text fallback (when none of the registry entries match)
+        const free = h("input", { class: "input mono", "data-env-key": key + ":free",
+          style: "width: 100%; font-size: 11.5px; margin-top: 4px;",
+          placeholder: "Or paste a custom DSN here",
+          value: savedValue && !databases.find((d) => d.dsn === savedValue) ? savedValue : "" });
+        valueCell = h("td", null, sel, free);
+        envInputs[key] = () => sel.value || free.value;
+      } else {
+        const inp = h("input", { class: "input mono",
+          "data-env-key": key,
+          style: "width: 100%; font-size: 11.5px"
+            + (isRequired && !savedValue && !manifestDefault ? "; border-color: var(--danger)" : ""),
+          placeholder: manifestDefault || (isRequired ? "(required)" : ""),
+          value: savedValue || "" });
+        valueCell = h("td", null, inp);
+        envInputs[key] = () => inp.value;
+      }
+      envBody.appendChild(h("tr", null,
+        h("td", { class: "mono", style: "font-size: 12px" },
+          isRequired
+            ? h("span", { style: "color: var(--danger); font-weight: bold;" }, key + " *")
+            : key),
+        h("td", { class: "muted mono", style: "font-size: 11px" },
+          manifestDefault || h("span", null, "—")),
+        valueCell,
+      ));
+    };
+
+    if (manifest) {
+      const required = new Set(manifest.required_env || []);
+      const sortedKeys = Array.from(envKeys).sort();
+      for (const key of sortedKeys) {
+        const manifestDefault = (manifest.defaults || {})[key] || "";
+        const saved = savedEnv[key] || "";
+        buildRow(key, manifestDefault, saved, required.has(key));
+      }
+    } else {
+      // No manifest yet (new service or fetch failed) — fall back to a
+      // simple textarea so the operator can still save defaults.
+      const ta = h("textarea", { id: "svc-env-ta", class: "textarea mono", rows: "6",
+        placeholder: "KEY=value, one per line" }, envDictToText(savedEnv));
+      envBody.appendChild(h("tr", null,
+        h("td", { colspan: "3" }, ta)));
+      envInputs.__textarea = () => ta.value;
+    }
+    envTable.appendChild(envBody);
+    const envInner = h("div", { class: "table-wrap",
+      style: "max-height: 280px; overflow-y: auto" });
+    envInner.appendChild(envTable);
+    envWrap.appendChild(envInner);
+    form.appendChild(envWrap);
     form.appendChild(h("div", { class: "field" },
       h("label", null, "Pre-deploy command (optional, runs before docker compose up)"),
       h("textarea", { id: "svc-pre", class: "textarea mono", rows: "2",
@@ -4205,7 +4318,19 @@
           default_branch: document.getElementById("svc-branch").value.trim() || "main",
           compose_file: document.getElementById("svc-compose").value.trim() || "docker-compose.yml",
           install_dir_template: document.getElementById("svc-installdir").value.trim() || "/opt/{name}",
-          default_env: envTextToDict(document.getElementById("svc-env").value),
+          default_env: (() => {
+            // Prefer the per-row table; fall back to the textarea
+            // when no manifest was loaded.
+            if (envInputs.__textarea) {
+              return envTextToDict(envInputs.__textarea());
+            }
+            const out = {};
+            for (const [k, getter] of Object.entries(envInputs)) {
+              const v = (getter() || "").trim();
+              if (v) out[k] = v;
+            }
+            return out;
+          })(),
           pre_deploy_command: document.getElementById("svc-pre").value.trim() || null,
           post_deploy_command: document.getElementById("svc-post").value.trim() || null,
         };

@@ -17,16 +17,20 @@ runtime: compose
 compose_file: docker-compose.yml
 install_dir_template: /opt/{name}
 
-# Required at deploy time. The admin UI refuses to deploy until these are
-# either filled in by the operator or supplied via `secrets`.
+# Required at deploy time. ADMIN_TOKEN is intentionally NOT required —
+# the deployed instance only starts its HTTP admin server when
+# SSL_SERVICE_ENABLE_WEB_UI=true. Default deploys are headless workers
+# (sync loop + Caddy reload) with no public-facing UI to harden.
 required_env:
   - SSL_SERVICE_MODE
   - SSL_SERVICE_PG_DSN
-  - SSL_SERVICE_ADMIN_TOKEN
 
-# Sensible defaults. Operator can override per-deploy.
+# Sensible defaults. Operator typically saves these once into
+# service.default_env via the Services > Edit dialog and forgets them.
 defaults:
   SSL_SERVICE_MODE: readonly
+  SSL_SERVICE_ENABLE_WEB_UI: "false"
+  SSL_SERVICE_ADMIN_TOKEN: ""
   SSL_SERVICE_LOG_LEVEL: INFO
   SSL_SERVICE_ADMIN_BIND: 0.0.0.0
   SSL_SERVICE_ADMIN_PORT: "8088"
@@ -36,13 +40,6 @@ defaults:
   SSL_SERVICE_RENEW_BEFORE_DAYS: "30"
   SSL_SERVICE_POLL_INTERVAL_SECONDS: "30"
   TZ: Asia/Shanghai
-
-# Pull these from system_config at deploy time so they aren't typed by hand.
-secrets:
-  - env: SSL_SERVICE_PG_DSN
-    from: system_config:postgres_dsn
-  - env: SSL_SERVICE_ADMIN_TOKEN
-    from: system_config:admin_token
 
 # Container ports. The admin UI surfaces these in the deploy preview and
 # can offer to wire up Caddy routes for them.
