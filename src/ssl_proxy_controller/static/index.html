@@ -4139,18 +4139,22 @@
     let databases = [];
     if (isEdit) {
       try {
-        if (existing.has_manifest && existing.deploy_yaml) {
-          manifest = parseInlineManifest(existing);
-        } else {
-          const r = await api("POST",
-            `/api/services/${encodeURIComponent(existing.name)}/manifest`,
-            { save: true });
-          manifest = r.manifest;
+        // ALWAYS re-fetch from the upstream repo so the operator sees
+        // the latest required_env/defaults — the cached `existing.deploy_yaml`
+        // can be stale (e.g. the manifest just got new flags upstream).
+        const r = await api("POST",
+          `/api/services/${encodeURIComponent(existing.name)}/manifest`,
+          { save: true });
+        manifest = r.manifest;
+      } catch (_) {
+        // Fall back to the stored cache if the fetch fails (offline, etc.)
+        if (existing.deploy_yaml) {
+          try { manifest = parseInlineManifest(existing); } catch (_) { manifest = null; }
         }
-      } catch (_) { manifest = null; }
+      }
       try {
         const r = await api("GET", "/api/databases");
-        databases = r.databases || r.entries || [];
+        databases = r.entries || r.databases || [];
       } catch (_) { databases = []; }
     }
     const form = h("form");
@@ -4224,32 +4228,63 @@
     // global IDs.
     const envInputs = {};
 
+    // Known SSL_SERVICE_* enums — render these as dropdowns instead of
+    // free text so the operator can't typo a value.
+    const ENV_ENUMS = {
+      SSL_SERVICE_MODE: ["readonly", "readwrite"],
+      SSL_SERVICE_ENABLE_WEB_UI: ["false", "true"],
+      SSL_SERVICE_ACME_STAGING: ["false", "true"],
+    };
+
     const buildRow = (key, manifestDefault, savedValue, isRequired) => {
       let valueCell;
       if (key === "SSL_SERVICE_PG_DSN" && databases.length) {
-        // Dropdown: each option's value IS the full DSN; label shows
-        // the registry entry's name + a redacted DSN.
+        // Pick from the Databases registry. We store `database:<id>`
+        // (a resolver token) instead of the cleartext DSN — that way
+        // the actual DSN never round-trips through the browser, and
+        // editing a database's DSN later auto-flows to all deploys
+        // that reference it.
         const sel = h("select", { class: "input mono",
           style: "width: 100%; font-size: 11.5px",
           "data-env-key": key });
         sel.appendChild(h("option", { value: "" },
           savedValue ? "(custom — typed below)" : "(none — pick a database)"));
-        const redact = (dsn) => (dsn || "").replace(/:[^:@/]*@/, ":****@");
-        for (const db of databases) {
-          const dsn = db.dsn || "";
-          const isActive = !!db.is_active;
-          const opt = h("option", { value: dsn },
-            `${db.name || db.id}${isActive ? "  ★ active" : ""}  —  ${redact(dsn).slice(0, 80)}`);
-          if (savedValue && savedValue === dsn) opt.selected = true;
+        const redact = (s) => (s || "").replace(/:[^:@/]*@/, ":****@");
+        // Sort so the active database floats to the top.
+        const entries = databases.slice().sort((a, b) =>
+          (b.is_active ? 1 : 0) - (a.is_active ? 1 : 0));
+        const matchToken = savedValue && savedValue.startsWith("database:")
+          ? savedValue.slice("database:".length) : null;
+        for (const db of entries) {
+          const token = `database:${db.id}`;
+          const lbl = db.label || db.id;
+          const text = `${lbl}${db.is_active ? "  ★ active" : ""}  —  ${redact(db.dsn_masked || "")}`;
+          const opt = h("option", { value: token }, text);
+          if (matchToken && db.id === matchToken) opt.selected = true;
           sel.appendChild(opt);
         }
-        // Free-text fallback (when none of the registry entries match)
+        // Free-text fallback (when the saved value isn't a registry token)
         const free = h("input", { class: "input mono", "data-env-key": key + ":free",
           style: "width: 100%; font-size: 11.5px; margin-top: 4px;",
-          placeholder: "Or paste a custom DSN here",
-          value: savedValue && !databases.find((d) => d.dsn === savedValue) ? savedValue : "" });
+          placeholder: "Or paste a raw DSN (advanced — won't track registry edits)",
+          value: savedValue && !savedValue.startsWith("database:") ? savedValue : "" });
         valueCell = h("td", null, sel, free);
         envInputs[key] = () => sel.value || free.value;
+      } else if (ENV_ENUMS[key]) {
+        const sel = h("select", { class: "input mono",
+          style: "width: 100%; font-size: 11.5px",
+          "data-env-key": key });
+        // Empty option = "use the manifest default"
+        sel.appendChild(h("option", { value: "" },
+          manifestDefault ? `(default — ${manifestDefault})` : "(none)"));
+        const cur = savedValue || "";
+        for (const v of ENV_ENUMS[key]) {
+          const opt = h("option", { value: v }, v);
+          if (cur === v) opt.selected = true;
+          sel.appendChild(opt);
+        }
+        valueCell = h("td", null, sel);
+        envInputs[key] = () => sel.value;
       } else {
         const inp = h("input", { class: "input mono",
           "data-env-key": key,

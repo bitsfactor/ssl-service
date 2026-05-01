@@ -1806,15 +1806,28 @@ def deploy_service_to_nodes(
 
   # System config secrets resolver — `system_config:KEY.PATH`.
   def _resolver(src: str) -> str | None:
-    if not src.startswith("system_config:"):
+    # database:<id>     -> full DSN of that registry entry
+    # database:active   -> currently active DSN
+    if src.startswith("database:"):
+      ident = src[len("database:"):].strip()
+      if not ident:
+        return None
+      if ident == "active":
+        return _current_dsn() or None
+      view = db_registry_mod.list_databases(ctx.database, _current_dsn() or "")
+      for e in view.get("entries") or []:
+        if e.get("id") == ident:
+          return e.get("dsn") or None
       return None
-    rest = src[len("system_config:"):]
-    parts = rest.split(".", 1)
-    key = parts[0].strip()
-    cfg = ctx.database.get_system_config(key) or {}
-    if len(parts) == 1:
-      return None
-    return str(cfg.get(parts[1].strip()) or "") or None
+    if src.startswith("system_config:"):
+      rest = src[len("system_config:"):]
+      parts = rest.split(".", 1)
+      key = parts[0].strip()
+      cfg = ctx.database.get_system_config(key) or {}
+      if len(parts) == 1:
+        return None
+      return str(cfg.get(parts[1].strip()) or "") or None
+    return None
 
   env, missing_env = services_deploy_mod.build_effective_env(
     manifest,

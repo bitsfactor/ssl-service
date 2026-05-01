@@ -278,6 +278,7 @@ def build_effective_env(
     effective.update({k: _stringify(v) for k, v in service_default_env.items()})
   if per_deploy_env:
     effective.update({k: _stringify(v) for k, v in per_deploy_env.items()})
+  # Manifest-declared secrets layer.
   if secrets_resolver and manifest.secrets:
     for s in manifest.secrets:
       env_name = s.get("env")
@@ -291,6 +292,23 @@ def build_effective_env(
         val = None
       if val is not None:
         effective[env_name] = _stringify(val)
+  # Inline resolver tokens — values like "database:<id>" or
+  # "system_config:KEY.PATH" embedded directly in service.default_env
+  # or per-deploy overrides. Lets the operator pick a DSN from the
+  # Databases registry (stored as "database:f499f7431634") and have
+  # the actual DSN substituted in at deploy time without ever
+  # round-tripping the cleartext through the browser.
+  if secrets_resolver:
+    for k, v in list(effective.items()):
+      sv = (v or "")
+      if sv.startswith("database:") or sv.startswith("system_config:"):
+        try:
+          resolved = secrets_resolver(sv)
+        except Exception as exc:  # noqa: BLE001
+          LOGGER.warning("inline resolver failed for %s=%s: %s", k, sv, exc)
+          resolved = None
+        if resolved is not None:
+          effective[k] = _stringify(resolved)
 
   # The compose project name + container name need this if the
   # compose template references ${SERVICE_NAME}. Fill it in always.
