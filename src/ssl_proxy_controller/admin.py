@@ -1575,6 +1575,17 @@ def deploy_service_to_nodes(
   revision = (payload.get("revision") or s.default_branch or "main").strip()
   triggered_by = (payload.get("triggered_by") or "admin").strip()
 
+  # Optional extra files dropped into install_dir on the target node.
+  # Used by the xout channel to ship preset.json — the deploy step
+  # writes <install_dir>/<path> from the supplied content via heredoc.
+  extra_files_raw = payload.get("extra_files") or {}
+  extra_files: dict[str, str] = {}
+  if isinstance(extra_files_raw, dict):
+    for k, v in extra_files_raw.items():
+      if not isinstance(k, str) or not k.strip():
+        continue
+      extra_files[k.strip()] = "" if v is None else str(v)
+
   from concurrent.futures import ThreadPoolExecutor
 
   def _env_for_node(n: NodeRecord) -> dict:
@@ -1602,6 +1613,7 @@ def deploy_service_to_nodes(
       service_branch=s.default_branch or "main",
       revision=revision,
       env_file_content=env_file,
+      extra_files=extra_files or None,
     )
     hc_script = services_deploy_mod.render_healthcheck_script(manifest, node_env)
     dep = ctx.database.insert_service_deployment(
@@ -3569,6 +3581,233 @@ def _build_router(ctx: AdminContext) -> _Router:
       deploy_service_to_nodes(ctx, request.path_params["name"], request.json_body()),
     )
 
+  # ---------- xout channel ----------------------------------------------
+
+  def _xout_normalize_inbound(entry: Any, idx: int) -> dict:
+    """Validate + normalize one inbound config from a preset.
+    Raises HttpError on invalid input."""
+    if not isinstance(entry, dict):
+      raise HttpError(HTTPStatus.BAD_REQUEST, f"inbound[{idx}] must be an object",
+                      code="invalid_inbound")
+    protocol = (entry.get("protocol") or "").strip().lower()
+    if protocol not in ("vless", "http", "socks"):
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      f"inbound[{idx}].protocol must be one of vless/http/socks",
+                      code="invalid_inbound")
+    try:
+      port = int(entry.get("port") or 0)
+    except (TypeError, ValueError):
+      raise HttpError(HTTPStatus.BAD_REQUEST, f"inbound[{idx}].port must be an integer",
+                      code="invalid_inbound") from None
+    if not (1 <= port <= 65535):
+      raise HttpError(HTTPStatus.BAD_REQUEST, f"inbound[{idx}].port out of range",
+                      code="invalid_inbound")
+    tag = (entry.get("tag") or f"in{idx}").strip()
+    if not re.match(r"^[a-zA-Z0-9._-]+$", tag):
+      raise HttpError(HTTPStatus.BAD_REQUEST, f"inbound[{idx}].tag has invalid chars",
+                      code="invalid_inbound")
+    out: dict[str, Any] = {"tag": tag, "protocol": protocol, "port": port}
+    if protocol == "vless":
+      reality = entry.get("reality") or {}
+      if not isinstance(reality, dict):
+        reality = {}
+      sni = (reality.get("sni") or "").strip()
+      if not sni:
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"inbound[{idx}].reality.sni is required for vless",
+                        code="invalid_inbound")
+      out["reality"] = {
+        "sni": sni,
+        "private_key": str(reality.get("private_key") or "auto"),
+        "short_id": str(reality.get("short_id") or "auto"),
+      }
+      users = entry.get("users") or [{"name": "default", "uuid": "auto"}]
+      if not isinstance(users, list) or not users:
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"inbound[{idx}].users must be a non-empty list",
+                        code="invalid_inbound")
+      cleaned_users = []
+      for u in users:
+        if not isinstance(u, dict): continue
+        name = (u.get("name") or "default").strip()
+        uuid = str(u.get("uuid") or "auto").strip()
+        cleaned_users.append({"name": name, "uuid": uuid or "auto"})
+      out["users"] = cleaned_users
+    else:
+      auth = entry.get("auth") or {}
+      if isinstance(auth, dict) and (auth.get("user") or "").strip():
+        out["auth"] = {
+          "user": str(auth.get("user")).strip(),
+          "pass": str(auth.get("pass") or ""),
+        }
+    # Outbound — direct by default, otherwise chain to another proxy.
+    ob = entry.get("outbound") or {"type": "direct"}
+    if not isinstance(ob, dict):
+      ob = {"type": "direct"}
+    ob_type = (ob.get("type") or "direct").lower()
+    if ob_type == "direct":
+      out["outbound"] = {"type": "direct"}
+    elif ob_type in ("http", "socks"):
+      ob_host = (ob.get("host") or "").strip()
+      try: ob_port = int(ob.get("port") or 0)
+      except (TypeError, ValueError): ob_port = 0
+      if not ob_host or not (1 <= ob_port <= 65535):
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"inbound[{idx}].outbound.host/port required for {ob_type}",
+                        code="invalid_inbound")
+      out["outbound"] = {
+        "type": ob_type, "host": ob_host, "port": ob_port,
+        "user": str(ob.get("user") or ""),
+        "pass": str(ob.get("pass") or ""),
+      }
+    elif ob_type == "vless":
+      ob_host = (ob.get("host") or "").strip()
+      try: ob_port = int(ob.get("port") or 0)
+      except (TypeError, ValueError): ob_port = 0
+      ob_uuid = (ob.get("uuid") or "").strip()
+      ob_sni  = (ob.get("sni") or "").strip()
+      ob_pub  = (ob.get("pubkey") or ob.get("public_key") or "").strip()
+      if not (ob_host and 1 <= ob_port <= 65535 and ob_uuid and ob_sni and ob_pub):
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"inbound[{idx}].outbound.vless requires host/port/uuid/sni/pubkey",
+                        code="invalid_inbound")
+      out["outbound"] = {
+        "type": "vless", "host": ob_host, "port": ob_port,
+        "uuid": ob_uuid, "sni": ob_sni, "pubkey": ob_pub,
+        "short_id": str(ob.get("short_id") or ""),
+      }
+    else:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      f"inbound[{idx}].outbound.type must be direct/http/socks/vless",
+                      code="invalid_inbound")
+    return out
+
+  def _xout_normalize_inbounds(raw: Any) -> list[dict]:
+    if not isinstance(raw, list) or not raw:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "inbounds must be a non-empty array", code="invalid_inbounds")
+    return [_xout_normalize_inbound(e, i) for i, e in enumerate(raw)]
+
+  def xout_presets_list_handler(_request: _Request) -> _Response:
+    return _json_response(HTTPStatus.OK, {"presets": ctx.database.list_xout_presets()})
+
+  def xout_presets_create_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    payload = request.json_body() or {}
+    name = (payload.get("name") or "").strip()
+    if not name:
+      raise HttpError(HTTPStatus.BAD_REQUEST, "name is required", code="name_required")
+    inbounds = _xout_normalize_inbounds(payload.get("inbounds"))
+    description = (payload.get("description") or "").strip() or None
+    try:
+      result = ctx.database.insert_xout_preset(
+        name=name, description=description, inbounds=inbounds,
+      )
+    except Exception as exc:
+      msg = str(exc)
+      if "duplicate key" in msg.lower():
+        raise HttpError(HTTPStatus.CONFLICT, f"preset name already in use: {name}",
+                        code="name_in_use") from exc
+      raise
+    return _json_response(HTTPStatus.CREATED, result)
+
+  def xout_presets_get_handler(request: _Request) -> _Response:
+    pid = request.path_params["preset_id"]
+    p = ctx.database.get_xout_preset(int(pid))
+    if p is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"preset not found: {pid}", code="preset_not_found")
+    return _json_response(HTTPStatus.OK, p)
+
+  def xout_presets_patch_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    pid = int(request.path_params["preset_id"])
+    payload = request.json_body() or {}
+    fields: dict[str, Any] = {}
+    if "name" in payload:
+      n = (payload["name"] or "").strip()
+      if not n:
+        raise HttpError(HTTPStatus.BAD_REQUEST, "name cannot be empty", code="name_required")
+      fields["name"] = n
+    if "description" in payload:
+      fields["description"] = (payload["description"] or "").strip() or None
+    if "inbounds" in payload:
+      fields["inbounds"] = _xout_normalize_inbounds(payload["inbounds"])
+    p = ctx.database.update_xout_preset(pid, fields)
+    if p is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"preset not found: {pid}", code="preset_not_found")
+    return _json_response(HTTPStatus.OK, p)
+
+  def xout_presets_delete_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    pid = int(request.path_params["preset_id"])
+    ok = ctx.database.delete_xout_preset(pid)
+    if not ok:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"preset not found: {pid}", code="preset_not_found")
+    return _json_response(HTTPStatus.OK, {"deleted": True})
+
+  def xout_nodes_list_handler(_request: _Request) -> _Response:
+    """List all nodes that have xout deployed (have a service_node_state row
+    for service_name='xout'), plus their current preset assignment."""
+    states = ctx.database.list_service_node_states(service_name="xout")
+    assignments = {a["node_name"]: a for a in ctx.database.list_xout_assignments()}
+    out = []
+    for st in states:
+      a = assignments.get(st.node_name)
+      out.append({
+        "node_name": st.node_name,
+        "container_state": st.container_state,
+        "container_image": st.container_image,
+        "container_started_at": _to_jsonable(st.container_started_at),
+        "healthcheck_ok": st.healthcheck_ok,
+        "last_observed_at": _to_jsonable(st.last_observed_at),
+        "deploy_status": st.status,
+        "deploy_revision": st.revision,
+        "preset_id": a["preset_id"] if a else None,
+        "preset_name": (a or {}).get("preset_name"),
+        "applied_at": _to_jsonable((a or {}).get("applied_at")),
+      })
+    return _json_response(HTTPStatus.OK, {"nodes": out})
+
+  def xout_node_deploy_handler(request: _Request) -> _Response:
+    """Deploy xout to one node using the chosen preset.
+    Body: {preset_id: int}
+    Renders the preset's inbounds as /opt/xout/data/preset.json on the
+    target, then runs the standard deploy_service_to_nodes flow with
+    extra_files set."""
+    _require_readwrite(ctx)
+    node_name = _normalize_node_name(request.path_params["node_name"])
+    n = ctx.database.get_node(node_name)
+    if n is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {node_name}",
+                      code="node_not_found")
+    payload = request.json_body() or {}
+    try:
+      preset_id = int(payload.get("preset_id") or 0)
+    except (TypeError, ValueError):
+      raise HttpError(HTTPStatus.BAD_REQUEST, "preset_id must be an integer",
+                      code="invalid_preset_id") from None
+    preset = ctx.database.get_xout_preset(preset_id)
+    if preset is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"preset not found: {preset_id}",
+                      code="preset_not_found")
+
+    # Pre-record the assignment so list_xout_assignments shows the right
+    # preset even if deploy is still mid-flight.
+    ctx.database.upsert_xout_assignment(node_name, preset_id, applied_by="admin")
+
+    # Hand off to deploy_service_to_nodes. It builds the deploy script;
+    # we extend it via the deploy_service_to_nodes payload's extra_files
+    # to drop preset.json into install_dir/data/preset.json.
+    import json as _json
+    preset_json = _json.dumps(preset["inbounds"], indent=2)
+    return _json_response(HTTPStatus.OK, deploy_service_to_nodes(
+      ctx, "xout", {
+        "nodes": [node_name],
+        "triggered_by": payload.get("triggered_by") or "xout-channel",
+        "extra_files": {"data/preset.json": preset_json},
+      },
+    ))
+
   def service_deployments_handler(request: _Request) -> _Response:
     limit = max(1, min(request.query_int("limit", 50), 500))
     return _json_response(HTTPStatus.OK, {
@@ -3978,6 +4217,13 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("DELETE", "/api/services/{name}", with_auth(service_delete_handler))
   router.add("POST", "/api/services/{name}/manifest", with_auth(service_manifest_handler))
   router.add("POST", "/api/services/{name}/deploy", with_auth(service_deploy_handler))
+  router.add("GET",    "/api/xout/presets",                 with_auth(xout_presets_list_handler))
+  router.add("POST",   "/api/xout/presets",                 with_auth(xout_presets_create_handler))
+  router.add("GET",    "/api/xout/presets/{preset_id}",     with_auth(xout_presets_get_handler))
+  router.add("PATCH",  "/api/xout/presets/{preset_id}",     with_auth(xout_presets_patch_handler))
+  router.add("DELETE", "/api/xout/presets/{preset_id}",     with_auth(xout_presets_delete_handler))
+  router.add("GET",    "/api/xout/nodes",                   with_auth(xout_nodes_list_handler))
+  router.add("POST",   "/api/xout/nodes/{node_name}/deploy", with_auth(xout_node_deploy_handler))
   router.add("GET",  "/api/services/{name}/nodes/{node_name}/config",
              with_auth(service_node_config_get_handler))
   router.add("PUT",  "/api/services/{name}/nodes/{node_name}/config",

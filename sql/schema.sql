@@ -561,6 +561,39 @@ BEFORE UPDATE ON service_node_config
 FOR EACH ROW
 EXECUTE FUNCTION touch_updated_at();
 
+-- xout channel: named presets + per-node assignment ---------------------
+-- xout (formerly vpsbox) is the multi-inbound proxy service. Operators
+-- maintain a small library of named "presets" (each is a list of inbound
+-- configs); deploy picks one by id and writes preset.json into the
+-- container's /data volume. Per-node assignment lives in
+-- xout_node_assignments — single row per node since xout is single-tenant.
+CREATE TABLE IF NOT EXISTS xout_presets (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT,
+  -- Array of inbound configs. Each entry has at least {tag, protocol,
+  -- port}. See vpsbox/scripts/container-entrypoint.sh for the full schema.
+  inbounds JSONB NOT NULL DEFAULT '[]'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS xout_presets_touch_updated_at ON xout_presets;
+CREATE TRIGGER xout_presets_touch_updated_at
+BEFORE UPDATE ON xout_presets
+FOR EACH ROW
+EXECUTE FUNCTION touch_updated_at();
+
+CREATE TABLE IF NOT EXISTS xout_node_assignments (
+  node_name  TEXT PRIMARY KEY REFERENCES nodes(name) ON DELETE CASCADE ON UPDATE CASCADE,
+  preset_id  BIGINT NOT NULL REFERENCES xout_presets(id) ON DELETE RESTRICT,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  applied_by TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_xout_assignments_preset
+  ON xout_node_assignments (preset_id);
+
 -- Sequence re-sync ------------------------------------------------------
 -- After cross-database sync (online→one or primary→one), BIGSERIAL columns
 -- can have rows with explicit id values that outrun the local sequence's

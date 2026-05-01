@@ -326,6 +326,7 @@ def render_deploy_script(
   revision: str | None,
   env_file_content: str,
   install_dir: str | None = None,
+  extra_files: dict[str, str] | None = None,
 ) -> str:
   """Build the bash script the platform runs on the target node.
 
@@ -365,6 +366,22 @@ def render_deploy_script(
   # that's deliberately unlikely to collide with any value text.
   marker = "SSLSVC_ENV_E0F"
 
+  # Optional extra files (e.g. data/preset.json for xout). Each gets
+  # written via heredoc with its own marker. Paths are interpreted
+  # relative to install_dir; we strip a leading slash so absolute paths
+  # don't escape into /.
+  extra_files_block = ""
+  if extra_files:
+    parts: list[str] = ["echo '--- writing extra deploy files ---'"]
+    for raw_path, content in extra_files.items():
+      safe_path = raw_path.lstrip("/")
+      file_marker = f"SSLSVC_FILE_{abs(hash(safe_path)) % 100000}"
+      parts.append(f"mkdir -p \"$(dirname {shlex.quote(safe_path)})\"")
+      parts.append(f"cat > {shlex.quote(safe_path)} <<'{file_marker}'")
+      parts.append(content.rstrip("\n"))
+      parts.append(file_marker)
+    extra_files_block = "\n".join(parts) + "\n"
+
   return f"""#!/usr/bin/env bash
 set -euo pipefail
 INSTALL_DIR={shlex.quote(install)}
@@ -400,7 +417,7 @@ echo "==> Resolved SHA: ${{DEPLOYED_SHA}}"
 cat > .env <<'{marker}'
 {env_file_content}{marker}
 
-{vols_block}{pre_block}
+{vols_block}{extra_files_block}{pre_block}
 echo "--- docker compose up -d --build ---"
 docker compose -f {shlex.quote(compose)} -p "${{SERVICE}}" up -d --build
 

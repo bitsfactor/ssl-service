@@ -2417,6 +2417,163 @@ class Database:
       connection.commit()
       return deleted > 0
 
+  # ---------- xout channel: presets + per-node assignments ----------
+
+  @staticmethod
+  def _row_to_xout_preset(row: dict) -> dict:
+    return {
+      "id": int(row["id"]),
+      "name": row["name"],
+      "description": row.get("description"),
+      "inbounds": list(row.get("inbounds") or []),
+      "created_at": row.get("created_at"),
+      "updated_at": row.get("updated_at"),
+    }
+
+  def list_xout_presets(self) -> list[dict]:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          "SELECT id, name, description, inbounds, created_at, updated_at "
+          "FROM xout_presets ORDER BY name ASC"
+        )
+        return [self._row_to_xout_preset(r) for r in cursor.fetchall()]
+
+  def get_xout_preset(self, preset_id: int) -> dict | None:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          "SELECT id, name, description, inbounds, created_at, updated_at "
+          "FROM xout_presets WHERE id = %s",
+          (int(preset_id),),
+        )
+        row = cursor.fetchone()
+        return None if row is None else self._row_to_xout_preset(row)
+
+  def insert_xout_preset(
+    self, *, name: str, description: str | None, inbounds: list,
+  ) -> dict:
+    import json as _json
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          INSERT INTO xout_presets (name, description, inbounds, created_at, updated_at)
+          VALUES (%s, %s, %s::jsonb, NOW(), NOW())
+          RETURNING id, name, description, inbounds, created_at, updated_at
+          """,
+          (name, description, _json.dumps(inbounds or [])),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    return self._row_to_xout_preset(row)
+
+  def update_xout_preset(self, preset_id: int, fields: dict) -> dict | None:
+    import json as _json
+    allowed = {"name", "description", "inbounds"}
+    sets = []
+    params: dict = {"id": int(preset_id)}
+    for k, v in fields.items():
+      if k not in allowed:
+        continue
+      if k == "inbounds":
+        sets.append("inbounds = %(inbounds)s::jsonb")
+        params["inbounds"] = _json.dumps(v or [])
+      else:
+        sets.append(f"{k} = %({k})s")
+        params[k] = v
+    if not sets:
+      return self.get_xout_preset(preset_id)
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"""UPDATE xout_presets SET {', '.join(sets)}, updated_at = NOW()
+              WHERE id = %(id)s
+              RETURNING id, name, description, inbounds, created_at, updated_at""",
+          params,
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    return None if row is None else self._row_to_xout_preset(row)
+
+  def delete_xout_preset(self, preset_id: int) -> bool:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute("DELETE FROM xout_presets WHERE id = %s", (int(preset_id),))
+        deleted = cursor.rowcount
+      connection.commit()
+    return deleted > 0
+
+  def get_xout_assignment(self, node_name: str) -> dict | None:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """SELECT a.node_name, a.preset_id, a.applied_at, a.applied_by,
+                    p.name AS preset_name, p.description AS preset_description
+             FROM xout_node_assignments a
+             LEFT JOIN xout_presets p ON p.id = a.preset_id
+             WHERE a.node_name = %s""",
+          (node_name,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+          return None
+        return {
+          "node_name": row["node_name"],
+          "preset_id": int(row["preset_id"]),
+          "preset_name": row.get("preset_name"),
+          "preset_description": row.get("preset_description"),
+          "applied_at": row.get("applied_at"),
+          "applied_by": row.get("applied_by"),
+        }
+
+  def list_xout_assignments(self) -> list[dict]:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """SELECT a.node_name, a.preset_id, a.applied_at, a.applied_by,
+                    p.name AS preset_name
+             FROM xout_node_assignments a
+             LEFT JOIN xout_presets p ON p.id = a.preset_id
+             ORDER BY a.node_name ASC"""
+        )
+        return [
+          {
+            "node_name": r["node_name"],
+            "preset_id": int(r["preset_id"]),
+            "preset_name": r.get("preset_name"),
+            "applied_at": r.get("applied_at"),
+            "applied_by": r.get("applied_by"),
+          }
+          for r in cursor.fetchall()
+        ]
+
+  def upsert_xout_assignment(
+    self, node_name: str, preset_id: int, *, applied_by: str | None = None,
+  ) -> dict:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          INSERT INTO xout_node_assignments (node_name, preset_id, applied_at, applied_by)
+          VALUES (%s, %s, NOW(), %s)
+          ON CONFLICT (node_name) DO UPDATE SET
+            preset_id = EXCLUDED.preset_id,
+            applied_at = NOW(),
+            applied_by = EXCLUDED.applied_by
+          RETURNING node_name, preset_id, applied_at, applied_by
+          """,
+          (node_name, int(preset_id), applied_by),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    return {
+      "node_name": row["node_name"],
+      "preset_id": int(row["preset_id"]),
+      "applied_at": row.get("applied_at"),
+      "applied_by": row.get("applied_by"),
+    }
+
   def try_advisory_lock(self, connection: psycopg.Connection, key: str) -> bool:
     with connection.cursor() as cursor:
       cursor.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS locked", (key,))
