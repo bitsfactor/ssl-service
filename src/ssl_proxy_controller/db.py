@@ -1927,6 +1927,23 @@ class Database:
       last_observed_at=r.get("last_observed_at"),
     )
 
+  def delete_service_node_state(
+    self, service_name: str, node_name: str,
+  ) -> bool:
+    """Used by the uninstall flow: clear the (service, node) row after
+    `docker compose down -v` so the Services / Xout pages stop showing
+    this node as having the service deployed. Returns True if a row
+    was deleted, False if there was nothing to clear."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          "DELETE FROM service_node_state WHERE service_name = %s AND node_name = %s",
+          (service_name, node_name),
+        )
+        deleted = cursor.rowcount
+      connection.commit()
+    return deleted > 0
+
   def list_service_node_states(
     self, *, service_name: str | None = None,
   ) -> list[ServiceNodeStateRecord]:

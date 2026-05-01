@@ -746,13 +746,18 @@ def list_nodes(ctx: AdminContext, *, with_status: bool = False) -> list[dict[str
   import time as _time
   from concurrent.futures import ThreadPoolExecutor
   t0 = _time.perf_counter()
-  with ThreadPoolExecutor(max_workers=3) as ex:
+  with ThreadPoolExecutor(max_workers=4) as ex:
     fut_records = ex.submit(ctx.database.list_nodes)
     fut_links = ex.submit(ctx.database.list_all_node_ssh_key_links)
     fut_statuses = ex.submit(ctx.database.list_node_statuses) if with_status else None
+    # Pre-collect names so we can fetch latest_init_runs for the whole set.
     records = fut_records.result()
+    fut_inits = ex.submit(
+      ctx.database.latest_init_run_per_node, [n.name for n in records],
+    ) if records else None
     links_by_node = fut_links.result()
     statuses = fut_statuses.result() if fut_statuses is not None else {}
+    init_runs = fut_inits.result() if fut_inits is not None else {}
   t1 = _time.perf_counter()
   LOGGER.info(
     "list_nodes parallel queries: total=%.0fms n=%d with_status=%s",
@@ -765,6 +770,23 @@ def list_nodes(ctx: AdminContext, *, with_status: bool = False) -> list[dict[str
       item["status"] = _node_status_to_dict(statuses.get(node.name))
     item["linked_keys"] = _serialize_linked_keys(links_by_node.get(node.name, []))
     item["ssh_key_ids"] = [k["id"] for k in item["linked_keys"]]
+    # Latest init run summary so the Nodes table can render an
+    # "initialized?" badge without a per-row request.
+    run = init_runs.get(node.name)
+    if run is None:
+      item["init"] = {"status": "never"}
+    else:
+      tail = (run.log_text or "").rstrip()
+      item["init"] = {
+        "status": run.status,                              # success / failed / running
+        "current_step": run.current_step,
+        "exit_code": run.exit_code,
+        "started_at": _to_jsonable(run.started_at),
+        "finished_at": _to_jsonable(run.finished_at),
+        "run_id": run.id,
+        # Last ~12 lines for tooltip — keeps payload small.
+        "tail": "\n".join(tail.splitlines()[-12:]),
+      }
     out.append(item)
   return out
 
@@ -1161,6 +1183,241 @@ def deploy_node_service(ctx: AdminContext, node_name: str, payload: dict[str, An
     "stdout": result.stdout,
     "stderr": result.stderr,
     "duration_seconds": result.duration_seconds,
+  }
+
+
+def uninstall_node_services(
+  ctx: AdminContext, name: str, payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+  """Stop + remove every registered service from this node.
+  For each service in the catalog (or the explicit list in payload['services']):
+    1. cd <install_dir> && docker compose down -v --remove-orphans
+    2. rm -rf <install_dir>
+    3. clear service_node_state row for (service, node)
+  Returns per-service exit codes + the consolidated log."""
+  _require_readwrite(ctx)
+  name = _normalize_node_name(name)
+  node = ctx.database.get_node(name)
+  if node is None:
+    raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {name}", code="node_not_found")
+  payload = payload or {}
+  raw_services = payload.get("services")
+  catalog = ctx.database.list_services()
+  if isinstance(raw_services, list) and raw_services:
+    wanted = {str(s).strip() for s in raw_services if str(s).strip()}
+    targets = [s for s in catalog if s.name in wanted]
+    missing = wanted - {s.name for s in targets}
+    if missing:
+      raise HttpError(HTTPStatus.NOT_FOUND,
+                      f"unknown service(s): {', '.join(sorted(missing))}",
+                      code="service_not_found")
+  else:
+    targets = list(catalog)
+
+  if not targets:
+    return {"node": node.name, "results": [], "message": "no services in the catalog"}
+
+  import shlex as _shlex
+  parts: list[str] = ["set -u", "OVERALL_RC=0"]
+  expected: list[dict[str, Any]] = []
+  for s in targets:
+    install_dir = (s.install_dir_template or "/opt/{name}").replace("{name}", s.name)
+    compose = s.compose_file or "docker-compose.yml"
+    parts.append(f'echo "===BEGIN===<{s.name}>"')
+    parts.append(
+      f'INSTALL_DIR={_shlex.quote(install_dir)}; '
+      f'COMPOSE_FILE={_shlex.quote(compose)}; '
+      f'if [ -d "$INSTALL_DIR" ]; then '
+      f'  cd "$INSTALL_DIR" && '
+      f'  if [ -f "$COMPOSE_FILE" ]; then '
+      f'    docker compose -f "$COMPOSE_FILE" down -v --remove-orphans 2>&1 | tail -20 || OVERALL_RC=$?; '
+      f'  else echo "no compose file at $COMPOSE_FILE"; fi; '
+      f'  cd /; rm -rf "$INSTALL_DIR" && echo "removed $INSTALL_DIR" || OVERALL_RC=$?; '
+      f'else echo "skip: $INSTALL_DIR not present"; fi; '
+      f'docker rm -f {_shlex.quote(s.name)} 2>/dev/null || true; '
+      f'echo "rc=$?"'
+    )
+    parts.append(f'echo "===END===<{s.name}>"')
+    expected.append({"service": s.name, "install_dir": install_dir})
+
+  parts.append('docker image prune -f 2>&1 | tail -3 || true')
+  parts.append('docker network prune -f 2>&1 | tail -3 || true')
+
+  script = "\n".join(parts)
+  try:
+    result = nodes_mod.run_command(
+      node, script, timeout=180.0,
+      linked_keys=_ssh_credentials_for_node(ctx, node.name),
+    )
+  except Exception as exc:
+    raise HttpError(HTTPStatus.BAD_GATEWAY,
+                    f"uninstall failed: {exc}", code="uninstall_failed") from exc
+
+  out = result.stdout or ""
+  results = []
+  for spec in expected:
+    block_re = re.compile(
+      r"===BEGIN===<" + re.escape(spec["service"]) +
+      r">\n(.*?)===END===<" + re.escape(spec["service"]) + r">",
+      re.DOTALL,
+    )
+    m = block_re.search(out)
+    block = (m.group(1).strip() if m else "")[:600]
+    rc_m = re.search(r"rc=(\d+)\s*$", block)
+    results.append({
+      "service": spec["service"],
+      "install_dir": spec["install_dir"],
+      "ok": "removed" in block or "skip:" in block,
+      "rc": int(rc_m.group(1)) if rc_m else None,
+      "log": block,
+    })
+    # Clear the (service, node) state row even on partial failures —
+    # the deploy machinery uses this row only as a fast view; deploy
+    # history stays in service_deployments untouched.
+    try:
+      ctx.database.delete_service_node_state(spec["service"], node.name)
+    except Exception:
+      LOGGER.exception("uninstall: clearing service_node_state for %s/%s failed",
+                       spec["service"], node.name)
+
+  return {
+    "node": node.name,
+    "duration_seconds": result.duration_seconds,
+    "results": results,
+    "ok_count": sum(1 for r in results if r["ok"]),
+    "fail_count": sum(1 for r in results if not r["ok"]),
+  }
+
+
+def clean_node(
+  ctx: AdminContext, name: str, payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+  """Aggressive reset for a dirty VPS — sibling of uninstall_node_services
+  but goes much further. Intended for nodes you've inherited or that have
+  accumulated cruft you'd rather not investigate one container at a time.
+
+  Steps:
+    1. Stop + rm ALL docker containers (not just ours), prune networks /
+       volumes / images / build cache.
+    2. Stop + disable any systemd unit we may have installed in earlier
+       eras (vpsproxy-xray, ssl-proxy-controller, caddy from our own
+       install). Keep the user's own systemd alone.
+    3. rm -rf /opt/* directories that match a registered service name,
+       plus ~/.vpsproxy (legacy non-container vps.sh state).
+
+  All destructive commands are guarded with || true so a single failure
+  doesn't stop the rest. We don't touch /etc/ssh/sshd_config — the SSH
+  port change was applied during init and reverting it would lock us
+  out of the box.
+
+  Body: ``{confirm: 'yes'}`` — a sanity guard since this is a one-shot
+  destroyer. Other strings are rejected.
+  """
+  _require_readwrite(ctx)
+  name = _normalize_node_name(name)
+  node = ctx.database.get_node(name)
+  if node is None:
+    raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {name}", code="node_not_found")
+  payload = payload or {}
+  if (payload.get("confirm") or "").strip().lower() != "yes":
+    raise HttpError(HTTPStatus.BAD_REQUEST,
+                    "must POST {\"confirm\": \"yes\"} to run a destructive clean",
+                    code="confirm_required")
+
+  import shlex as _shlex
+  catalog = ctx.database.list_services()
+  service_dirs = [
+    (s.install_dir_template or "/opt/{name}").replace("{name}", s.name)
+    for s in catalog
+  ]
+
+  parts: list[str] = ["set -u", "echo '== clean-server =='"]
+
+  # 1) Docker: stop+rm everything, then prune.
+  parts.extend([
+    'echo "===BEGIN===<docker-stop>"',
+    'if command -v docker >/dev/null 2>&1; then',
+    '  CIDS="$(docker ps -aq 2>/dev/null || true)"',
+    '  if [ -n "$CIDS" ]; then',
+    '    echo "stopping $(echo "$CIDS" | wc -l) container(s)"',
+    '    docker stop $CIDS 2>&1 | tail -10 || true',
+    '    docker rm -f $CIDS 2>&1 | tail -10 || true',
+    '  else echo "no containers to stop"; fi',
+    '  docker system prune -af --volumes 2>&1 | tail -8 || true',
+    'else echo "docker not installed (skip)"; fi',
+    'echo "===END===<docker-stop>"',
+  ])
+
+  # 2) Legacy systemd units (we installed in pre-container era).
+  parts.extend([
+    'echo "===BEGIN===<systemd>"',
+    'for unit in vpsproxy-xray ssl-proxy-controller xout; do',
+    '  if systemctl is-active --quiet "$unit" 2>/dev/null; then',
+    '    echo "stopping $unit"',
+    '    systemctl stop "$unit" 2>&1 | tail -3 || true',
+    '  fi',
+    '  if systemctl is-enabled --quiet "$unit" 2>/dev/null; then',
+    '    systemctl disable "$unit" 2>&1 | tail -3 || true',
+    '  fi',
+    '  rm -f /etc/systemd/system/"$unit".service 2>/dev/null || true',
+    'done',
+    'systemctl daemon-reload 2>/dev/null || true',
+    'echo "===END===<systemd>"',
+  ])
+
+  # 3) Install dirs from the catalog + legacy state dir.
+  legacy_dirs = ["$HOME/.vpsproxy", "/root/.vpsproxy"]
+  for d in service_dirs + legacy_dirs:
+    safe = _shlex.quote(d)
+    parts.extend([
+      f'echo "===BEGIN===<rm:{d}>"',
+      f'if [ -e {safe} ]; then echo "removing {d}"; rm -rf {safe} && echo "ok"; '
+      f'else echo "not present"; fi',
+      f'echo "===END===<rm:{d}>"',
+    ])
+
+  parts.append('echo "== clean-server done =="')
+
+  script = "\n".join(parts)
+  try:
+    result = nodes_mod.run_command(
+      node, script, timeout=240.0,
+      linked_keys=_ssh_credentials_for_node(ctx, node.name),
+    )
+  except Exception as exc:
+    raise HttpError(HTTPStatus.BAD_GATEWAY,
+                    f"clean failed: {exc}", code="clean_failed") from exc
+
+  out = result.stdout or ""
+
+  def _block(tag: str) -> str:
+    rx = re.compile(
+      r"===BEGIN===<" + re.escape(tag) + r">\n(.*?)===END===<" + re.escape(tag) + r">",
+      re.DOTALL,
+    )
+    m = rx.search(out)
+    return (m.group(1).strip() if m else "")[:800]
+
+  sections: list[dict[str, Any]] = [
+    {"tag": "docker-stop", "label": "Docker (stop + prune)", "log": _block("docker-stop")},
+    {"tag": "systemd",     "label": "Legacy systemd units",  "log": _block("systemd")},
+  ]
+  for d in service_dirs + legacy_dirs:
+    sections.append({"tag": f"rm:{d}", "label": f"Remove {d}", "log": _block(f"rm:{d}")})
+
+  # Clear all (service, node) state rows since we just nuked everything.
+  for s in catalog:
+    try:
+      ctx.database.delete_service_node_state(s.name, node.name)
+    except Exception:
+      LOGGER.exception("clean: clearing service_node_state for %s/%s failed",
+                       s.name, node.name)
+
+  return {
+    "node": node.name,
+    "duration_seconds": result.duration_seconds,
+    "sections": sections,
+    "stdout_tail": out[-2000:],
   }
 
 
@@ -3369,6 +3626,16 @@ def _build_router(ctx: AdminContext) -> _Router:
       HTTPStatus.OK, update_node_action(ctx, request.path_params["name"], payload)
     )
 
+  def node_uninstall_services_handler(request: _Request) -> _Response:
+    return _json_response(HTTPStatus.OK,
+      uninstall_node_services(ctx, request.path_params["name"],
+                              request.json_body() if request.body else {}))
+
+  def node_clean_handler(request: _Request) -> _Response:
+    return _json_response(HTTPStatus.OK,
+      clean_node(ctx, request.path_params["name"],
+                 request.json_body() if request.body else {}))
+
   def node_run_handler(request: _Request) -> _Response:
     payload = request.json_body() if request.body else {}
     return _json_response(
@@ -3443,6 +3710,10 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("POST", "/api/nodes/{name}/deploy-service", with_auth(node_deploy_service_handler))
   router.add("POST", "/api/nodes/{name}/update", with_auth(node_update_handler))
   router.add("POST", "/api/nodes/{name}/run", with_auth(node_run_handler))
+  router.add("POST", "/api/nodes/{name}/uninstall-services",
+             with_auth(node_uninstall_services_handler))
+  router.add("POST", "/api/nodes/{name}/clean",
+             with_auth(node_clean_handler))
   router.add("GET", "/api/host/ssh-keys", with_auth(host_ssh_keys_handler))
   router.add("POST", "/api/host/ssh-keys/read", with_auth(host_ssh_keys_read_handler))
   router.add("POST", "/api/nodes/{name}/init/start", with_auth(init_start_handler))
