@@ -2920,22 +2920,18 @@
       detail = resp;
     } catch (err) { toast("error", "Could not load node", err.message); return; }
 
-    // Load both registries:
-    //  - adminKeys: SSH keys saved in the SSH Keys channel (preferred).
-    //               Operator manages these in /#/ssh-keys; one can be
-    //               marked as the init-default. They live in the DB.
-    //  - localKeys: legacy fallback — files in the operator's local
-    //               ~/.ssh on the Mac. Useful when the operator hasn't
-    //               registered keys yet but already has them on disk.
+    // Load admin registries (SSH Keys channel + AI Keys channel) so
+    // step 1 and step 3 can offer the operator's pre-saved values.
     let adminKeys = [];
-    let localKeys = [];
+    let aiKeys = [];
     try {
       const r = await api("GET", "/api/ssh-keys");
       adminKeys = r.ssh_keys || r.keys || [];
     } catch (err) { /* non-fatal */ }
     try {
-      localKeys = (await api("GET", "/api/host/ssh-keys")).keys || [];
-    } catch (err) { /* non-fatal — user can paste manually */ }
+      const r = await api("GET", "/api/ai-api-keys");
+      aiKeys = r.ai_api_keys || r.keys || [];
+    } catch (err) { /* non-fatal */ }
 
     const state = {
       step: 1,
@@ -3047,30 +3043,7 @@
         wrap.appendChild(h("div", { class: "muted", style: "font-size: 12px; margin-bottom: 8px; padding: 8px; background: var(--surface-2); border-radius: 4px" },
           "No keys in your SSH Keys registry yet. Add one in ",
           h("a", { href: "#/ssh-keys", style: "color: var(--accent,#2563eb)" }, "SSH Keys"),
-          " (and mark one as init-default), or pick from your Mac below."));
-      }
-
-      // ── Section B: Mac local files (legacy fallback)
-      if (localKeys.length) {
-        const list = h("div", { style: "display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px" });
-        list.appendChild(h("div", { class: "muted", style: "font-size: 12px; margin-top: 6px" },
-          "Or pick a file from your Mac (~/.ssh):"));
-        for (const k of localKeys) {
-          list.appendChild(h("div", { class: "row", style: "gap: 8px" },
-            h("button", { class: "btn btn-sm", onclick: async (e) => {
-              e.preventDefault();
-              try {
-                const r = await api("POST", "/api/host/ssh-keys/read", {path: k.path});
-                state.git_private_key = r.content;
-                document.getElementById("wiz-key").value = r.content;
-                toast("success", "Loaded", k.name);
-              } catch (err) { toast("error", "Failed to read", err.message); }
-            } }, `Use ${k.name}`),
-            h("span", { class: "muted mono", style: "font-size: 11.5px" },
-              `${k.type || "?"}  ${k.fingerprint || ""}`),
-          ));
-        }
-        wrap.appendChild(list);
+          " (and mark one as init-default), or paste a key body manually below."));
       }
 
       wrap.appendChild(h("div", { class: "field" },
@@ -3119,6 +3092,73 @@
         h("input", { id: "wiz-install-codex", type: "checkbox", checked: state.install_codex }),
         h("label", { for: "wiz-install-codex", style: "margin: 0" }, "Install Codex CLI"),
       ));
+
+      // AI Keys registry picker (mirrors step 1's SSH-keys picker).
+      // Each row has: Use button (default-highlighted in accent color),
+      // name + url + masked key + default badge. Clicking Use fills
+      // both BASE_URL and API_KEY fields below.
+      if (aiKeys.length) {
+        const list = h("div", { style: "display: flex; flex-direction: column; gap: 6px; margin: 8px 0 12px" });
+        list.appendChild(h("div", { class: "muted", style: "font-size: 12px" },
+          "Pick from your ", h("strong", null, "AI Keys"), " registry:"));
+        const sorted = aiKeys.slice().sort((a, b) =>
+          (b.is_init_default ? 1 : 0) - (a.is_init_default ? 1 : 0)
+          || (a.name || "").localeCompare(b.name || ""));
+        for (const k of sorted) {
+          const useBtn = h("button", { class: "btn btn-sm",
+            onclick: async (e) => {
+              e.preventDefault();
+              try {
+                // Re-fetch full record — list endpoint may mask api_key.
+                const full = await api("GET", `/api/ai-api-keys/${k.id}`);
+                state.codex_base_url = full.url || k.url || "";
+                state.codex_api_key  = full.api_key || k.api_key || "";
+                document.getElementById("wiz-codex-url").value = state.codex_base_url;
+                document.getElementById("wiz-codex-key").value = state.codex_api_key;
+                toast("success", "Loaded", k.name);
+              } catch (err) { toast("error", "Failed to read", err.message); }
+            } }, k.is_init_default ? `Use ${k.name} ★` : `Use ${k.name}`);
+          if (k.is_init_default) {
+            useBtn.setAttribute("style", "background: var(--accent,#2563eb); color: white; border-color: var(--accent,#2563eb)");
+          }
+          const maskedKey = (k.api_key || "").length > 8
+            ? (k.api_key.slice(0, 4) + "…" + k.api_key.slice(-4))
+            : (k.api_key ? "(short)" : "(empty)");
+          list.appendChild(h("div", { class: "row", style: "gap: 8px; align-items: center" },
+            useBtn,
+            h("span", { class: "muted mono", style: "font-size: 11.5px; flex: 1" },
+              `${k.url || ""}  ${maskedKey}`),
+            k.is_init_default
+              ? h("span", { class: "badge ok", style: "font-size: 10px" }, "default")
+              : null,
+          ));
+        }
+        wrap.appendChild(list);
+        // Auto-fill the default on first render so the operator can
+        // accept-as-is by hitting Next.
+        if (!state.codex_api_key) {
+          const dflt = sorted.find((k) => k.is_init_default);
+          if (dflt) {
+            api("GET", `/api/ai-api-keys/${dflt.id}`).then((full) => {
+              if (!state.codex_api_key) {
+                state.codex_base_url = full.url || "";
+                state.codex_api_key = full.api_key || "";
+                const u = document.getElementById("wiz-codex-url");
+                const a = document.getElementById("wiz-codex-key");
+                if (u && !u.value.trim()) u.value = state.codex_base_url;
+                if (a && !a.value.trim()) a.value = state.codex_api_key;
+              }
+            }).catch(() => {});
+          }
+        }
+      } else {
+        wrap.appendChild(h("div", { class: "muted",
+          style: "font-size: 12px; margin: 8px 0; padding: 8px; background: var(--surface-2); border-radius: 4px" },
+          "No keys in your AI Keys registry yet. Add one in ",
+          h("a", { href: "#/ai-keys", style: "color: var(--accent,#2563eb)" }, "AI Keys"),
+          " (and mark one as init-default), or paste below."));
+      }
+
       wrap.appendChild(h("div", { class: "field" },
         h("label", null, "OPENAI_BASE_URL ", h("span", { class: "hint" }, " — leave blank to use script default")),
         h("input", { id: "wiz-codex-url", class: "input mono", value: state.codex_base_url,
