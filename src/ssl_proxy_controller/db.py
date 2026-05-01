@@ -2936,9 +2936,18 @@ class Database:
     self, node_name: str, token_id: int, day, *,
     uplink_bytes: int, downlink_bytes: int,
   ) -> None:
-    """Snapshot the raw cumulative byte counters (since container last
-    started) into the daily row. Caller passes deltas — we just store
-    the latest seen value for that day."""
+    """Snapshot raw cumulative byte counters into the daily row.
+
+    Xray's stats counters reset to 0 every time the container restarts.
+    If a container restarts mid-day and we sync after restart, the
+    'fresh' reading is smaller than what we already stored. Using
+    GREATEST(existing, incoming) keeps the highest reading we've seen
+    today, so a single same-day restart only loses traffic between the
+    restart moment and the next sync — not everything pre-restart.
+
+    For a perfectly accurate counter you'd track 'last raw reading' and
+    add deltas; the GREATEST trick is the high-confidence approximation
+    that doesn't need extra state. The next day's row starts fresh."""
     with self.connect() as connection:
       with connection.cursor() as cursor:
         cursor.execute(
@@ -2947,8 +2956,8 @@ class Database:
             uplink_bytes, downlink_bytes, updated_at)
           VALUES (%s, %s, %s, %s, %s, NOW())
           ON CONFLICT (node_name, token_id, day) DO UPDATE SET
-            uplink_bytes = EXCLUDED.uplink_bytes,
-            downlink_bytes = EXCLUDED.downlink_bytes,
+            uplink_bytes   = GREATEST(xout_traffic_daily.uplink_bytes,   EXCLUDED.uplink_bytes),
+            downlink_bytes = GREATEST(xout_traffic_daily.downlink_bytes, EXCLUDED.downlink_bytes),
             updated_at = NOW()
           """,
           (node_name, int(token_id), day, int(uplink_bytes), int(downlink_bytes)),

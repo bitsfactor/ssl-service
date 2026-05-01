@@ -4301,6 +4301,7 @@ def _build_router(ctx: AdminContext) -> _Router:
     one token across all nodes that have this token assigned. Returns
     {raw: [uri,...], plain: 'uri\nuri\n...', base64: '...', clash: 'yaml-string'}."""
     import base64 as _b64
+    from urllib.parse import quote as _q
     uris: list[str] = []
     for node_name, info in node_assignments.items():
       preset = info.get("preset")
@@ -4324,11 +4325,12 @@ def _build_router(ctx: AdminContext) -> _Router:
           # without the actual public key.
           if not pub or pub.lower() == "auto":
             continue
-          frag = f"{node_name}-{tag}"
+          frag = _q(f"{node_name}-{tag}", safe="")
           uri = (
             f"vless://{token['uuid']}@{host}:{port}"
             f"?encryption=none&security=reality&type=tcp&flow="
-            f"&sni={sni}&pbk={pub}&sid={sid}&fp=chrome#{frag}"
+            f"&sni={_q(sni, safe='')}"
+            f"&pbk={_q(pub, safe='')}&sid={_q(sid, safe='')}&fp=chrome#{frag}"
           )
           uris.append(uri)
         elif proto == "http":
@@ -4336,22 +4338,37 @@ def _build_router(ctx: AdminContext) -> _Router:
           # Per-token semantics: http inbound auth is at the inbound level
           # (not per-user). We embed the inbound's auth, NOT the token's
           # password — they're conceptually different in xray's model.
+          # URL-encode user/pass so a literal ':', '@', '/', '?', or '#'
+          # in the inbound auth doesn't break the URI.
           auth = ib.get("auth") or {}
+          frag = _q(f"{node_name}-{tag}", safe="")
           if auth.get("user"):
-            uri = f"http://{auth['user']}:{auth.get('pass','')}@{host}:{port}#{node_name}-{tag}"
+            u = _q(str(auth["user"]), safe="")
+            pw = _q(str(auth.get("pass", "")), safe="")
+            uri = f"http://{u}:{pw}@{host}:{port}#{frag}"
           else:
-            uri = f"http://{host}:{port}#{node_name}-{tag}"
+            uri = f"http://{host}:{port}#{frag}"
           uris.append(uri)
         elif proto == "socks":
           auth = ib.get("auth") or {}
+          frag = _q(f"{node_name}-{tag}", safe="")
           if auth.get("user"):
-            uri = f"socks://{auth['user']}:{auth.get('pass','')}@{host}:{port}#{node_name}-{tag}"
+            u = _q(str(auth["user"]), safe="")
+            pw = _q(str(auth.get("pass", "")), safe="")
+            uri = f"socks://{u}:{pw}@{host}:{port}#{frag}"
           else:
-            uri = f"socks://{host}:{port}#{node_name}-{tag}"
+            uri = f"socks://{host}:{port}#{frag}"
           uris.append(uri)
 
     plain = "\n".join(uris) + "\n" if uris else ""
     b64 = _b64.b64encode(plain.encode("utf-8")).decode("ascii") if plain else ""
+
+    # Quote a YAML scalar that may contain double-quotes or newlines.
+    # We always use double-quoted form so any special char is safe; only
+    # `"` and `\` need escaping inside that form.
+    def _yq(s: str) -> str:
+      s = "" if s is None else str(s)
+      return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
     # Minimal Clash config — proxy nodes only, no rules. Clients merge
     # this into their main rule set. Each entry is a YAML object.
@@ -4372,40 +4389,40 @@ def _build_router(ctx: AdminContext) -> _Router:
           if not pk_clash or pk_clash.lower() == "auto":
             continue
           clash_lines.extend([
-            f"  - name: \"{node_name}-{tag}\"",
+            f"  - name: {_yq(f'{node_name}-{tag}')}",
             f"    type: vless",
-            f"    server: {host}",
+            f"    server: {_yq(host)}",
             f"    port: {port}",
-            f"    uuid: {token['uuid']}",
+            f"    uuid: {_yq(token['uuid'])}",
             f"    network: tcp",
             f"    tls: true",
             f"    udp: true",
             f"    flow: \"\"",
-            f"    servername: {reality.get('sni','')}",
+            f"    servername: {_yq(reality.get('sni',''))}",
             f"    reality-opts:",
-            f"      public-key: {reality.get('public_key') or reality.get('pubkey','')}",
-            f"      short-id: \"{reality.get('short_id','')}\"",
+            f"      public-key: {_yq(pk_clash)}",
+            f"      short-id: {_yq(reality.get('short_id',''))}",
             f"    client-fingerprint: chrome",
           ])
         elif proto == "http":
           auth = ib.get("auth") or {}
           clash_lines.extend([
-            f"  - name: \"{node_name}-{tag}\"",
+            f"  - name: {_yq(f'{node_name}-{tag}')}",
             f"    type: http",
-            f"    server: {host}",
+            f"    server: {_yq(host)}",
             f"    port: {port}",
-            f"    username: {auth.get('user','')}",
-            f"    password: {auth.get('pass','')}",
+            f"    username: {_yq(auth.get('user',''))}",
+            f"    password: {_yq(auth.get('pass',''))}",
           ])
         elif proto == "socks":
           auth = ib.get("auth") or {}
           clash_lines.extend([
-            f"  - name: \"{node_name}-{tag}\"",
+            f"  - name: {_yq(f'{node_name}-{tag}')}",
             f"    type: socks5",
-            f"    server: {host}",
+            f"    server: {_yq(host)}",
             f"    port: {port}",
-            f"    username: {auth.get('user','')}",
-            f"    password: {auth.get('pass','')}",
+            f"    username: {_yq(auth.get('user',''))}",
+            f"    password: {_yq(auth.get('pass',''))}",
             f"    udp: true",
           ])
     clash = "\n".join(clash_lines) + ("\n" if len(clash_lines) > 1 else "")
@@ -4746,7 +4763,14 @@ def _build_router(ctx: AdminContext) -> _Router:
     p = request.json_body() or {}
     raw_nodes = p.get("nodes")
     if isinstance(raw_nodes, list) and raw_nodes:
-      target_names = [_normalize_node_name(str(n)) for n in raw_nodes]
+      # Dedup while preserving order — duplicates would re-ssh the same
+      # box twice for nothing.
+      seen: set[str] = set()
+      target_names = []
+      for n in raw_nodes:
+        nn = _normalize_node_name(str(n))
+        if nn not in seen:
+          seen.add(nn); target_names.append(nn)
     else:
       assignments = ctx.database.list_xout_assignments()
       target_names = [a["node_name"] for a in assignments]
@@ -4827,7 +4851,12 @@ def _build_router(ctx: AdminContext) -> _Router:
     p = request.json_body() or {}
     raw_nodes = p.get("nodes")
     if isinstance(raw_nodes, list) and raw_nodes:
-      target_names = [_normalize_node_name(str(n)) for n in raw_nodes]
+      seen: set[str] = set()
+      target_names = []
+      for n in raw_nodes:
+        nn = _normalize_node_name(str(n))
+        if nn not in seen:
+          seen.add(nn); target_names.append(nn)
     else:
       assignments = ctx.database.list_xout_assignments()
       target_names = [a["node_name"] for a in assignments]

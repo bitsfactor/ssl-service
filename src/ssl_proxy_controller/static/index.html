@@ -6103,22 +6103,24 @@
     };
 
     async function refresh() {
-      try {
-        const [pr, tr, nr] = await Promise.all([
-          api("GET", "/api/xout/presets"),
-          api("GET", "/api/xout/tokens"),
-          api("GET", "/api/xout/nodes"),
-        ]);
-        renderPresets(pr.presets || []);
-        renderTokens(tr.tokens || []);
-        renderNodes(nr.nodes || []);
-      } catch (err) {
-        presetsBody.innerHTML = "";
-        presetsBody.appendChild(h("div", { class: "muted", style: "color: var(--danger)" },
+      // Each call is independent — render whichever cards' API succeeded
+      // rather than wedging the whole page if one endpoint flakes.
+      const renderError = (target, err) => {
+        target.innerHTML = "";
+        target.appendChild(h("div", { class: "muted", style: "color: var(--danger); padding: 8px 0" },
           err.status === 404
-            ? "Xout endpoints not available — restart admin to pick up the new build."
-            : "Load failed: " + err.message));
-      }
+            ? "Endpoint missing — restart admin to pick up the new build."
+            : "Load failed: " + (err.message || "")));
+      };
+      const tasks = [
+        ["GET", "/api/xout/presets",  presetsBody, (d) => renderPresets(d.presets || [])],
+        ["GET", "/api/xout/tokens",   tokensBody,  (d) => renderTokens(d.tokens  || [])],
+        ["GET", "/api/xout/nodes",    nodesBody,   (d) => renderNodes(d.nodes    || [])],
+      ];
+      await Promise.all(tasks.map(async ([m, p, body, render]) => {
+        try { render(await api(m, p)); }
+        catch (err) { renderError(body, err); }
+      }));
     }
 
     presetsBody.appendChild(h("div", { class: "muted", style: "padding: 8px 0;" }, "Loading…"));
