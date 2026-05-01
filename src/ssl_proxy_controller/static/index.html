@@ -6674,31 +6674,33 @@
     }
     body.innerHTML = "";
 
-    const tokenN = (r.tokens || []).length;
-    const cachedN = (r.tokens_cached || []).length;
-    const uncachedN = (r.tokens_uncached || []).length;
+    const uriCount = (r.raw || []).length;
+    const matchedN = (r.matched_tokens || []).length;
+    const unknownN = (r.unknown_uuids || []).length;
+    const vlessN = r.vless_inbounds || 0;
 
-    // Header summary
+    // Header summary — emphasises that we're reading the LIVE deployed
+    // preset, not the DB cache. URI count always equals the number of
+    // (vless inbound × users in that inbound) combinations.
     body.appendChild(h("div", { class: "row",
       style: "gap: 12px; margin-bottom: 10px; flex-wrap: wrap; align-items: center" },
-      h("strong", null, `${(r.raw || []).length} URIs`),
+      h("strong", null, `${uriCount} URI${uriCount === 1 ? "" : "s"}`),
       h("span", { class: "muted" },
-        `from ${tokenN} token${tokenN === 1 ? "" : "s"}`),
-      cachedN ? h("span", { class: "badge ok",
-        style: "font-size: 11px",
-        title: "Built from on-disk resolved preset (real Reality keys)" },
-        `${cachedN} synced`) : null,
-      uncachedN ? h("span", { class: "badge", style: "font-size: 11px",
-        title: "On-the-fly fallback used — VLESS URIs may be skipped if Reality public_key is still 'auto'. Run 'Sync tokens' to populate the cache." },
-        `${uncachedN} on-the-fly`) : null,
+        `· ${vlessN} vless inbound${vlessN === 1 ? "" : "s"}`),
+      matchedN ? h("span", { class: "badge ok", style: "font-size: 11px",
+        title: "User UUID matches a DB token" },
+        `${matchedN} matched`) : null,
+      unknownN ? h("span", { class: "badge danger", style: "font-size: 11px",
+        title: "User UUID present in deployed preset but not registered in the Tokens table — usage won't be attributed to any token" },
+        `${unknownN} unknown`) : null,
     ));
 
-    if (!tokenN) {
+    if (!uriCount) {
       body.appendChild(h("div", { class: "muted",
         style: "padding: 12px; background: var(--surface-2); border-radius: 6px; margin-bottom: 10px" },
-        "No tokens have been published to this node yet. Open the ",
-        h("strong", null, "Tokens"),
-        " card and click ", h("strong", null, "Publish"), " on a token to assign it here."));
+        vlessN === 0
+          ? "This node has no VLESS inbounds in its deployed preset."
+          : "VLESS inbounds exist on this node but their Reality public keys aren't ready yet. Wait a few seconds for the container to finish startup, then reopen this dialog."));
     }
 
     // Format toggle (radio-like — only one section visible at a time)

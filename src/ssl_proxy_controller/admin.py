@@ -4782,98 +4782,150 @@ def _build_router(ctx: AdminContext) -> _Router:
     })
 
   def xout_node_subscription_handler(request: _Request) -> _Response:
-    """Aggregated subscription content for ONE node across every token
-    that has been published to it. Returns the same shape as the
-    per-token subscription endpoint (raw / plain / base64 / clash).
+    """Live per-node subscription content.
 
-    Per-token cached strings (populated by sync-tokens, which reads
-    /data/preset.json.resolved) are preferred. Tokens whose cache is
-    stale fall through to an on-the-fly build from the stored preset
-    (which silently drops vless URIs whose Reality public_key is still
-    'auto' — the operator should run 'Sync tokens' on this node first
-    to populate the cache).
-    """
+    SSHes into the node, reads ``/data/preset.json.resolved`` (the
+    actually-running config — has real Reality public/private keys + the
+    user UUIDs xray is currently accepting), and builds the subscription
+    from THAT. This bypasses the DB cache entirely so what the operator
+    sees here is exactly what their clients will be able to connect to.
+
+    Falls back to ``/data/preset.json`` if .resolved doesn't exist
+    (early stage of first deploy). VLESS-only — HTTP/SOCKS are gateway
+    proxies, not subscription targets."""
     name = _normalize_node_name(request.path_params["name"])
     node = ctx.database.get_node(name)
     if node is None:
       raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {name}",
                       code="node_not_found")
-    rows = ctx.database.list_xout_node_tokens_for_node(name)
 
-    cached_b64_chunks: list[str] = []
-    cached_clash_chunks: list[str] = []
-    nodes_cached_for: list[str] = []  # which token names had cache hits
-    nodes_uncached_for: list[str] = []
+    # Try resolved first, fall back to stored preset on the node.
+    # Also try `docker exec xout cat ...` in case the host bind mount
+    # isn't pointing at the right place — the container always sees the
+    # canonical /data/preset.json.resolved.
+    cmd = (
+      "set -e; "
+      "for f in /data/preset.json.resolved /data/preset.json "
+      "         /opt/xout/data/preset.json.resolved /opt/xout/data/preset.json; do "
+      "  if [ -f \"$f\" ]; then cat \"$f\"; exit 0; fi; "
+      "done; "
+      # Last resort: pull from inside the running container.
+      "docker exec xout cat /data/preset.json.resolved 2>/dev/null "
+      "|| docker exec xout cat /data/preset.json 2>/dev/null "
+      "|| echo '[]'"
+    )
+    try:
+      rc = nodes_mod.run_command(node, cmd, timeout=20.0,
+                                  linked_keys=_ssh_credentials_for_node(ctx, name))
+    except Exception as exc:
+      raise HttpError(HTTPStatus.BAD_GATEWAY,
+                      f"could not read preset on node: {exc}"[:300],
+                      code="ssh_failed") from exc
+    raw_text = (rc.stdout or "").strip() or "[]"
+    try:
+      data = json.loads(raw_text)
+    except Exception as exc:
+      raise HttpError(HTTPStatus.BAD_GATEWAY,
+                      f"could not parse preset on node ({len(raw_text)} bytes): {exc}",
+                      code="parse_failed") from exc
 
-    # On-the-fly builds need the assigned preset for THIS node — fetch
-    # once, reuse for every token that lacks a cache.
-    a = ctx.database.get_xout_assignment(name)
-    preset = ctx.database.get_xout_preset(a["preset_id"]) if a else None
+    # Both list-shape and dict-with-inbounds shape are accepted.
+    if isinstance(data, list):
+      inbounds_list = data
+    elif isinstance(data, dict):
+      inbounds_list = data.get("inbounds") or []
+    else:
+      raise HttpError(HTTPStatus.BAD_GATEWAY,
+                      f"unexpected preset shape on node: {type(data).__name__}",
+                      code="bad_shape")
 
-    fly_plain_parts: list[str] = []
-    fly_clash_parts: list[str] = []
-    seen_tokens: list[dict] = []
-
-    for r in rows:
-      tok = ctx.database.get_xout_token(r["token_id"])
-      if tok is None: continue
-      seen_tokens.append({"id": tok["id"], "name": tok["name"]})
-      cached_b64 = r.get("base64_subscription")
-      cached_clash = r.get("clash_subscription")
-      if cached_b64 or cached_clash:
-        if cached_b64: cached_b64_chunks.append(cached_b64)
-        if cached_clash: cached_clash_chunks.append(cached_clash)
-        nodes_cached_for.append(tok["name"])
-      elif preset is not None:
-        # Build per-token URIs against this single node only — same
-        # helper as the token-subscription endpoint.
-        subs = _build_subscriptions_for_token(
-          tok, {name: {"node": node, "preset": preset}},
-        )
-        if subs.get("plain"):
-          fly_plain_parts.append(subs["plain"])
-        if subs.get("clash"):
-          fly_clash_parts.append(subs["clash"])
-        nodes_uncached_for.append(tok["name"])
-
+    # Build the subscription content directly from the live inbound
+    # objects. We don't need the DB token list — every UUID xray is
+    # currently accepting is right there in users[].
+    from urllib.parse import quote as _q
     import base64 as _b64
-    plain_parts: list[str] = []
-    for chunk in cached_b64_chunks:
-      try:
-        plain_parts.append(_b64.b64decode(chunk).decode("utf-8"))
-      except Exception:
-        pass
-    plain_parts.extend(fly_plain_parts)
-    plain = "".join(plain_parts)
+    host = node.host
+    uris: list[str] = []
+    clash_lines: list[str] = ["proxies:"]
+    seen_users: list[dict] = []
+
+    def _yq(s):
+      s = "" if s is None else str(s)
+      return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    for ib in inbounds_list:
+      if not isinstance(ib, dict): continue
+      if ib.get("protocol") != "vless": continue  # skip http/socks
+      port = ib.get("port")
+      tag = ib.get("tag") or "vless"
+      reality = ib.get("reality") or {}
+      sni = reality.get("sni", "")
+      pub = (reality.get("public_key") or reality.get("pubkey") or "")
+      sid = reality.get("short_id", "")
+      if not pub or pub.lower() == "auto":
+        # Resolved file should never have "auto" — bail on this inbound.
+        continue
+      users = ib.get("users") or []
+      for u in users:
+        if not isinstance(u, dict): continue
+        uid = (u.get("uuid") or "").strip()
+        if not uid or uid.lower() == "auto":
+          continue
+        uname = u.get("name") or "user"
+        seen_users.append({"uuid": uid, "name": uname, "tag": tag, "port": port})
+        frag = _q(f"{name}-{tag}-{uname}", safe="")
+        uri = (
+          f"vless://{uid}@{host}:{port}"
+          f"?encryption=none&security=reality&type=tcp&flow="
+          f"&sni={_q(sni, safe='')}"
+          f"&pbk={_q(pub, safe='')}&sid={_q(sid, safe='')}&fp=chrome#{frag}"
+        )
+        uris.append(uri)
+        clash_lines.extend([
+          f"  - name: {_yq(f'{name}-{tag}-{uname}')}",
+          f"    type: vless",
+          f"    server: {_yq(host)}",
+          f"    port: {port}",
+          f"    uuid: {_yq(uid)}",
+          f"    network: tcp",
+          f"    tls: true",
+          f"    udp: true",
+          f"    flow: \"\"",
+          f"    servername: {_yq(sni)}",
+          f"    reality-opts:",
+          f"      public-key: {_yq(pub)}",
+          f"      short-id: {_yq(sid)}",
+          f"    client-fingerprint: chrome",
+        ])
+
+    plain = ("\n".join(uris) + "\n") if uris else ""
     b64 = _b64.b64encode(plain.encode("utf-8")).decode("ascii") if plain else ""
+    clash = ("\n".join(clash_lines) + "\n") if len(clash_lines) > 1 else ""
 
-    clash_parts: list[str] = []
-    for i, chunk in enumerate(cached_clash_chunks):
-      if i == 0:
-        clash_parts.append(chunk.rstrip("\n"))
+    # Cross-reference against DB tokens so the UI can show which user
+    # name maps to which DB token (handy for usage / quota tracking).
+    db_tokens = {t["uuid"]: t for t in ctx.database.list_xout_tokens()}
+    matched = []
+    unknown_uuids = []
+    for u in seen_users:
+      tok = db_tokens.get(u["uuid"])
+      if tok is not None:
+        matched.append({"id": tok["id"], "name": tok["name"], "tag": u["tag"]})
       else:
-        body = "\n".join(line for line in chunk.splitlines()
-                         if line.strip() and line.strip() != "proxies:")
-        if body:
-          clash_parts.append(body)
-    for body in fly_clash_parts:
-      if clash_parts:
-        body = "\n".join(line for line in body.splitlines()
-                         if line.strip() and line.strip() != "proxies:")
-      if body:
-        clash_parts.append(body.rstrip("\n"))
-    clash = ("\n".join(clash_parts) + "\n") if clash_parts else ""
+        unknown_uuids.append({"uuid": u["uuid"], "name_in_preset": u["name"], "tag": u["tag"]})
 
-    raw = [u for u in plain.split("\n") if u]
     return _json_response(HTTPStatus.OK, {
       "node": name,
-      "tokens": seen_tokens,
-      "tokens_cached": nodes_cached_for,
-      "tokens_uncached": nodes_uncached_for,
-      "raw": raw,
+      "host": host,
+      "vless_inbounds": sum(1 for ib in inbounds_list
+                             if isinstance(ib, dict) and ib.get("protocol") == "vless"),
+      "raw": uris,
       "plain": plain,
       "base64": b64,
       "clash": clash,
+      "matched_tokens": matched,
+      "unknown_uuids": unknown_uuids,
+      "source_bytes": len(raw_text),
     })
 
   def xout_sync_traffic_handler(request: _Request) -> _Response:
