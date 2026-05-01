@@ -598,6 +598,7 @@ def _node_to_dict(node: NodeRecord, *, reveal_secrets: bool = True) -> dict[str,
     "auth_method": node.auth_method,
     "description": node.description,
     "tags": list(node.tags or []),
+    "groups": list(node.groups or []),
     "deploy_command": node.deploy_command,
     "update_command": node.update_command,
     "created_at": _to_jsonable(node.created_at),
@@ -885,6 +886,7 @@ def create_node(ctx: AdminContext, payload: dict[str, Any]) -> dict[str, Any]:
     init_codex_base_url=(payload.get("init_codex_base_url") or None) or None,
     init_codex_api_key=(payload.get("init_codex_api_key") or None) or None,
     init_timezone=(payload.get("init_timezone") or "Asia/Shanghai"),
+    groups=_normalize_tags(payload.get("groups")),
   )
   inserted = ctx.database.insert_node(record)
   if ssh_key_ids is not None:
@@ -953,6 +955,8 @@ def update_node(ctx: AdminContext, name: str, payload: dict[str, Any]) -> dict[s
     patch["description"] = payload["description"] or None
   if "tags" in payload:
     patch["tags"] = _normalize_tags(payload["tags"])
+  if "groups" in payload:
+    patch["groups"] = _normalize_tags(payload["groups"])
   if "deploy_command" in payload:
     patch["deploy_command"] = payload["deploy_command"] or None
   if "update_command" in payload:
@@ -3665,6 +3669,62 @@ def _build_router(ctx: AdminContext) -> _Router:
     payload = request.json_body() if request.body else {}
     return _json_response(HTTPStatus.ACCEPTED, start_init_run(ctx, request.path_params["name"], payload))
 
+  def init_start_bulk_handler(request: _Request) -> _Response:
+    """Kick off the same init flow on multiple nodes in parallel.
+
+    Body: ``{nodes: [...], shared: {git_user_name?, git_user_email?,
+    desired_ssh_port?, install_codex?, codex_base_url?, codex_api_key?,
+    git_private_key?, timezone?}}``. The ``shared`` block (optional)
+    overrides per-node init defaults for *every* node in this batch —
+    useful when the operator wants to apply a fresh git key to a
+    handful of nodes at once. Each node still falls back to its own
+    saved init defaults / the platform-wide init-default ssh & ai keys
+    when ``shared`` doesn't specify a value.
+
+    Returns ``{started: [...], skipped: [...]}``. ``started`` rows
+    contain ``{node, run_id}``; ``skipped`` rows contain
+    ``{node, error}``.
+    """
+    _require_readwrite(ctx)
+    payload = request.json_body() or {}
+    raw_nodes = payload.get("nodes")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "nodes must be a non-empty list",
+                      code="nodes_required")
+    # Dedup while preserving order — duplicates would queue two
+    # parallel init runs for the same node, which is a foot-gun.
+    seen: set[str] = set()
+    target_names = []
+    for n in raw_nodes:
+      nn = _normalize_node_name(str(n))
+      if nn not in seen:
+        seen.add(nn); target_names.append(nn)
+    shared = payload.get("shared") or {}
+    if not isinstance(shared, dict):
+      shared = {}
+
+    started: list[dict] = []
+    skipped: list[dict] = []
+    for nn in target_names:
+      try:
+        # start_init_run() reads the node from DB and constructs an
+        # InitConfig with the shared overrides on top — mirrors the
+        # single-node POST behavior so the contract stays consistent.
+        run = start_init_run(ctx, nn, shared)
+        started.append({"node": nn, "run_id": run.get("id")})
+      except HttpError as exc:
+        skipped.append({"node": nn, "error": str(exc.message)[:200]})
+      except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("init bulk: failed to start for %s", nn)
+        skipped.append({"node": nn, "error": f"{type(exc).__name__}: {exc}"[:200]})
+
+    return _json_response(HTTPStatus.ACCEPTED, {
+      "started": started,
+      "skipped": skipped,
+      "total": len(target_names),
+    })
+
   def init_get_handler(request: _Request) -> _Response:
     return _json_response(
       HTTPStatus.OK,
@@ -3730,6 +3790,7 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("GET", "/api/host/ssh-keys", with_auth(host_ssh_keys_handler))
   router.add("POST", "/api/host/ssh-keys/read", with_auth(host_ssh_keys_read_handler))
   router.add("POST", "/api/nodes/{name}/init/start", with_auth(init_start_handler))
+  router.add("POST", "/api/nodes/init/start-bulk", with_auth(init_start_bulk_handler))
   router.add("GET", "/api/nodes/{name}/init/runs", with_auth(init_list_handler))
   router.add("GET", "/api/nodes/{name}/init/runs/{run_id}", with_auth(init_get_handler))
   def service_manifest_handler(request: _Request) -> _Response:

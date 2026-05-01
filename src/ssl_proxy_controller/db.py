@@ -104,6 +104,9 @@ class NodeRecord:
   init_codex_base_url: str | None = None
   init_codex_api_key: str | None = None
   init_timezone: str | None = "Asia/Shanghai"
+  # Operator-assigned tags/groups (e.g. ["us-edge", "experiment"]).
+  # Empty list means ungrouped.
+  groups: list[str] = field(default_factory=list)
 
 
 INIT_RUN_STATUSES = ("queued", "running", "success", "failed", "cancelled")
@@ -895,7 +898,8 @@ class Database:
     "created_at, updated_at, "
     "init_git_private_key, init_git_user_name, init_git_user_email, "
     "init_desired_ssh_port, init_install_codex, "
-    "init_codex_base_url, init_codex_api_key, init_timezone"
+    "init_codex_base_url, init_codex_api_key, init_timezone, "
+    "groups"
   )
 
   @staticmethod
@@ -923,6 +927,7 @@ class Database:
       init_codex_base_url=row.get("init_codex_base_url"),
       init_codex_api_key=row.get("init_codex_api_key"),
       init_timezone=row.get("init_timezone") or "Asia/Shanghai",
+      groups=list(row.get("groups") or []),
     )
 
   @staticmethod
@@ -987,6 +992,7 @@ class Database:
             init_git_private_key, init_git_user_name, init_git_user_email,
             init_desired_ssh_port, init_install_codex,
             init_codex_base_url, init_codex_api_key, init_timezone,
+            groups,
             created_at, updated_at)
           VALUES (%(name)s, %(host)s, %(ssh_port)s, %(ssh_user)s, %(auth_method)s,
             %(ssh_password)s, %(ssh_private_key)s, %(ssh_key_passphrase)s,
@@ -994,6 +1000,7 @@ class Database:
             %(init_git_private_key)s, %(init_git_user_name)s, %(init_git_user_email)s,
             %(init_desired_ssh_port)s, %(init_install_codex)s,
             %(init_codex_base_url)s, %(init_codex_api_key)s, %(init_timezone)s,
+            %(groups)s,
             NOW(), NOW())
           RETURNING {self._NODE_COLUMNS}
           """,
@@ -1018,6 +1025,7 @@ class Database:
             "init_codex_base_url": node.init_codex_base_url,
             "init_codex_api_key": node.init_codex_api_key,
             "init_timezone": node.init_timezone,
+            "groups": list(node.groups or []),
           },
         )
         row = cursor.fetchone()
@@ -1035,6 +1043,7 @@ class Database:
       "init_git_private_key", "init_git_user_name", "init_git_user_email",
       "init_desired_ssh_port", "init_install_codex",
       "init_codex_base_url", "init_codex_api_key", "init_timezone",
+      "groups",
     }
     sets = []
     params: dict = {"name": name}

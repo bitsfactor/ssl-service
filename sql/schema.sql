@@ -192,6 +192,13 @@ ALTER TABLE nodes ADD COLUMN IF NOT EXISTS init_codex_base_url TEXT;
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS init_codex_api_key TEXT;
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS init_timezone TEXT DEFAULT 'Asia/Shanghai';
 
+-- Free-form tag/group labels for filtering and bulk operations on the
+-- Nodes page. Stored as a TEXT[] so we can use Postgres GIN indexes
+-- and `&&` (overlap) for multi-tag filters. Operator picks the
+-- vocabulary — typically things like "us-edge", "kr", "experiment".
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS groups TEXT[] NOT NULL DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_nodes_groups ON nodes USING GIN (groups);
+
 -- One row per init run. The orchestrator appends to log_text as it goes,
 -- and the polling endpoint just reads this row.
 CREATE TABLE IF NOT EXISTS node_init_runs (

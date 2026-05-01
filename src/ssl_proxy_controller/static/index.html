@@ -647,6 +647,8 @@
   const App = {
     overview: null,
     mode: null,
+    // Active group filter on the Nodes page. "" = show all.
+    nodeGroupFilter: "",
   };
 
   async function refreshOverview() {
@@ -1436,6 +1438,84 @@
     return h("span", { class: "badge warn" }, h("span", { class: "dot" }), "stopped");
   }
 
+  // Populate the #nodes-group-filter bar with one pill per known group,
+  // plus a count badge and a Clear button when a filter is active. Hides
+  // the bar entirely if no groups are configured anywhere in the fleet.
+  function renderNodeGroupFilterBar(allNodes) {
+    const bar = document.getElementById("nodes-group-filter");
+    if (!bar) return;
+    const groupSet = new Set();
+    for (const n of allNodes || []) {
+      for (const g of (n.groups || [])) {
+        if (g) groupSet.add(g);
+      }
+    }
+    if (!groupSet.size) {
+      bar.style.display = "none";
+      bar.innerHTML = "";
+      return;
+    }
+    const groups = Array.from(groupSet).sort();
+    const active = App.nodeGroupFilter || "";
+    bar.style.display = "flex";
+    bar.innerHTML = "";
+    bar.appendChild(h("span", { class: "muted", style: "font-weight: 500" }, "Filter by group:"));
+    // "All" pill resets the filter.
+    bar.appendChild(h("span", {
+      class: active === "" ? "badge ok" : "badge",
+      style: "cursor: pointer",
+      onclick: () => {
+        App.nodeGroupFilter = "";
+        loadNodesIntoBody();
+      },
+    }, "All"));
+    for (const g of groups) {
+      const isActive = active === g;
+      bar.appendChild(h("span", {
+        class: isActive ? "badge ok" : "badge",
+        style: "cursor: pointer",
+        onclick: () => {
+          App.nodeGroupFilter = isActive ? "" : g;
+          loadNodesIntoBody();
+        },
+      }, g));
+    }
+    if (active) {
+      bar.appendChild(h("button", {
+        class: "btn btn-sm",
+        style: "margin-left: auto",
+        onclick: () => {
+          App.nodeGroupFilter = "";
+          loadNodesIntoBody();
+        },
+      }, "Clear filter"));
+    }
+  }
+
+  // Render a node's groups as small clickable badges. Click to add the
+  // group to the current Nodes-page filter.
+  function renderNodeGroupsBadges(groups) {
+    const list = Array.isArray(groups) ? groups.filter(Boolean) : [];
+    if (!list.length) return h("span", { class: "muted", style: "font-size: 11px" }, "—");
+    const wrap = h("div", { class: "row", style: "gap: 4px; flex-wrap: wrap" });
+    for (const g of list) {
+      const badge = h("span", {
+        class: "badge",
+        style: "font-size: 10.5px; cursor: pointer",
+        title: `Filter by group: ${g}`,
+        onclick: (e) => {
+          e.preventDefault();
+          App.nodeGroupFilter = g;
+          // Re-render via the active nav handler.
+          const root = document.getElementById("view");
+          if (root && typeof renderNodesView === "function") renderNodesView(root);
+        },
+      }, g);
+      wrap.appendChild(badge);
+    }
+    return wrap;
+  }
+
   async function renderNodesView(root) {
     setActiveNav("nodes");
     root.innerHTML = "";
@@ -1457,6 +1537,10 @@
       h("h2", null, "All nodes"),
       h("span", { class: "hint", id: "nodes-count" }, ""),
     ));
+    // Group-filter pill bar — populated after nodes load. Always present
+    // in the DOM so we can patch its contents without re-rendering the page.
+    card.appendChild(h("div", { id: "nodes-group-filter",
+      style: "display: none; gap: 6px; align-items: center; flex-wrap: wrap; padding: 8px 16px; background: var(--surface-alt); border-bottom: 1px solid var(--border); font-size: 12px;" }));
     // Bulk action bar — shows up only after rows have been selected.
     if (App.mode === "readwrite") {
       const bar = h("div", { id: "nodes-bulk-bar",
@@ -1464,9 +1548,13 @@
       bar.appendChild(h("span", { id: "nodes-bulk-count", class: "muted" }, "0 selected"));
       bar.appendChild(h("div", { style: "flex: 1" }));
       bar.appendChild(h("button", { class: "btn btn-sm",
-        onclick: () => bulkProbeSelected() }, "Probe selected"));
+        onclick: () => bulkProbeSelected() }, "Probe"));
+      bar.appendChild(h("button", { class: "btn btn-sm",
+        title: "Run the Initialize wizard's flow on every selected node in parallel",
+        onclick: () => bulkInitializeSelected() }, "Initialize"));
       bar.appendChild(h("button", { class: "btn btn-sm btn-primary",
-        onclick: () => bulkDeploySslService() }, "Deploy ssl-service to selected"));
+        title: "Pick a service from the catalog and deploy it to every selected node",
+        onclick: () => bulkDeployServiceSelected() }, "Deploy service…"));
       bar.appendChild(h("button", { class: "btn btn-sm",
         onclick: () => bulkClearSelection() }, "Clear"));
       card.appendChild(bar);
@@ -1506,14 +1594,28 @@
     });
     try {
       const resp = await nodesPromise;
-      let nodes = resp.nodes || [];
+      const allNodes = resp.nodes || [];
+      // Refresh the group filter pill (the union of all groups across all
+      // nodes — recomputed every load so newly-added groups show up).
+      renderNodeGroupFilterBar(allNodes);
+      // Apply the active group filter, if any.
+      const filter = App.nodeGroupFilter || "";
+      let nodes = allNodes;
+      if (filter) {
+        nodes = allNodes.filter((n) => Array.isArray(n.groups) && n.groups.includes(filter));
+      }
       const counter = document.getElementById("nodes-count");
-      if (counter) counter.textContent = `${nodes.length} node${nodes.length === 1 ? "" : "s"}`;
+      if (counter) {
+        if (filter) counter.textContent = `${nodes.length} of ${allNodes.length} (group: ${filter})`;
+        else counter.textContent = `${nodes.length} node${nodes.length === 1 ? "" : "s"}`;
+      }
       body.innerHTML = "";
       if (!nodes.length) {
         body.appendChild(h("div", { class: "empty" },
-          h("div", { class: "title" }, "No nodes registered"),
-          h("div", { class: "sub" }, App.mode === "readwrite" ? "Add your first node above." : "This is a read-only admin."),
+          h("div", { class: "title" }, filter ? `No nodes in group "${filter}"` : "No nodes registered"),
+          h("div", { class: "sub" }, filter
+            ? "Clear the group filter above to see all nodes."
+            : (App.mode === "readwrite" ? "Add your first node above." : "This is a read-only admin.")),
         ));
         return;
       }
@@ -1625,6 +1727,7 @@
       h("tr", null,
         App.mode === "readwrite" ? h("th", { style: "width: 28px" }, masterCheckbox) : null,
         h("th", null, "Node"),
+        h("th", null, "Groups"),
         h("th", null, "Host"),
         h("th", null, "Reachability"),
         h("th", null, "Service"),
@@ -1671,6 +1774,110 @@
     toast("info", "Probing", `${names.length} node${names.length === 1 ? "" : "s"}…`);
     // Run probes in parallel and let probeNode patch each row in place.
     await Promise.all(names.map((n) => probeNode(n).catch(() => {})));
+  }
+
+  // Bulk Initialize: fan out the same init flow as the per-node wizard
+  // (step 1-5) across N selected nodes. Uses each node's own saved
+  // init defaults (git key, codex key, port, etc.) — operator can edit
+  // those per-node first if they want overrides.
+  async function bulkInitializeSelected() {
+    const names = getBulkSelected();
+    if (!names.length) return;
+    if (!confirm(
+      `Initialize ${names.length} node${names.length === 1 ? "" : "s"}?\n\n` +
+      `${names.join(", ")}\n\n` +
+      `Each will: install git/python/node/go/docker, set up the git deploy key, install Codex, change SSH port, etc. ` +
+      `Re-running on already-initialized nodes is safe (steps detect already-done state).`
+    )) return;
+    let r;
+    try {
+      r = await api("POST", "/api/nodes/init/start-bulk", { nodes: names });
+    } catch (err) { toast("error", "Bulk init failed", err.message); return; }
+    const startedN = (r.started || []).length;
+    const skippedN = (r.skipped || []).length;
+    if (skippedN) {
+      const reasons = r.skipped.slice(0, 5).map((s) => `${s.node}: ${s.error}`).join("\n");
+      toast("warn", `Init queued: ${startedN}/${r.total}`, `Skipped ${skippedN}.\n${reasons}`);
+    } else {
+      toast("success", `Init queued: ${startedN} node${startedN === 1 ? "" : "s"}`,
+        "Open Actions → Init history on each row to follow progress.");
+    }
+    bulkClearSelection();
+  }
+
+  // Bulk Deploy a service: pick a service from the catalog, then call
+  // the existing /api/services/{name}/deploy with the multi-node list.
+  // The deploy endpoint already accepts an array — no new backend.
+  async function bulkDeployServiceSelected() {
+    const names = getBulkSelected();
+    if (!names.length) return;
+    let services = [];
+    try {
+      const r = await api("GET", "/api/services");
+      services = r.services || [];
+    } catch (err) { toast("error", "Could not load services", err.message); return; }
+    if (!services.length) {
+      toast("error", "No services in catalog",
+        "Add one in Services → + Add service first.");
+      return;
+    }
+
+    // Build a tiny picker modal: select service + revision + Deploy.
+    const sel = h("select", { class: "input mono", id: "bulk-deploy-svc",
+      style: "width: 100%; padding: 6px 8px;" });
+    for (const s of services) {
+      sel.appendChild(h("option", { value: s.name },
+        `${s.display_name || s.name}  (${s.name})`));
+    }
+    const rev = h("input", { class: "input mono", id: "bulk-deploy-rev",
+      style: "width: 100%; padding: 6px 8px;",
+      placeholder: "main (default)" });
+    const errEl = h("div", { class: "muted",
+      style: "color: var(--danger); margin-top: 8px" });
+    const body = h("div", null,
+      h("p", { class: "muted" },
+        `Deploy a service to ${names.length} node${names.length === 1 ? "" : "s"}: `,
+        h("span", { class: "mono", style: "font-size: 11px" }, names.join(", "))),
+      h("div", { class: "field", style: "margin-bottom: 12px" },
+        h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" },
+          "Service"), sel),
+      h("div", { class: "field" },
+        h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" },
+          "Revision (optional)"), rev,
+        h("div", { class: "muted", style: "font-size: 11px; margin-top: 4px" },
+          "Git ref to deploy. Blank = service's default branch.")),
+      errEl);
+    const footer = h("div", { class: "row" },
+      h("div", { style: "flex: 1" }),
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { class: "btn btn-primary",
+        onclick: async (e) => {
+          e.preventDefault();
+          const svcName = sel.value;
+          const revision = rev.value.trim();
+          e.target.disabled = true;
+          e.target.textContent = "Deploying…";
+          try {
+            const payload = { nodes: names };
+            if (revision) payload.revision = revision;
+            const r = await api("POST",
+              `/api/services/${encodeURIComponent(svcName)}/deploy`, payload);
+            const ok = (r.results || []).filter((x) => x.ok).length;
+            const fail = (r.results || []).length - ok;
+            toast(fail ? "warn" : "success", `Deploy: ${svcName}`,
+              `${ok}/${r.results.length} succeeded${fail ? ", " + fail + " failed" : ""}`);
+            Modal.close();
+            bulkClearSelection();
+            // Refresh probe so the per-row Service column updates.
+            for (const n of names) probeNode(n).catch(() => {});
+          } catch (err) {
+            errEl.textContent = err.message || "request failed";
+            e.target.disabled = false;
+            e.target.textContent = "Deploy";
+          }
+        } }, "Deploy"));
+    Modal.open({ title: `Deploy service to ${names.length} node${names.length === 1 ? "" : "s"}`,
+                 body, footer, size: "wide" });
   }
   async function bulkDeploySslService() {
     const names = getBulkSelected();
@@ -1887,6 +2094,7 @@
           }))
         : null,
       h("td", { class: "domain" }, n.name),
+      h("td", null, renderNodeGroupsBadges(n.groups)),
       h("td", { class: "mono" }, `${n.ssh_user}@${n.host}:${n.ssh_port}`),
       h("td", null, nodeReachBadge(status)),
       h("td", null, nodeServiceBadge(status)),
@@ -1899,7 +2107,7 @@
     // Only keep the error row — failed probes need to be visible. All
     // other sub-lines are available via "View full info".
     if (status && status.last_probe_error) {
-      const cspan = App.mode === "readwrite" ? "9" : "8";
+      const cspan = App.mode === "readwrite" ? "10" : "9";
       tbody.appendChild(h("tr", { style: "background: var(--danger-bg)" },
         h("td", { colspan: cspan, class: "mono", style: "color: var(--danger); font-size: 11.5px; padding: 6px 16px" }, status.last_probe_error)));
     }
@@ -2004,6 +2212,7 @@
     body.appendChild(section("Identity", [
       ["Name", node.name],
       ["Description", node.description],
+      ["Groups", (node.groups || []).join(", ")],
       ["Tags", (node.tags || []).join(", ")],
       ["Created", fmtDate(node.created_at)],
       ["Updated", fmtDate(node.updated_at)],
@@ -2202,9 +2411,20 @@
         h("input", { id: "node-name", class: "input mono", value: existing ? existing.name : "", required: true, placeholder: "edge-sg-1" }),
       ),
       h("div", { class: "field" },
-        h("label", null, "Tags"),
-        h("input", { id: "node-tags", class: "input", value: existing ? (existing.tags || []).join(", ") : "", placeholder: "tag1, tag2" }),
+        h("label", null, "Groups",
+          h("span", { class: "hint" },
+            " — comma-separated; used as filters and bulk-action targets")),
+        h("input", { id: "node-groups", class: "input",
+          value: existing ? (existing.groups || []).join(", ") : "",
+          placeholder: "us-edge, kr, experiment" }),
       ),
+    ));
+    form.appendChild(h("div", { class: "field", style: "margin-top: -8px" },
+      h("label", null, "Tags",
+        h("span", { class: "hint" }, " — free-form labels (legacy field)")),
+      h("input", { id: "node-tags", class: "input",
+        value: existing ? (existing.tags || []).join(", ") : "",
+        placeholder: "tag1, tag2" }),
     ));
     form.appendChild(h("div", { class: "form-row" },
       h("div", { class: "field" },
@@ -2428,6 +2648,9 @@
           auth_method: auth,
           description: document.getElementById("node-desc").value.trim() || null,
           tags: document.getElementById("node-tags").value.split(",").map(s => s.trim()).filter(Boolean),
+          groups: document.getElementById("node-groups")
+            ? document.getElementById("node-groups").value.split(",").map(s => s.trim()).filter(Boolean)
+            : [],
           deploy_command: document.getElementById("node-deploy").value.trim() || null,
           update_command: document.getElementById("node-update").value.trim() || null,
         };
