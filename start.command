@@ -25,38 +25,15 @@ echo "  ssl-service admin — Postgres (ssl_service_test schema)"
 echo "================================================================"
 echo
 
-# --- DSN (test Supabase) --------------------------------------------------
-# Bootstrap DSN — used the very first time the admin starts. After
-# that, ~/.ssl-service/databases.yaml's active_id wins (so 'Activate'
-# in the Databases page survives restarts).
+# --- DSN (bootstrap) -----------------------------------------------------
+# Always launch with the BOOTSTRAP DSN. The admin process boots, reads
+# ``system_config['databases']`` from this DB, sees which entry is
+# marked active_id, and (if it's a different DSN) live-swaps its
+# connection pool. So 'Activate' in the Databases page persists in the
+# database itself — no per-machine state on disk.
 BOOTSTRAP_DSN='postgresql://postgres:qqwweeQQWWEE112233%40%40@db.vcktifcdhinmooixljto.supabase.co:5432/postgres?sslmode=require&options=-csearch_path%3Dssl_service_test'
-
-REGISTRY_FILE="${HOME}/.ssl-service/databases.yaml"
-
-DSN=""
-if [[ -f "${REGISTRY_FILE}" ]]; then
-  # Pull active_id, then look up its dsn. Tiny inline Python so we
-  # don't need a yaml parser in the .command launcher.
-  DSN="$(/usr/bin/env python3 - <<PY 2>/dev/null
-import yaml, sys
-try:
-  data = yaml.safe_load(open("${REGISTRY_FILE}").read()) or {}
-  active = data.get("active_id")
-  for e in data.get("databases") or []:
-    if e.get("id") == active:
-      print(e.get("dsn") or "")
-      break
-except Exception:
-  pass
-PY
-)"
-fi
-if [[ -z "${DSN}" ]]; then
-  echo "registry: ${REGISTRY_FILE} not found or no active_id — using bootstrap DSN"
-  DSN="${BOOTSTRAP_DSN}"
-else
-  echo "registry: using active DSN from ${REGISTRY_FILE}"
-fi
+DSN="${BOOTSTRAP_DSN}"
+echo "bootstrap DSN: ${DSN%%@*}@…"
 
 # --- Find Python 3.11+ + venv -------------------------------------------
 PY=""

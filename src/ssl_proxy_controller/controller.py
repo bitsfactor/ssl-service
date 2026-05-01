@@ -45,6 +45,20 @@ class Controller:
     self.certs_dir = self.state_dir / "certs"
     self.runtime_state_path = self.state_dir / "state" / "state.json"
     self._running = True
+    # Honor the registry's active_id at startup. The bootstrap DSN
+    # gets us into the database so we can read system_config; if the
+    # operator previously hit Activate on a different entry, swap
+    # over to it. This survives the absence of any local YAML file.
+    try:
+      from . import db_registry as _reg  # local import to avoid cycle
+      active = _reg.get_active_dsn(self.database)
+      if active and active != config.postgres.dsn:
+        LOGGER.info("Controller: registry active_id differs from bootstrap "
+                    "DSN; swapping pool to active DSN")
+        self.database.swap_to(active)
+    except Exception:  # noqa: BLE001
+      LOGGER.exception("Controller: could not read registry active_id; "
+                       "staying on bootstrap DSN")
 
   def ensure_directories(self) -> None:
     for path in [
