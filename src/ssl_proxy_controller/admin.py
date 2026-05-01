@@ -1873,14 +1873,37 @@ def start_init_run(ctx: AdminContext, name: str, payload: dict[str, Any] | None)
     if node is None:
       raise HttpError(HTTPStatus.NOT_FOUND, "node disappeared mid-update", code="node_not_found")
 
+  # Fall back to the platform-wide defaults when this node didn't override
+  # the credential. The "default" SSH key is the row with is_init_default=true
+  # in ssh_keys; the "default" AI key is the same flag in ai_api_keys.
+  git_private_key = node.init_git_private_key
+  if not git_private_key:
+    default_ssh = ctx.database.get_default_ssh_key()
+    if default_ssh is not None:
+      git_private_key = default_ssh.private_key
+      LOGGER.info("init: using default ssh key '%s' for node %s",
+                  default_ssh.name, node.name)
+
+  codex_api_key = node.init_codex_api_key
+  codex_base_url = node.init_codex_base_url
+  if not codex_api_key:
+    default_ai = ctx.database.get_default_ai_api_key()
+    if default_ai is not None:
+      codex_api_key = default_ai["api_key"]
+      # Prefer the default's URL only if the node didn't pick its own.
+      if not codex_base_url:
+        codex_base_url = default_ai["url"]
+      LOGGER.info("init: using default ai key '%s' for node %s",
+                  default_ai["name"], node.name)
+
   cfg = nodes_init_mod.InitConfig(
-    git_private_key=node.init_git_private_key,
+    git_private_key=git_private_key,
     git_user_name=node.init_git_user_name,
     git_user_email=node.init_git_user_email,
     desired_ssh_port=int(node.init_desired_ssh_port or 60101),
     install_codex=bool(node.init_install_codex),
-    codex_base_url=node.init_codex_base_url,
-    codex_api_key=node.init_codex_api_key,
+    codex_base_url=codex_base_url,
+    codex_api_key=codex_api_key,
     timezone=node.init_timezone or "Asia/Shanghai",
   )
   run = nodes_init_mod.schedule_init_run(ctx.database, node, cfg)
@@ -2544,6 +2567,7 @@ def _ssh_key_to_dict(rec: SshKeyRecord, *, reveal_private: bool = True) -> dict[
     "tags": list(rec.tags or []),
     "created_at": _to_jsonable(rec.created_at),
     "updated_at": _to_jsonable(rec.updated_at),
+    "is_init_default": bool(getattr(rec, "is_init_default", False)),
   }
 
 
@@ -4627,6 +4651,105 @@ def _build_router(ctx: AdminContext) -> _Router:
                           deploy_ssh_key_to_nodes(ctx, int(request.path_params["id"]),
                                                   request.json_body()))
 
+  def ssh_key_set_init_default_handler(request: _Request) -> _Response:
+    """Mark this ssh_keys row as the init-time default. The init flow
+    falls back to this key when a node has no per-node init_git_private_key.
+    Clearing the previous default happens atomically inside set_default_ssh_key."""
+    _require_readwrite(ctx)
+    kid = int(request.path_params["id"])
+    rec = ctx.database.set_default_ssh_key(kid)
+    if rec is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"ssh key not found: {kid}",
+                      code="ssh_key_not_found")
+    return _json_response(HTTPStatus.OK, _ssh_key_to_dict(rec, reveal_private=False))
+
+  # ---------- AI API keys (Codex + similar) ----------
+
+  def ai_api_keys_list_handler(_request: _Request) -> _Response:
+    return _json_response(HTTPStatus.OK,
+                          {"keys": ctx.database.list_ai_api_keys()})
+
+  def ai_api_keys_create_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    p = request.json_body() or {}
+    name = (p.get("name") or "").strip()
+    api_key = (p.get("api_key") or "").strip()
+    url = (p.get("url") or "").strip() or "https://api.develop.cc/v1"
+    if not name or not api_key:
+      raise HttpError(HTTPStatus.BAD_REQUEST, "name and api_key are required",
+                      code="ai_key_missing_fields")
+    if not re.match(r"^https?://[A-Za-z0-9.\-/_:%?=&]+$", url):
+      raise HttpError(HTTPStatus.BAD_REQUEST, "url must be http(s)",
+                      code="ai_key_invalid_url")
+    description = (p.get("description") or "").strip() or None
+    try:
+      out = ctx.database.insert_ai_api_key(
+        name=name, url=url, api_key=api_key, description=description,
+      )
+    except Exception as exc:
+      msg = str(exc)
+      if "duplicate key" in msg.lower():
+        raise HttpError(HTTPStatus.CONFLICT, f"name already in use: {name}",
+                        code="name_in_use") from exc
+      raise
+    return _json_response(HTTPStatus.CREATED, out)
+
+  def ai_api_keys_get_handler(request: _Request) -> _Response:
+    kid = int(request.path_params["id"])
+    rec = ctx.database.get_ai_api_key(kid)
+    if rec is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"ai key not found: {kid}",
+                      code="ai_key_not_found")
+    return _json_response(HTTPStatus.OK, rec)
+
+  def ai_api_keys_patch_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    kid = int(request.path_params["id"])
+    p = request.json_body() or {}
+    fields: dict[str, Any] = {}
+    if "name" in p:
+      n = (p["name"] or "").strip()
+      if not n:
+        raise HttpError(HTTPStatus.BAD_REQUEST, "name cannot be empty",
+                        code="name_required")
+      fields["name"] = n
+    if "url" in p:
+      u = (p["url"] or "").strip() or "https://api.develop.cc/v1"
+      if not re.match(r"^https?://[A-Za-z0-9.\-/_:%?=&]+$", u):
+        raise HttpError(HTTPStatus.BAD_REQUEST, "url must be http(s)",
+                        code="ai_key_invalid_url")
+      fields["url"] = u
+    if "api_key" in p:
+      ak = (p["api_key"] or "").strip()
+      if not ak:
+        raise HttpError(HTTPStatus.BAD_REQUEST, "api_key cannot be empty",
+                        code="ai_key_required")
+      fields["api_key"] = ak
+    if "description" in p:
+      fields["description"] = (p["description"] or "").strip() or None
+    rec = ctx.database.update_ai_api_key(kid, fields)
+    if rec is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"ai key not found: {kid}",
+                      code="ai_key_not_found")
+    return _json_response(HTTPStatus.OK, rec)
+
+  def ai_api_keys_delete_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    kid = int(request.path_params["id"])
+    if not ctx.database.delete_ai_api_key(kid):
+      raise HttpError(HTTPStatus.NOT_FOUND, f"ai key not found: {kid}",
+                      code="ai_key_not_found")
+    return _json_response(HTTPStatus.OK, {"deleted": True})
+
+  def ai_api_keys_set_default_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    kid = int(request.path_params["id"])
+    rec = ctx.database.set_default_ai_api_key(kid)
+    if rec is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"ai key not found: {kid}",
+                      code="ai_key_not_found")
+    return _json_response(HTTPStatus.OK, rec)
+
   def ssh_key_apply_local_handler(request: _Request) -> _Response:
     payload = request.json_body() if request.body else {}
     return _json_response(HTTPStatus.OK,
@@ -4641,6 +4764,13 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("POST", "/api/ssh-keys/{id}/attach", with_auth(ssh_key_attach_handler))
   router.add("POST", "/api/ssh-keys/{id}/deploy", with_auth(ssh_key_deploy_handler))
   router.add("POST", "/api/ssh-keys/{id}/apply-local", with_auth(ssh_key_apply_local_handler))
+  router.add("PUT",  "/api/ssh-keys/{id}/init-default", with_auth(ssh_key_set_init_default_handler))
+  router.add("GET",    "/api/ai-api-keys",          with_auth(ai_api_keys_list_handler))
+  router.add("POST",   "/api/ai-api-keys",          with_auth(ai_api_keys_create_handler))
+  router.add("GET",    "/api/ai-api-keys/{id}",     with_auth(ai_api_keys_get_handler))
+  router.add("PATCH",  "/api/ai-api-keys/{id}",     with_auth(ai_api_keys_patch_handler))
+  router.add("DELETE", "/api/ai-api-keys/{id}",     with_auth(ai_api_keys_delete_handler))
+  router.add("PUT",    "/api/ai-api-keys/{id}/default", with_auth(ai_api_keys_set_default_handler))
 
   router.add("GET", "/api/static-ips", with_auth(static_ips_list_handler))
   router.add("POST", "/api/static-ips", with_auth(static_ips_create_handler))

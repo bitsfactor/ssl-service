@@ -412,6 +412,10 @@
         <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c1.5 2 2.2 4 2.2 6S9.5 12 8 14M8 2c-1.5 2-2.2 4-2.2 6S6.5 12 8 14"/></svg>
         Static IPs
       </a>
+      <a href="#/ai-keys" data-nav="ai-keys">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="8" r="2.5"/><path d="M8.5 8h6M11.5 8v2M13.5 8v2M2 4 a4 4 0 0 1 8 0"/></svg>
+        AI Keys
+      </a>
       <a href="#/ssh-keys" data-nav="ssh-keys">
         <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="5" cy="8" r="2.5"/><path d="M7.5 8h6M11.5 8v2M13.5 8v2"/></svg>
         SSH Keys
@@ -4537,6 +4541,189 @@
     return fp.length > 24 ? (fp.slice(0, 24) + "…") : fp;
   }
 
+  // ---------------------------------------------------------------------------
+  // AI Keys — channel for managing API URL+key pairs (Codex / OpenAI-compat).
+  // Mark one row as init-default; the node Initialize flow uses it when a
+  // node has no per-node init_codex_api_key.
+  // ---------------------------------------------------------------------------
+  async function renderAiKeysView(root) {
+    setActiveNav("ai-keys");
+    root.innerHTML = "";
+    const addBtn = h("button", { class: "btn btn-primary",
+      onclick: () => openAiKeyEditor(null, () => renderAiKeysView(root)) },
+      "+ Add AI key");
+    root.appendChild(h("div", { class: "page-header" },
+      h("div", null,
+        h("h1", null, "AI Keys"),
+        h("p", { class: "lede" },
+          "Manage AI API endpoints and keys (Codex / OpenAI-compatible). ",
+          "The row marked ", h("strong", null, "init-default"),
+          " is used by the node Initialize flow when a node has no per-node API key."),
+      ),
+      h("div", null, addBtn),
+    ));
+
+    const card = h("div", { class: "card" });
+    card.appendChild(h("div", { class: "card-header" },
+      h("h2", null, "Keys"), h("span", { class: "hint", id: "ai-keys-count" }, "")));
+    const body = h("div", { class: "card-body" });
+    card.appendChild(body);
+    root.appendChild(card);
+
+    body.appendChild(h("div", { class: "muted", style: "padding: 8px 0;" }, "Loading…"));
+
+    let keys = [];
+    try {
+      const r = await api("GET", "/api/ai-api-keys");
+      keys = r.keys || [];
+    } catch (err) {
+      body.innerHTML = "";
+      body.appendChild(h("div", { class: "muted", style: "color: var(--danger)" },
+        err.status === 404
+          ? "AI keys endpoint not available — restart the admin server."
+          : "Load failed: " + err.message));
+      return;
+    }
+    const counter = document.getElementById("ai-keys-count");
+    if (counter) counter.textContent = `${keys.length} key${keys.length === 1 ? "" : "s"}`;
+
+    body.innerHTML = "";
+    if (!keys.length) {
+      body.appendChild(h("div", { class: "empty" },
+        h("div", { class: "title" }, "No AI keys yet"),
+        h("div", { class: "sub" },
+          "Add one to make the node Initialize flow able to install Codex automatically.")));
+      return;
+    }
+
+    const tbl = h("table", { class: "data" });
+    tbl.appendChild(h("thead", null, h("tr", null,
+      h("th", null, "Name"),
+      h("th", null, "URL"),
+      h("th", null, "API Key"),
+      h("th", null, "Updated"),
+      h("th", null, ""),
+    )));
+    const tb = h("tbody");
+    for (const k of keys) {
+      const masked = k.api_key
+        ? k.api_key.slice(0, 4) + "…" + k.api_key.slice(-4)
+        : "—";
+      tb.appendChild(h("tr", null,
+        h("td", null,
+          h("div", null,
+            k.name,
+            k.is_init_default
+              ? h("span", { class: "badge ok", style: "margin-left: 6px",
+                  title: "Default key used during node initialization" },
+                  "init-default")
+              : null),
+          k.description ? h("div", { class: "muted", style: "font-size: 11px; margin-top: 2px" },
+            k.description) : null,
+        ),
+        h("td", { class: "mono", style: "font-size: 12px" }, k.url || "—"),
+        h("td", { class: "mono", style: "font-size: 12px" }, masked),
+        h("td", { class: "muted", style: "font-size: 12px" },
+          k.updated_at ? fmtRelative(k.updated_at) : "—"),
+        h("td", null,
+          h("div", { class: "row", style: "gap: 4px; flex-wrap: wrap" },
+            h("button", { class: "btn btn-sm",
+              onclick: () => openAiKeyEditor(k, () => renderAiKeysView(root)) }, "Edit"),
+            !k.is_init_default
+              ? h("button", { class: "btn btn-sm",
+                  onclick: async () => {
+                    try {
+                      await api("PUT", `/api/ai-api-keys/${k.id}/default`, {});
+                      toast("success", "Init default updated", `'${k.name}' is now the init default`);
+                      renderAiKeysView(root);
+                    } catch (err) { toast("error", "Failed", err.message); }
+                  } }, "Set init default")
+              : null,
+            h("button", { class: "btn btn-sm danger",
+              onclick: async () => {
+                if (!confirm(`Delete AI key '${k.name}'?`)) return;
+                try {
+                  await api("DELETE", `/api/ai-api-keys/${k.id}`);
+                  toast("success", "Deleted", "");
+                  renderAiKeysView(root);
+                } catch (err) { toast("error", "Delete failed", err.message); }
+              } }, "Delete")),
+        ),
+      ));
+    }
+    tbl.appendChild(tb);
+    const wrap = h("div", { class: "table-wrap" });
+    wrap.appendChild(tbl);
+    body.appendChild(wrap);
+  }
+
+  // Modal: create / edit an AI key.
+  async function openAiKeyEditor(existing, onDone) {
+    const name = h("input", { type: "text", value: existing ? existing.name : "",
+      placeholder: "e.g. develop-cc-prod", style: "width: 100%; padding: 6px 8px" });
+    const url = h("input", { type: "text",
+      value: existing ? existing.url : "https://api.develop.cc/v1",
+      placeholder: "https://api.develop.cc/v1",
+      style: "width: 100%; padding: 6px 8px; font-family: monospace; font-size: 12px" });
+    const key = h("input", { type: "text", value: existing ? existing.api_key : "",
+      placeholder: "sk-…", style: "width: 100%; padding: 6px 8px; font-family: monospace; font-size: 12px" });
+    const desc = h("input", { type: "text",
+      value: (existing && existing.description) || "",
+      placeholder: "optional", style: "width: 100%; padding: 6px 8px" });
+    const errorEl = h("div", { class: "muted", style: "color: var(--danger); margin-top: 8px" });
+
+    const labelRow = (text, ctrl) => h("div", { style: "margin-bottom: 12px" },
+      h("label", { style: "display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px" }, text),
+      ctrl);
+
+    const body = h("div", null,
+      labelRow("Name (unique)", name),
+      labelRow("Base URL", url),
+      labelRow("API Key", key),
+      labelRow("Description", desc),
+      errorEl,
+    );
+
+    const footer = h("div", { class: "row", style: "gap: 8px" },
+      h("div", { style: "flex: 1" }),
+      h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel"),
+      h("button", { class: "btn btn-primary",
+        onclick: async (e) => {
+          e.preventDefault();
+          errorEl.textContent = "";
+          const payload = {
+            name: name.value.trim(),
+            url: url.value.trim() || "https://api.develop.cc/v1",
+            api_key: key.value.trim(),
+            description: desc.value.trim() || null,
+          };
+          if (!payload.name || !payload.api_key) {
+            errorEl.textContent = "Name and API key are required";
+            return;
+          }
+          e.target.disabled = true;
+          e.target.textContent = "Saving…";
+          try {
+            if (existing) {
+              await api("PATCH", `/api/ai-api-keys/${existing.id}`, payload);
+              toast("success", "Saved", "");
+            } else {
+              await api("POST", "/api/ai-api-keys", payload);
+              toast("success", "Added", "");
+            }
+            Modal.close();
+            if (onDone) onDone();
+          } catch (err) {
+            errorEl.textContent = err.message || "save failed";
+            e.target.disabled = false;
+            e.target.textContent = existing ? "Save" : "Add";
+          }
+        } }, existing ? "Save" : "Add"));
+
+    Modal.open({ title: existing ? `Edit AI key: ${existing.name}` : "New AI key", body, footer });
+  }
+
+
   async function renderSshKeysView(root) {
     setActiveNav("ssh-keys");
     root.innerHTML = "";
@@ -4613,14 +4800,34 @@
         title: "Overwrite this Mac's ~/.ssh/id_<algo> with this keypair (existing files are backed up)",
         onclick: () => openApplyLocalSshKeyModal(k, () => renderSshKeysView(document.getElementById("view-root")))
       }, "Apply local"));
+      if (!k.is_init_default) {
+        actions.appendChild(h("button", { class: "btn btn-sm",
+          title: "Use this key when initializing a new node that has no per-node SSH key set",
+          onclick: async () => {
+            try {
+              await api("PUT", `/api/ssh-keys/${k.id}/init-default`, {});
+              toast("success", "Init default updated", `'${k.name}' will be used when a node has no per-node ssh key`);
+              renderSshKeysView(document.getElementById("view-root"));
+            } catch (err) { toast("error", "Failed", err.message); }
+          }
+        }, "Set init default"));
+      }
       actions.appendChild(h("button", { class: "btn btn-sm danger",
         onclick: () => confirmDeleteSshKey(k)
       }, "✕"));
-      const tr = h("tr", { "data-key-id": k.id },
-        h("td", null,
-          h("div", null, k.name),
-          k.description ? h("div", { class: "muted", style: "font-size: 11px; margin-top: 2px" }, k.description) : null,
+      const nameCell = h("td", null,
+        h("div", null,
+          k.name,
+          k.is_init_default
+            ? h("span", { class: "badge ok", style: "margin-left: 6px",
+                title: "Default key used during node initialization" },
+                "init-default")
+            : null,
         ),
+        k.description ? h("div", { class: "muted", style: "font-size: 11px; margin-top: 2px" }, k.description) : null,
+      );
+      const tr = h("tr", { "data-key-id": k.id },
+        nameCell,
         h("td", null, keyTypeBadge(k)),
         h("td", { class: "mono", style: "font-size: 11px" }, shortFp(k.fingerprint_sha256)),
         h("td", { class: "mono", style: "font-size: 11px" }, k.comment || h("span", { class: "muted" }, "—")),
@@ -6764,6 +6971,7 @@
     "#/services": renderServicesView,
     "#/static-ips": renderStaticIpsView,
     "#/ssh-keys": renderSshKeysView,
+    "#/ai-keys": renderAiKeysView,
     "#/databases": renderDatabasesView,
     "#/xout": renderXoutView,
     "#/logs": renderLogsView,

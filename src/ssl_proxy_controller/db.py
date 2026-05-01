@@ -291,6 +291,7 @@ class SshKeyRecord:
   tags: list[str]
   created_at: datetime
   updated_at: datetime
+  is_init_default: bool = False
 
 
 @dataclass(slots=True)
@@ -2039,7 +2040,8 @@ class Database:
     id, name, description, key_type, bits, private_key, public_key,
     fingerprint_sha256, comment, passphrase, source,
     COALESCE(tags, ARRAY[]::TEXT[]) AS tags,
-    created_at, updated_at
+    created_at, updated_at,
+    COALESCE(is_init_default, FALSE) AS is_init_default
   """
 
   _SSH_KEY_UPDATABLE_COLUMNS: frozenset[str] = frozenset({
@@ -2129,6 +2131,7 @@ class Database:
       tags=list(row["tags"] or []),
       created_at=row["created_at"],
       updated_at=row["updated_at"],
+      is_init_default=bool(row.get("is_init_default")),
     )
 
   def list_ssh_keys(self) -> list[SshKeyRecord]:
@@ -2416,6 +2419,146 @@ class Database:
         deleted = cursor.rowcount
       connection.commit()
       return deleted > 0
+
+  # ---------- AI API keys (Codex etc) ----------
+
+  @staticmethod
+  def _row_to_ai_api_key(row: dict) -> dict:
+    return {
+      "id": int(row["id"]),
+      "name": row["name"],
+      "url": row.get("url") or "https://api.develop.cc/v1",
+      "api_key": row.get("api_key") or "",
+      "description": row.get("description"),
+      "is_init_default": bool(row.get("is_init_default")),
+      "created_at": row.get("created_at"),
+      "updated_at": row.get("updated_at"),
+    }
+
+  def list_ai_api_keys(self) -> list[dict]:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          "SELECT id, name, url, api_key, description, is_init_default, "
+          "created_at, updated_at FROM ai_api_keys ORDER BY name ASC"
+        )
+        return [self._row_to_ai_api_key(r) for r in cursor.fetchall()]
+
+  def get_ai_api_key(self, key_id: int) -> dict | None:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          "SELECT id, name, url, api_key, description, is_init_default, "
+          "created_at, updated_at FROM ai_api_keys WHERE id = %s",
+          (int(key_id),),
+        )
+        row = cursor.fetchone()
+        return None if row is None else self._row_to_ai_api_key(row)
+
+  def get_default_ai_api_key(self) -> dict | None:
+    """Return the row marked is_init_default, or None."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          "SELECT id, name, url, api_key, description, is_init_default, "
+          "created_at, updated_at FROM ai_api_keys WHERE is_init_default LIMIT 1"
+        )
+        row = cursor.fetchone()
+        return None if row is None else self._row_to_ai_api_key(row)
+
+  def insert_ai_api_key(
+    self, *, name: str, url: str, api_key: str, description: str | None = None,
+  ) -> dict:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          INSERT INTO ai_api_keys (name, url, api_key, description, created_at, updated_at)
+          VALUES (%s, %s, %s, %s, NOW(), NOW())
+          RETURNING id, name, url, api_key, description, is_init_default,
+                    created_at, updated_at
+          """,
+          (name, url or "https://api.develop.cc/v1", api_key, description),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    return self._row_to_ai_api_key(row)
+
+  def update_ai_api_key(self, key_id: int, fields: dict) -> dict | None:
+    allowed = {"name", "url", "api_key", "description"}
+    sets = []
+    params: dict = {"id": int(key_id)}
+    for k, v in fields.items():
+      if k not in allowed:
+        continue
+      sets.append(f"{k} = %({k})s")
+      params[k] = v
+    if not sets:
+      return self.get_ai_api_key(key_id)
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          f"""UPDATE ai_api_keys SET {', '.join(sets)}, updated_at = NOW()
+              WHERE id = %(id)s
+              RETURNING id, name, url, api_key, description, is_init_default,
+                        created_at, updated_at""",
+          params,
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    return None if row is None else self._row_to_ai_api_key(row)
+
+  def delete_ai_api_key(self, key_id: int) -> bool:
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute("DELETE FROM ai_api_keys WHERE id = %s", (int(key_id),))
+        deleted = cursor.rowcount
+      connection.commit()
+    return deleted > 0
+
+  def set_default_ai_api_key(self, key_id: int) -> dict | None:
+    """Mark exactly this row as the init default; clear the flag on
+    any other row first. Atomic via single transaction."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        # Clear first to satisfy the partial unique index even though we
+        # update the same row a beat later.
+        cursor.execute("UPDATE ai_api_keys SET is_init_default = FALSE WHERE is_init_default")
+        cursor.execute(
+          """UPDATE ai_api_keys SET is_init_default = TRUE WHERE id = %s
+             RETURNING id, name, url, api_key, description, is_init_default,
+                       created_at, updated_at""",
+          (int(key_id),),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    return None if row is None else self._row_to_ai_api_key(row)
+
+  # ---------- SSH key init-default (sibling of the existing ssh_keys CRUD)
+
+  def set_default_ssh_key(self, key_id: int) -> SshKeyRecord | None:
+    """Mark this ssh_keys row as the init default; clear other rows."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute("UPDATE ssh_keys SET is_init_default = FALSE WHERE is_init_default")
+        cursor.execute(
+          "UPDATE ssh_keys SET is_init_default = TRUE WHERE id = %s",
+          (int(key_id),),
+        )
+      connection.commit()
+    return self.get_ssh_key(int(key_id))
+
+  def get_default_ssh_key(self) -> SshKeyRecord | None:
+    """Return the ssh_keys row currently flagged as init default."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          "SELECT id FROM ssh_keys WHERE is_init_default LIMIT 1"
+        )
+        row = cursor.fetchone()
+        if row is None:
+          return None
+    return self.get_ssh_key(int(row["id"]))
 
   # ---------- xout channel: presets + per-node assignments ----------
 

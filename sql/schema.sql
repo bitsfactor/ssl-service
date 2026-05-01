@@ -594,6 +594,45 @@ CREATE TABLE IF NOT EXISTS xout_node_assignments (
 CREATE INDEX IF NOT EXISTS idx_xout_assignments_preset
   ON xout_node_assignments (preset_id);
 
+-- Init defaults ----------------------------------------------------------
+-- The Initialize-a-node flow needs two pieces of credential material:
+--   1. an SSH private key it can drop into ~/.ssh on the new VPS so it can
+--      git-clone private repos (deploy keys);
+--   2. an AI API key + base URL for the Codex CLI install step.
+--
+-- Both default to the row marked ``is_init_default``; the per-node
+-- ``init_git_private_key`` / ``init_codex_api_key`` fields override
+-- the default when the operator wants this node to use a specific key.
+
+ALTER TABLE ssh_keys
+  ADD COLUMN IF NOT EXISTS is_init_default BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- At most one row at a time may carry the flag. The partial unique index
+-- enforces this — toggling on a different row first clears the previous
+-- one inside set_ssh_key_init_default().
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ssh_keys_init_default_unique
+  ON ssh_keys ((1)) WHERE is_init_default;
+
+CREATE TABLE IF NOT EXISTS ai_api_keys (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  url TEXT NOT NULL DEFAULT 'https://api.develop.cc/v1',
+  api_key TEXT NOT NULL,
+  description TEXT,
+  is_init_default BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_api_keys_init_default_unique
+  ON ai_api_keys ((1)) WHERE is_init_default;
+
+DROP TRIGGER IF EXISTS ai_api_keys_touch_updated_at ON ai_api_keys;
+CREATE TRIGGER ai_api_keys_touch_updated_at
+BEFORE UPDATE ON ai_api_keys
+FOR EACH ROW
+EXECUTE FUNCTION touch_updated_at();
+
 -- Sequence re-sync ------------------------------------------------------
 -- After cross-database sync (online→one or primary→one), BIGSERIAL columns
 -- can have rows with explicit id values that outrun the local sequence's
