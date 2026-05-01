@@ -51,9 +51,13 @@ from . import nodes as nodes_mod
 LOGGER = logging.getLogger("ssl_proxy_controller.nodes_init")
 
 BFS_VER = "main"
-# Single line that is curled and piped into bash on the target host.
+# URL of the bfs launcher script. We curl this URL and pipe to bash on
+# the target host. (Earlier this constant included `curl -fsSL` itself,
+# producing a double `curl -fsSL curl -fsSL ...` invocation that
+# emitted "Could not resolve host: curl" warnings before luckily falling
+# through to the real URL — clean up by keeping only the URL here.)
 BFS_LAUNCHER = (
-  "curl -fsSL https://fastly.jsdelivr.net/gh/bitsfactor/scripts@{ver}/bfs.sh"
+  "https://fastly.jsdelivr.net/gh/bitsfactor/scripts@{ver}/bfs.sh"
 )
 
 
@@ -105,10 +109,21 @@ class Step:
 
 
 def _bfs_remote_command(action: str) -> str:
-  """Build the remote `bfs.sh <action>` invocation."""
+  """Build the remote `bfs.sh <action>` invocation.
+
+  Sources ~/.bashrc first so subshells see PATH additions like nvm
+  (Node.js + npm) that earlier init steps wrote to .bashrc but the
+  next non-interactive SSH session would otherwise miss. Without this,
+  `codex install` would fail with "[Error] npm not found" right after
+  `env install-node` succeeded."""
   url = BFS_LAUNCHER.format(ver=BFS_VER)
   # `bash -s -- <words>` passes positional args after `--` to the piped script.
-  return f"BFS_VER={shlex.quote(BFS_VER)} bash -c {shlex.quote(f'curl -fsSL {url} | bash -s -- ' + action)}"
+  inner = (
+    "[ -f ~/.bashrc ] && . ~/.bashrc 2>/dev/null; "
+    "[ -f ~/.nvm/nvm.sh ] && . ~/.nvm/nvm.sh 2>/dev/null; "
+    f"curl -fsSL {url} | bash -s -- {action}"
+  )
+  return f"BFS_VER={shlex.quote(BFS_VER)} bash -c {shlex.quote(inner)}"
 
 
 def _run_remote_with_input_file(
@@ -133,14 +148,22 @@ def _run_remote_with_input_file(
     # Write the input lines to a temp file on the remote, then export
     # BFS_TTY_INPUT_FILE before invoking. We use a heredoc so we don't
     # have to escape every special character per line.
+    #
+    # IMPORTANT: A heredoc terminator MUST sit on its own line, and the
+    # next bash statement starts on the line after it. Putting "; cmd"
+    # on the line after the terminator (which the original code did)
+    # makes bash see a stray leading semicolon → "syntax error near
+    # unexpected token ';'". Use a plain newline between the closing
+    # heredoc and the next statement instead.
     delimiter = "BFS_TTY_INPUT_EOF_BFS"
     body = "\n".join(input_lines) + "\n"
     setup = (
-      f"_BFS_INPUT=$(mktemp -t bfs-input.XXXXXX); "
-      f"cat > \"$_BFS_INPUT\" <<'{delimiter}'\n{body}{delimiter}\n; "
-      f"export BFS_TTY_INPUT_FILE=\"$_BFS_INPUT\"; "
+      f"_BFS_INPUT=$(mktemp -t bfs-input.XXXXXX)\n"
+      f"cat > \"$_BFS_INPUT\" <<'{delimiter}'\n"
+      f"{body}{delimiter}\n"
+      f"export BFS_TTY_INPUT_FILE=\"$_BFS_INPUT\"\n"
     )
-    cleanup = '; rm -f "$_BFS_INPUT" >/dev/null 2>&1 || true'
+    cleanup = '\nrm -f "$_BFS_INPUT" >/dev/null 2>&1 || true'
     full_command = setup + command + cleanup
 
   log_func(f"\n$ {command}\n")
