@@ -241,6 +241,16 @@
     overflow: hidden;
     max-height: 90vh; display: flex; flex-direction: column;
   }
+  /* Wider variants for editors with tables / many fields. The
+     fixed 560px default is fine for a confirm dialog but cramps
+     anything with a 3-column table or long DSN values. */
+  .modal--wide   { width: 900px; }
+  .modal--xlarge { width: 1100px; }
+  /* On narrow viewports, fall back to the body padding (max-width 100%
+     already keeps it under window width). */
+  @media (max-width: 960px) {
+    .modal--wide, .modal--xlarge { width: 95vw; }
+  }
   .modal-header { padding: 18px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
   .modal-header h3 { font-family: var(--serif); font-size: 18px; font-weight: 600; margin: 0; }
   .modal-body { padding: 20px; overflow: auto; }
@@ -604,7 +614,8 @@
   }
 
   const Modal = {
-    open({ title, body, footer }) {
+    // size: "default" (560px) | "wide" (900px) | "xlarge" (1100px)
+    open({ title, body, footer, size }) {
       document.getElementById("modal-title").textContent = title;
       const bodyEl = document.getElementById("modal-body");
       const footerEl = document.getElementById("modal-footer");
@@ -612,6 +623,12 @@
       footerEl.innerHTML = "";
       if (body) bodyEl.appendChild(body);
       if (footer) footerEl.appendChild(footer);
+      const modalEl = document.querySelector(".modal-backdrop .modal");
+      if (modalEl) {
+        modalEl.classList.remove("modal--wide", "modal--xlarge");
+        if (size === "wide")   modalEl.classList.add("modal--wide");
+        if (size === "xlarge") modalEl.classList.add("modal--xlarge");
+      }
       document.getElementById("modal-backdrop").classList.add("open");
     },
     close() {
@@ -2478,7 +2495,8 @@
         } catch (err) { toast("error", "Save failed", err.message); }
       } }, isEdit ? "Save" : "Add node"),
     );
-    Modal.open({ title: isEdit ? `Edit ${existing.name}` : "Add node", body: form, footer });
+    Modal.open({ title: isEdit ? `Edit ${existing.name}` : "Add node",
+                 body: form, footer, size: "wide" });
   }
 
   // Modal that runs deploy/update with a previewable command + streams the
@@ -2659,7 +2677,7 @@
       previewBtn,
       runBtn,
     );
-    Modal.open({ title: `Deploy service on ${node.name}`, body: wrap, footer });
+    Modal.open({ title: `Deploy service on ${node.name}`, body: wrap, footer, size: "wide" });
   }
 
   // ----- Init runs history -----
@@ -4415,7 +4433,8 @@
         } catch (err) { toast("error", "Save failed", err.message); }
       } }, isEdit ? "Save" : "Add service"),
     );
-    Modal.open({ title: isEdit ? `Edit ${existing.name}` : "Add service", body: form, footer });
+    Modal.open({ title: isEdit ? `Edit ${existing.name}` : "Add service",
+                 body: form, footer, size: "wide" });
   }
 
   // ----- Static IPs view -----
@@ -6526,7 +6545,7 @@
     body.appendChild(h("div", { class: "muted", style: "padding: 12px;" },
       "Sshing into ", h("span", { class: "mono" }, nodeName),
       " and running curl through every inbound… (up to ~2 minutes)"));
-    Modal.open({ title: `Test xout on ${nodeName}`, body });
+    Modal.open({ title: `Test xout on ${nodeName}`, body, size: "wide" });
 
     let r;
     try {
@@ -6535,7 +6554,7 @@
       body.innerHTML = "";
       body.appendChild(h("div", { class: "muted", style: "color: var(--danger); padding: 12px" },
         "Test failed: " + (err.message || "")));
-      Modal.open({ title: `Test xout on ${nodeName}`, body,
+      Modal.open({ title: `Test xout on ${nodeName}`, body, size: "wide",
         footer: h("div", { class: "row" },
           h("div", { style: "flex: 1" }),
           h("button", { class: "btn btn-primary", onclick: () => Modal.close() }, "Close")) });
@@ -6585,7 +6604,7 @@
     wrap.appendChild(tbl);
     body.appendChild(wrap);
 
-    Modal.open({ title: `Test xout on ${nodeName}`, body,
+    Modal.open({ title: `Test xout on ${nodeName}`, body, size: "wide",
       footer: h("div", { class: "row" },
         h("button", { class: "btn", onclick: () => openXoutTestModal(nodeName) }, "Re-run"),
         h("div", { style: "flex: 1" }),
@@ -6809,7 +6828,7 @@
   async function openTokenSubscriptionModal(token) {
     const body = h("div");
     body.appendChild(h("div", { class: "muted", style: "padding: 12px;" }, "Loading subscription…"));
-    Modal.open({ title: `Subscription: ${token.name}`, body });
+    Modal.open({ title: `Subscription: ${token.name}`, body, size: "wide" });
 
     let r;
     try {
@@ -6886,7 +6905,7 @@
   async function openVerifyTrafficModal(nodeName) {
     const body = h("div");
     body.appendChild(h("div", { class: "muted", style: "padding: 12px;" }, "Loading…"));
-    Modal.open({ title: `Verify traffic: ${nodeName}`, body });
+    Modal.open({ title: `Verify traffic: ${nodeName}`, body, size: "wide" });
 
     let r;
     try {
@@ -6951,7 +6970,7 @@
       body.appendChild(wrap);
     }
 
-    Modal.open({ title: `Verify traffic: ${nodeName}`, body,
+    Modal.open({ title: `Verify traffic: ${nodeName}`, body, size: "wide",
       footer: h("div", { class: "row" },
         h("button", { class: "btn", title: "Pull latest stats from this node",
           onclick: async (e) => {
@@ -6976,7 +6995,7 @@
     const body = h("div");
     body.appendChild(h("div", { class: "muted", style: "padding: 12px;" },
       "Loading subscription for ", h("span", { class: "mono" }, nodeName), "…"));
-    Modal.open({ title: `Subscription: ${nodeName}`, body });
+    Modal.open({ title: `Subscription: ${nodeName}`, body, size: "wide" });
 
     let r;
     try {
@@ -7430,7 +7449,8 @@
           }
         } }, existing ? "Save" : "Create"));
 
-    Modal.open({ title: existing ? `Edit preset: ${existing.name}` : "New preset", body, footer });
+    Modal.open({ title: existing ? `Edit preset: ${existing.name}` : "New preset",
+                 body, footer, size: "wide" });
   }
 
 
