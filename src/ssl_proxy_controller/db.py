@@ -325,6 +325,20 @@ def _redact_dsn(dsn: str | None) -> str:
     return "***"
 
 
+def _cycle_start_for(today, reset_day: int):
+  """Return the date the most recent billing cycle started, given a
+  reset day-of-month (1..28). If today is before reset_day, the cycle
+  began on reset_day of the previous month; otherwise this month."""
+  from datetime import date as _date
+  rd = max(1, min(28, int(reset_day or 1)))
+  if today.day >= rd:
+    return today.replace(day=rd)
+  # previous month's reset day
+  prev_month = today.month - 1 or 12
+  prev_year = today.year if today.month > 1 else today.year - 1
+  return _date(prev_year, prev_month, rd)
+
+
 class Database:
   def __init__(
     self,
@@ -2982,11 +2996,12 @@ class Database:
 
   def list_token_deployment_summary(self) -> list[dict]:
     """One row per token, with a count of nodes it's deployed to plus
-    aggregated this-month and lifetime traffic. Used as the Tokens
-    table's row payload."""
+    aggregated 'current cycle' and lifetime traffic. The cycle starts
+    on each token's ``monthly_reset_day`` (e.g. day=15 means the cycle
+    started on the 15th of last month if today < 15th, otherwise the
+    15th of this month). Used as the Tokens table's row payload."""
     from datetime import date as _date
     today = _date.today()
-    month_start = today.replace(day=1)
     with self.connect() as connection:
       with connection.cursor() as cursor:
         cursor.execute(
@@ -2995,29 +3010,38 @@ class Database:
                  t.monthly_quota_gb, t.monthly_reset_day, t.notes,
                  t.created_at, t.updated_at,
                  COALESCE(nt.node_count, 0) AS node_count,
-                 COALESCE(tot.total, 0) AS total_bytes,
-                 COALESCE(mon.total, 0) AS month_bytes
+                 COALESCE(tot.total, 0) AS total_bytes
           FROM xout_tokens t
           LEFT JOIN (SELECT token_id, COUNT(*) AS node_count FROM xout_node_tokens GROUP BY token_id) nt
             ON nt.token_id = t.id
           LEFT JOIN (SELECT token_id, SUM(uplink_bytes + downlink_bytes) AS total
                      FROM xout_traffic_daily GROUP BY token_id) tot
             ON tot.token_id = t.id
-          LEFT JOIN (SELECT token_id, SUM(uplink_bytes + downlink_bytes) AS total
-                     FROM xout_traffic_daily WHERE day >= %s GROUP BY token_id) mon
-            ON mon.token_id = t.id
           ORDER BY t.name
           """,
-          (month_start,),
         )
-        out = []
-        for r in cursor.fetchall():
+        bases = list(cursor.fetchall())
+      # Per-token current-cycle sum — separate query because the cutoff
+      # depends on each token's monthly_reset_day.
+      out: list[dict] = []
+      with connection.cursor() as cursor:
+        for r in bases:
           d = self._row_to_xout_token(r)
           d["node_count"] = int(r.get("node_count") or 0)
           d["total_bytes"] = int(r.get("total_bytes") or 0)
-          d["month_bytes"] = int(r.get("month_bytes") or 0)
+          reset_day = d.get("monthly_reset_day") or 1
+          cycle_start = _cycle_start_for(today, reset_day)
+          d["cycle_start"] = cycle_start.isoformat()
+          cursor.execute(
+            """SELECT COALESCE(SUM(uplink_bytes + downlink_bytes), 0) AS s
+               FROM xout_traffic_daily
+               WHERE token_id = %s AND day >= %s""",
+            (d["id"], cycle_start),
+          )
+          row = cursor.fetchone()
+          d["month_bytes"] = int((row and row["s"]) or 0)
           out.append(d)
-        return out
+      return out
 
   def try_advisory_lock(self, connection: psycopg.Connection, key: str) -> bool:
     with connection.cursor() as cursor:

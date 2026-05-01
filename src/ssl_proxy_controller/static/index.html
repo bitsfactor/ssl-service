@@ -6266,6 +6266,15 @@
   // shown read-only on edit (rotating it would break clients' subs).
   async function openXoutTokenEditor(existing, onDone) {
     const isEdit = !!(existing && existing.id);
+    // The list endpoint masks `password` for safety (it would otherwise
+    // appear in every Tokens-tab payload). Refetch the full record on
+    // edit so the password input shows the current value.
+    if (isEdit) {
+      try {
+        const full = await api("GET", `/api/xout/tokens/${existing.id}`);
+        if (full && typeof full === "object") existing = { ...existing, ...full };
+      } catch (_) { /* fall back to whatever the row had */ }
+    }
     const body = h("div");
     const nameInput = h("input", { type: "text",
       value: existing ? existing.name : "",

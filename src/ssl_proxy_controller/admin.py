@@ -4317,11 +4317,12 @@ def _build_router(ctx: AdminContext) -> _Router:
           sni = reality.get("sni", "")
           pub = reality.get("public_key", "") or reality.get("pubkey", "")
           sid = reality.get("short_id", "")
-          if not pub:
-            # Public key isn't in our DB yet; the resolved version on
-            # the node has it but we read presets from xout_presets
-            # which stores 'auto'. Skip this URI entry — sync-tokens
-            # populates the cached subscription on a later pass.
+          # Treat "auto" the same as missing — that's the placeholder
+          # operators put in the preset; the real key is generated on
+          # the node and only available via sync-tokens (which reads
+          # /data/preset.json.resolved). Either way, can't build a URI
+          # without the actual public key.
+          if not pub or pub.lower() == "auto":
             continue
           frag = f"{node_name}-{tag}"
           uri = (
@@ -4367,7 +4368,8 @@ def _build_router(ctx: AdminContext) -> _Router:
         host = node.host
         if proto == "vless":
           reality = ib.get("reality") or {}
-          if not (reality.get("public_key") or reality.get("pubkey")):
+          pk_clash = reality.get("public_key") or reality.get("pubkey") or ""
+          if not pk_clash or pk_clash.lower() == "auto":
             continue
           clash_lines.extend([
             f"  - name: \"{node_name}-{tag}\"",
@@ -4416,8 +4418,17 @@ def _build_router(ctx: AdminContext) -> _Router:
     }
 
   def xout_tokens_list_handler(_request: _Request) -> _Response:
-    return _json_response(HTTPStatus.OK,
-      {"tokens": ctx.database.list_token_deployment_summary()})
+    rows = ctx.database.list_token_deployment_summary()
+    # Don't echo cleartext passwords on the bulk list endpoint — anyone
+    # with the admin token would otherwise harvest them all in one call.
+    # Keep individual GET /tokens/{id} returning password for the editor.
+    for r in rows:
+      if r.get("password"):
+        r["password_set"] = True
+        r["password"] = None
+      else:
+        r["password_set"] = False
+    return _json_response(HTTPStatus.OK, {"tokens": rows})
 
   def xout_tokens_create_handler(request: _Request) -> _Response:
     _require_readwrite(ctx)
@@ -4435,8 +4446,22 @@ def _build_router(ctx: AdminContext) -> _Router:
       raise HttpError(HTTPStatus.BAD_REQUEST, "uuid is not a valid UUID",
                       code="invalid_uuid")
     password = (p.get("password") or "").strip() or None
-    quota = int(p.get("monthly_quota_gb") or 1000)
-    reset_day = int(p.get("monthly_reset_day") or 1)
+    try:
+      quota = int(p.get("monthly_quota_gb") or 1000)
+    except (TypeError, ValueError):
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "monthly_quota_gb must be an integer",
+                      code="invalid_quota") from None
+    if not (0 <= quota <= 1_000_000):
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "monthly_quota_gb must be between 0 and 1000000",
+                      code="invalid_quota")
+    try:
+      reset_day = int(p.get("monthly_reset_day") or 1)
+    except (TypeError, ValueError):
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "monthly_reset_day must be an integer",
+                      code="invalid_reset_day") from None
     if not (1 <= reset_day <= 28):
       raise HttpError(HTTPStatus.BAD_REQUEST,
                       "monthly_reset_day must be between 1 and 28",
@@ -4479,10 +4504,15 @@ def _build_router(ctx: AdminContext) -> _Router:
       fields["password"] = (p["password"] or "").strip() or None
     if "monthly_quota_gb" in p:
       try:
-        fields["monthly_quota_gb"] = int(p["monthly_quota_gb"])
+        q = int(p["monthly_quota_gb"])
       except (TypeError, ValueError):
         raise HttpError(HTTPStatus.BAD_REQUEST, "monthly_quota_gb must be int",
                         code="invalid_quota") from None
+      if not (0 <= q <= 1_000_000):
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        "monthly_quota_gb must be 0..1000000",
+                        code="invalid_quota")
+      fields["monthly_quota_gb"] = q
     if "monthly_reset_day" in p:
       try:
         rd = int(p["monthly_reset_day"])
@@ -4504,10 +4534,27 @@ def _build_router(ctx: AdminContext) -> _Router:
   def xout_tokens_delete_handler(request: _Request) -> _Response:
     _require_readwrite(ctx)
     tid = int(request.path_params["id"])
+    # Snapshot whether this is the default BEFORE delete — we need the
+    # info to decide whether to auto-promote a successor.
+    existing = ctx.database.get_xout_token(tid)
+    was_default = bool(existing and existing.get("is_default"))
     if not ctx.database.delete_xout_token(tid):
       raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
                       code="token_not_found")
-    return _json_response(HTTPStatus.OK, {"deleted": True})
+    promoted = None
+    if was_default:
+      # Promote the alphabetically-first remaining token to default so
+      # newly-deployed nodes always get a valid seed user. If none left,
+      # leave as-is — _xout_resolve_preset gracefully falls through to
+      # the empty-users path (entrypoint generates a placeholder).
+      remaining = ctx.database.list_xout_tokens()
+      if remaining:
+        promoted = ctx.database.set_default_xout_token(remaining[0]["id"])
+    return _json_response(HTTPStatus.OK, {
+      "deleted": True,
+      "promoted_default_id": promoted["id"] if promoted else None,
+      "promoted_default_name": promoted["name"] if promoted else None,
+    })
 
   def xout_tokens_set_default_handler(request: _Request) -> _Response:
     _require_readwrite(ctx)
@@ -4520,31 +4567,92 @@ def _build_router(ctx: AdminContext) -> _Router:
 
   def xout_tokens_subscription_handler(request: _Request) -> _Response:
     """Aggregated subscription content for one token across every node
-    that has it provisioned. Reads from xout_node_tokens (filled by
-    sync-tokens) for the cached base64/clash strings; if those are
-    missing for a node, generates on-the-fly from the assigned preset.
-    """
+    that has it provisioned.
+
+    Prefers the per-node cached strings (populated by sync-tokens, which
+    reads ``/data/preset.json.resolved`` so the URI has the REAL Reality
+    public key). If a node has no cached value, falls back to building
+    on-the-fly from the stored preset — that path silently drops vless
+    URIs whose public key is still ``"auto"``."""
     tid = int(request.path_params["id"])
     token = ctx.database.get_xout_token(tid)
     if token is None:
       raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
                       code="token_not_found")
     rows = ctx.database.list_xout_node_tokens_for_token(tid)
-    node_assignments: dict[str, dict] = {}
+    nodes_seen: list[str] = []
+    nodes_cached: list[str] = []
+    nodes_uncached: list[str] = []
+    cached_b64_chunks: list[str] = []
+    cached_clash_chunks: list[str] = []
+    on_the_fly: dict[str, dict] = {}
+
     for r in rows:
       node = ctx.database.get_node(r["node_name"])
       if node is None: continue
-      a = ctx.database.get_xout_assignment(r["node_name"])
-      if a is None: continue
-      preset = ctx.database.get_xout_preset(a["preset_id"])
-      if preset is None: continue
-      node_assignments[r["node_name"]] = {"node": node, "preset": preset,
-                                          "cached": r}
-    subs = _build_subscriptions_for_token(token, node_assignments)
+      nodes_seen.append(r["node_name"])
+      cached_b64 = r.get("base64_subscription")
+      cached_clash = r.get("clash_subscription")
+      if cached_b64 or cached_clash:
+        nodes_cached.append(r["node_name"])
+        if cached_b64: cached_b64_chunks.append(cached_b64)
+        if cached_clash: cached_clash_chunks.append(cached_clash)
+      else:
+        a = ctx.database.get_xout_assignment(r["node_name"])
+        if a is None: continue
+        preset = ctx.database.get_xout_preset(a["preset_id"])
+        if preset is None: continue
+        on_the_fly[r["node_name"]] = {"node": node, "preset": preset}
+        nodes_uncached.append(r["node_name"])
+
+    fly_subs = _build_subscriptions_for_token(token, on_the_fly) \
+      if on_the_fly else {"raw": [], "plain": "", "base64": "", "clash": ""}
+
+    # Merge cached + on-the-fly. The cached base64 strings each decode
+    # to a `\n`-separated URI list — we just concat them with the new
+    # plain text and re-encode. For Clash, cached chunks already start
+    # with "proxies:"; concat by stripping the header from chunks 2+.
+    import base64 as _b64
+    plain_parts: list[str] = []
+    for chunk in cached_b64_chunks:
+      try:
+        plain_parts.append(_b64.b64decode(chunk).decode("utf-8"))
+      except Exception:
+        pass
+    if fly_subs.get("plain"):
+      plain_parts.append(fly_subs["plain"])
+    plain = "".join(plain_parts)
+    b64 = _b64.b64encode(plain.encode("utf-8")).decode("ascii") if plain else ""
+
+    clash_parts: list[str] = []
+    for i, chunk in enumerate(cached_clash_chunks):
+      if i == 0:
+        clash_parts.append(chunk.rstrip("\n"))
+      else:
+        # strip the duplicated "proxies:" header
+        body = "\n".join(line for line in chunk.splitlines()
+                         if line.strip() and line.strip() != "proxies:")
+        if body:
+          clash_parts.append(body)
+    if fly_subs.get("clash"):
+      body = fly_subs["clash"]
+      if clash_parts:
+        body = "\n".join(line for line in body.splitlines()
+                         if line.strip() and line.strip() != "proxies:")
+      if body:
+        clash_parts.append(body.rstrip("\n"))
+    clash = ("\n".join(clash_parts) + "\n") if clash_parts else ""
+
+    raw = [u for u in plain.split("\n") if u]
     return _json_response(HTTPStatus.OK, {
       "token": {"id": token["id"], "name": token["name"], "uuid": token["uuid"]},
-      "nodes": list(node_assignments.keys()),
-      **subs,
+      "nodes": nodes_seen,
+      "nodes_cached": nodes_cached,
+      "nodes_uncached": nodes_uncached,
+      "raw": raw,
+      "plain": plain,
+      "base64": b64,
+      "clash": clash,
     })
 
   def xout_tokens_publish_handler(request: _Request) -> _Response:
@@ -4589,19 +4697,25 @@ def _build_router(ctx: AdminContext) -> _Router:
       raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {name}",
                       code="node_not_found")
     from datetime import date as _date
+    from ssl_proxy_controller.db import _cycle_start_for
     today = _date.today()
-    month_start = today.replace(day=1)
     summary_total = ctx.database.sum_traffic_for_node(name)
-    summary_month = ctx.database.sum_traffic_for_node(name, since=month_start)
+    # Per-node 'this month' uses the calendar month-start as a sane
+    # default — the per-token breakdown below uses the token's own
+    # reset_day cycle.
+    summary_month = ctx.database.sum_traffic_for_node(name, since=today.replace(day=1))
     # Per-token rollups for nodes assigned to this node
     rows = ctx.database.list_xout_node_tokens_for_node(name)
     per_token = []
     for r in rows:
+      tok = ctx.database.get_xout_token(r["token_id"]) or {}
+      cycle_start = _cycle_start_for(today, tok.get("monthly_reset_day") or 1)
       tot = ctx.database.sum_traffic_for_token(r["token_id"])
-      mon = ctx.database.sum_traffic_for_token(r["token_id"], since=month_start)
+      mon = ctx.database.sum_traffic_for_token(r["token_id"], since=cycle_start)
       per_token.append({
         "token_id": r["token_id"], "token_name": r.get("token_name"),
         "total_bytes": tot["total"], "month_bytes": mon["total"],
+        "cycle_start": cycle_start.isoformat(),
         "last_seen_at": _to_jsonable(r.get("last_seen_at")),
       })
     # Residual: 1000 GB default (ish) — we use the largest assigned token's
@@ -4642,8 +4756,9 @@ def _build_router(ctx: AdminContext) -> _Router:
 
     from datetime import date as _date
     today = _date.today()
-    tokens_by_uuid = {t["uuid"]: t for t in ctx.database.list_xout_tokens()}
-    tokens_by_name = {t["name"]: t for t in ctx.database.list_xout_tokens()}
+    all_tokens = ctx.database.list_xout_tokens()
+    tokens_by_uuid = {t["uuid"]: t for t in all_tokens}
+    tokens_by_name = {t["name"]: t for t in all_tokens}
 
     results: list[dict[str, Any]] = []
     for nn in target_names:
@@ -4769,22 +4884,24 @@ def _build_router(ctx: AdminContext) -> _Router:
         linked += 1
         tokens_for_this_node.append(tok)
 
-      # Rebuild the cached subscription strings for each token on this
-      # node by handing _build_subscriptions_for_token a single-node
-      # assignment dict — the cached value is per-(node,token), so we
-      # filter the URI list to lines tagged with this node.
-      a = ctx.database.get_xout_assignment(nn)
-      preset = ctx.database.get_xout_preset(a["preset_id"]) if a else None
-      if preset:
-        for tok in tokens_for_this_node:
-          subs = _build_subscriptions_for_token(
-            tok, {nn: {"node": node, "preset": preset}},
-          )
-          ctx.database.upsert_xout_node_token(
-            nn, tok["id"],
-            base64_subscription=subs.get("base64"),
-            clash_subscription=subs.get("clash"),
-          )
+      # Rebuild the cached subscription strings using the RESOLVED
+      # preset we just parsed from /data/preset.json.resolved on the
+      # node. The stored preset has placeholders (e.g. public_key:
+      # "auto"); the resolved file has the real generated values, so
+      # only it produces working subscription URIs.
+      resolved_preset = {
+        "name": (data.get("name") or "resolved"),
+        "inbounds": data.get("inbounds") or [],
+      }
+      for tok in tokens_for_this_node:
+        subs = _build_subscriptions_for_token(
+          tok, {nn: {"node": node, "preset": resolved_preset}},
+        )
+        ctx.database.upsert_xout_node_token(
+          nn, tok["id"],
+          base64_subscription=subs.get("base64"),
+          clash_subscription=subs.get("clash"),
+        )
 
       results.append({"node": nn, "ok": True,
                       "tokens_present": len(uuids_present),
