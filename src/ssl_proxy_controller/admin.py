@@ -4305,9 +4305,15 @@ def _build_router(ctx: AdminContext) -> _Router:
     return str(_uuid.uuid4())
 
   def _build_subscriptions_for_token(token: dict, node_assignments: dict[str, dict]) -> dict:
-    """Build the aggregated VLESS / HTTP / SOCKS subscription URIs for
-    one token across all nodes that have this token assigned. Returns
-    {raw: [uri,...], plain: 'uri\nuri\n...', base64: '...', clash: 'yaml-string'}."""
+    """Build the aggregated VLESS subscription content for one token
+    across all nodes that have this token assigned. Returns
+    {raw: [uri,...], plain: 'uri\nuri\n...', base64: '...', clash: 'yaml-string'}.
+
+    Only VLESS inbounds are included. HTTP and SOCKS are gateway-style
+    proxies — operators configure them directly in the browser / system
+    settings (the inbound's host:port + auth), not via subscription.
+    Including them in a subscription URL would confuse most clients,
+    which expect a homogeneous protocol list."""
     import base64 as _b64
     from urllib.parse import quote as _q
     uris: list[str] = []
@@ -4341,32 +4347,10 @@ def _build_router(ctx: AdminContext) -> _Router:
             f"&pbk={_q(pub, safe='')}&sid={_q(sid, safe='')}&fp=chrome#{frag}"
           )
           uris.append(uri)
-        elif proto == "http":
-          # http://user:pass@host:port  (Basic-auth style; most clients accept)
-          # Per-token semantics: http inbound auth is at the inbound level
-          # (not per-user). We embed the inbound's auth, NOT the token's
-          # password — they're conceptually different in xray's model.
-          # URL-encode user/pass so a literal ':', '@', '/', '?', or '#'
-          # in the inbound auth doesn't break the URI.
-          auth = ib.get("auth") or {}
-          frag = _q(f"{node_name}-{tag}", safe="")
-          if auth.get("user"):
-            u = _q(str(auth["user"]), safe="")
-            pw = _q(str(auth.get("pass", "")), safe="")
-            uri = f"http://{u}:{pw}@{host}:{port}#{frag}"
-          else:
-            uri = f"http://{host}:{port}#{frag}"
-          uris.append(uri)
-        elif proto == "socks":
-          auth = ib.get("auth") or {}
-          frag = _q(f"{node_name}-{tag}", safe="")
-          if auth.get("user"):
-            u = _q(str(auth["user"]), safe="")
-            pw = _q(str(auth.get("pass", "")), safe="")
-            uri = f"socks://{u}:{pw}@{host}:{port}#{frag}"
-          else:
-            uri = f"socks://{host}:{port}#{frag}"
-          uris.append(uri)
+        # http / socks are intentionally skipped — they're not "subscription
+        # targets" in the sense most clients expect. Their host:port +
+        # auth show up in the Test and Verify-Traffic modals; the operator
+        # plugs them directly into browser/system proxy settings.
 
     plain = "\n".join(uris) + "\n" if uris else ""
     b64 = _b64.b64encode(plain.encode("utf-8")).decode("ascii") if plain else ""
@@ -4412,27 +4396,8 @@ def _build_router(ctx: AdminContext) -> _Router:
             f"      short-id: {_yq(reality.get('short_id',''))}",
             f"    client-fingerprint: chrome",
           ])
-        elif proto == "http":
-          auth = ib.get("auth") or {}
-          clash_lines.extend([
-            f"  - name: {_yq(f'{node_name}-{tag}')}",
-            f"    type: http",
-            f"    server: {_yq(host)}",
-            f"    port: {port}",
-            f"    username: {_yq(auth.get('user',''))}",
-            f"    password: {_yq(auth.get('pass',''))}",
-          ])
-        elif proto == "socks":
-          auth = ib.get("auth") or {}
-          clash_lines.extend([
-            f"  - name: {_yq(f'{node_name}-{tag}')}",
-            f"    type: socks5",
-            f"    server: {_yq(host)}",
-            f"    port: {port}",
-            f"    username: {_yq(auth.get('user',''))}",
-            f"    password: {_yq(auth.get('pass',''))}",
-            f"    udp: true",
-          ])
+        # http / socks intentionally skipped — see comment in the URI
+        # builder above. Subscription = VLESS-only.
     clash = "\n".join(clash_lines) + ("\n" if len(clash_lines) > 1 else "")
 
     return {
