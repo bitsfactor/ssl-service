@@ -5659,6 +5659,200 @@ def _build_router(ctx: AdminContext) -> _Router:
               "active_id so future restarts will use this DB too.",
     })
 
+  # ---- /api/env --------------------------------------------------------
+  #
+  # Exposes the bootstrap .env file the admin booted from. Reading is
+  # fine for any authenticated session; writing requires read-write
+  # mode. Sensitive values are masked in GET responses (full values
+  # only ever round-trip on PUT, and only to be written back to disk).
+  #
+  # ``SSL_SERVICE_ENV_FILE`` is exported by ``start.command`` and
+  # points at the absolute path of the .env file. Without it, the
+  # admin can't reliably locate the file (its CWD when launched via
+  # docker may be /app, not the file's actual location), so we surface
+  # a helpful error instead of guessing.
+
+  # Keys whose values must be redacted in GET responses. Match the
+  # full key name (case-sensitive). Anything not in this set is shown
+  # in plaintext — non-sensitive things like SSL_SERVICE_ADMIN_BIND or
+  # SSL_SERVICE_LOG_LEVEL are easier to scan when visible.
+  _ENV_SECRET_KEYS = {
+    "SSL_SERVICE_PG_DSN",
+    "SSL_SERVICE_ADMIN_TOKEN",
+  }
+
+  def _env_file_path() -> Path | None:
+    raw = os.environ.get("SSL_SERVICE_ENV_FILE", "").strip()
+    return Path(raw).expanduser().resolve() if raw else None
+
+  def _parse_env_file(text: str) -> list[dict]:
+    """Parse a docker-compose-style .env into an ordered list of
+    ``{type, key, value, raw}`` items. Comments and blank lines are
+    preserved with ``type='comment'`` so we can re-render the file
+    losslessly (modulo whitespace inside quoted values)."""
+    items: list[dict] = []
+    for raw_line in text.splitlines():
+      line = raw_line.rstrip("\r")
+      stripped = line.strip()
+      if not stripped or stripped.startswith("#"):
+        items.append({"type": "comment", "raw": line})
+        continue
+      # Tolerate "export KEY=VAL".
+      body = stripped[len("export "):] if stripped.startswith("export ") else stripped
+      if "=" not in body:
+        # Malformed line — preserve it verbatim so we don't lose data.
+        items.append({"type": "comment", "raw": line})
+        continue
+      key, _, val = body.partition("=")
+      key = key.strip()
+      # Strip a single pair of surrounding quotes if present.
+      if (val.startswith('"') and val.endswith('"')) or \
+         (val.startswith("'") and val.endswith("'")):
+        val = val[1:-1]
+      items.append({"type": "kv", "key": key, "value": val, "raw": line})
+    return items
+
+  def _render_env_file(entries: list[dict]) -> str:
+    """Build a .env file body from a list of ``{key, value}`` dicts —
+    used by PUT. Always emits ``KEY=VALUE`` (no quotes); operator can
+    later add quotes by hand if they want literal whitespace."""
+    out_lines: list[str] = []
+    seen_keys: set[str] = set()
+    for e in entries:
+      key = (e.get("key") or "").strip()
+      if not key:
+        continue
+      if key in seen_keys:
+        # Drop accidental duplicates — last write wins is more
+        # surprising; we keep the first.
+        continue
+      seen_keys.add(key)
+      val = e.get("value")
+      if val is None:
+        val = ""
+      out_lines.append(f"{key}={val}")
+    return "\n".join(out_lines) + ("\n" if out_lines else "")
+
+  def env_get_handler(_request: _Request) -> _Response:
+    path = _env_file_path()
+    if path is None:
+      return _json_response(HTTPStatus.OK, {
+        "available": False,
+        "reason": "SSL_SERVICE_ENV_FILE is not set — start.command should "
+                  "export it; if you launched the admin some other way "
+                  "the .env editor is unavailable.",
+        "path": None, "entries": [],
+      })
+    if not path.is_file():
+      return _json_response(HTTPStatus.OK, {
+        "available": False,
+        "reason": f"file not found: {path}",
+        "path": str(path), "entries": [],
+      })
+    try:
+      text = path.read_text()
+    except OSError as exc:
+      raise HttpError(HTTPStatus.INTERNAL_SERVER_ERROR,
+                      f"could not read .env: {exc}",
+                      code="env_read_failed") from exc
+    parsed = _parse_env_file(text)
+    visible: list[dict] = []
+    for it in parsed:
+      if it["type"] != "kv":
+        continue
+      key = it["key"]
+      val = it["value"]
+      is_secret = key in _ENV_SECRET_KEYS
+      out = {"key": key, "is_secret": is_secret}
+      if is_secret:
+        # Show first/last few chars so the operator can sanity-check
+        # which value is in the file without exposing the secret.
+        if val:
+          if "@" in val and val.startswith("postgres"):
+            # DSN — mask password segment specifically.
+            out["display"] = db_sync_mod.mask_dsn(val)
+          else:
+            out["display"] = ("***" if len(val) <= 8
+                              else f"{val[:3]}***{val[-3:]}")
+        else:
+          out["display"] = ""
+      else:
+        out["display"] = val
+      visible.append(out)
+    return _json_response(HTTPStatus.OK, {
+      "available": True,
+      "path": str(path),
+      "entries": visible,
+      "note": "Changes take effect on next admin restart.",
+    })
+
+  def env_put_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    path = _env_file_path()
+    if path is None:
+      raise HttpError(HTTPStatus.PRECONDITION_FAILED,
+                      "SSL_SERVICE_ENV_FILE is not set; cannot edit .env",
+                      code="env_file_unset")
+    if not path.is_file():
+      raise HttpError(HTTPStatus.NOT_FOUND,
+                      f"env file not found: {path}",
+                      code="env_file_missing")
+    payload = request.json_body() or {}
+    raw_entries = payload.get("entries")
+    if not isinstance(raw_entries, list):
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "entries must be a list of {key, value}",
+                      code="entries_required")
+    # We also accept clients that don't bother re-sending masked
+    # secret values: if a secret key arrives with value=null we keep
+    # the existing on-disk value rather than blowing it away.
+    try:
+      existing_text = path.read_text()
+    except OSError as exc:
+      raise HttpError(HTTPStatus.INTERNAL_SERVER_ERROR,
+                      f"could not read existing .env: {exc}",
+                      code="env_read_failed") from exc
+    existing = {it["key"]: it["value"]
+                for it in _parse_env_file(existing_text)
+                if it["type"] == "kv"}
+    rendered_entries: list[dict] = []
+    for raw in raw_entries:
+      if not isinstance(raw, dict):
+        continue
+      key = (raw.get("key") or "").strip()
+      if not key:
+        continue
+      if key in _ENV_SECRET_KEYS and raw.get("value") in (None, ""):
+        # Treat empty/null as "leave existing value alone" for secrets,
+        # so the UI can omit the field if the operator didn't change it.
+        if key in existing:
+          rendered_entries.append({"key": key, "value": existing[key]})
+        continue
+      rendered_entries.append({"key": key, "value": raw.get("value") or ""})
+    new_body = _render_env_file(rendered_entries)
+    # Atomic-ish write: rename tempfile into place so a half-written
+    # file is never visible to start.command.
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+      tmp_path.write_text(new_body)
+      tmp_path.replace(path)
+    except OSError as exc:
+      try:
+        if tmp_path.exists():
+          tmp_path.unlink()
+      except OSError:
+        pass
+      raise HttpError(HTTPStatus.INTERNAL_SERVER_ERROR,
+                      f"could not write .env: {exc}",
+                      code="env_write_failed") from exc
+    LOGGER.info("env.put: wrote %d entries to %s", len(rendered_entries), path)
+    return _json_response(HTTPStatus.OK, {
+      "ok": True,
+      "path": str(path),
+      "written_entries": len(rendered_entries),
+      "note": "Changes take effect on next admin restart.",
+    })
+
   # ---- /api/sync/* (now id-based) ---------------------------------------
 
   def _resolve_from_to(payload: dict) -> tuple[str, str]:
@@ -5744,6 +5938,8 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("PUT",    "/api/databases/{id}/primary", with_auth(databases_set_primary_handler))
   router.add("PUT",    "/api/databases/{id}/activate", with_auth(databases_activate_handler))
   router.add("POST",   "/api/databases/push-dsn-to-nodes", with_auth(databases_push_dsn_handler))
+  router.add("GET",    "/api/env", with_auth(env_get_handler))
+  router.add("PUT",    "/api/env", with_auth(env_put_handler))
   router.add("POST",   "/api/sync/analyze", with_auth(sync_analyze_handler))
   router.add("POST",   "/api/sync/apply", with_auth(sync_apply_handler))
   router.add("POST",   "/api/admin/restart", with_auth(admin_restart_handler))

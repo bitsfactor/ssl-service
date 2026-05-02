@@ -76,7 +76,12 @@ if [[ -z "${SSL_SERVICE_PG_DSN:-}" ]]; then
   read -n 1 -s
   exit 1
 fi
-echo "loaded .env (DSN: ${SSL_SERVICE_PG_DSN%%@*}@…)"
+# Tell the admin process where .env lives so it can read+edit it
+# from the Databases page. Without this, the admin only sees the
+# values (already in its env) and would have nothing to write back to.
+export SSL_SERVICE_ENV_FILE="${ENV_FILE}"
+echo "loaded .env from ${ENV_FILE}"
+echo "  DSN: ${SSL_SERVICE_PG_DSN%%@*}@…"
 
 # --- 2. Verify venv (we don't create or update it; that's setup.sh) ---
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
