@@ -279,6 +279,18 @@ def load_config_from_env(env: dict[str, str] | None = None) -> AppConfig:
     ),
     logging=LoggingConfig(
       level=_get("SSL_SERVICE_LOG_LEVEL", "INFO"),
+      # Default log paths follow SSL_SERVICE_LOG_DIR so the local
+      # admin (which sets log_dir=/tmp/ssl-service-dev-pg/logs) and
+      # the container (which leaves it at /app/logs) both work
+      # without needing to spell every path explicitly.
+      controller_log_path=_get(
+        "SSL_SERVICE_CONTROLLER_LOG_PATH",
+        f"{_get('SSL_SERVICE_LOG_DIR', '/app/logs')}/controller.log",
+      ),
+      caddy_log_path=_get(
+        "SSL_SERVICE_CADDY_LOG_PATH",
+        f"{_get('SSL_SERVICE_LOG_DIR', '/app/logs')}/caddy.log",
+      ),
     ),
     admin=AdminConfig(
       enabled=_normalize_bool(_get("SSL_SERVICE_ENABLE_WEB_UI", "false")),
