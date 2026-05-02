@@ -6,3 +6,7 @@ __pycache__/
 .pytest_cache/
 build/
 *.egg-info/
+
+# Local admin bootstrap config — contains DSN + admin token. Each
+# operator/machine has its own; never commit.
+.env

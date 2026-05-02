@@ -21,19 +21,59 @@ LOG_DIR="/tmp/ssl-service-dev-pg/logs"
 export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}"
 
 echo "================================================================"
-echo "  ssl-service admin — Postgres (ssl_service_test schema)"
+echo "  ssl-service admin — Postgres (schema is set by .env DSN)"
 echo "================================================================"
 echo
 
 # --- DSN (bootstrap) -----------------------------------------------------
-# Always launch with the BOOTSTRAP DSN. The admin process boots, reads
-# ``system_config['databases']`` from this DB, sees which entry is
-# marked active_id, and (if it's a different DSN) live-swaps its
-# connection pool. So 'Activate' in the Databases page persists in the
-# database itself — no per-machine state on disk.
-BOOTSTRAP_DSN='postgresql://postgres:qqwweeQQWWEE112233%40%40@db.vcktifcdhinmooixljto.supabase.co:5432/postgres?sslmode=require&options=-csearch_path%3Dssl_service_test'
-DSN="${BOOTSTRAP_DSN}"
-echo "bootstrap DSN: ${DSN%%@*}@…"
+# We read the bootstrap DSN from the project's ``.env`` file — the
+# same file that gets written into /opt/ssl-service/ on remote nodes
+# when the platform deploys ssl-service there. Local mirror of the
+# deployment convention.
+#
+# How the runtime resolves the working DSN: the admin connects on
+# startup using SSL_SERVICE_PG_DSN, reads ``system_config['databases']``
+# **from this home schema**, finds the entry whose ``selected`` flag
+# is true, and (if different from the bootstrap DSN) live-swaps its
+# working pool. The home schema never moves with that swap — the
+# registry stays put.
+ENV_FILE="${REPO_DIR}/.env"
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "ERROR: ${ENV_FILE} not found."
+  echo
+  echo "ssl-service needs SSL_SERVICE_PG_DSN in a .env at the project"
+  echo "root (mirrors how the platform writes /opt/ssl-service/.env on"
+  echo "remote deploys). Example contents:"
+  echo
+  cat <<'EOF'
+SSL_SERVICE_PG_DSN=postgresql://USER:PASSWORD@HOST:5432/postgres?sslmode=require&options=-csearch_path%3DSCHEMA
+SSL_SERVICE_ADMIN_TOKEN=dev-token
+SSL_SERVICE_ADMIN_BIND=127.0.0.1
+SSL_SERVICE_ADMIN_PORT=8088
+SSL_SERVICE_MODE=readwrite
+SSL_SERVICE_LOG_LEVEL=INFO
+EOF
+  echo
+  echo "Create ${ENV_FILE} (with at least SSL_SERVICE_PG_DSN), then re-run."
+  echo "Press any key to close this window..."
+  read -n 1 -s
+  exit 1
+fi
+# Source the .env so every line ``KEY=VALUE`` becomes an exported
+# env var (set -a). Cheap and predictable; matches the docker-compose
+# env_file convention.
+set -a
+# shellcheck disable=SC1090
+source "${ENV_FILE}"
+set +a
+if [[ -z "${SSL_SERVICE_PG_DSN:-}" ]]; then
+  echo "ERROR: ${ENV_FILE} did not define SSL_SERVICE_PG_DSN."
+  echo "Press any key to close this window..."
+  read -n 1 -s
+  exit 1
+fi
+DSN="${SSL_SERVICE_PG_DSN}"
+echo "bootstrap DSN (from .env): ${DSN%%@*}@…"
 
 # --- Find Python 3.11+ + venv -------------------------------------------
 PY=""
@@ -93,9 +133,9 @@ fi
 # --- Apply schema --------------------------------------------------------
 mkdir -p "${STATE_DIR}" "${LOG_DIR}"
 
-echo "ensuring ssl_service_test schema + tables exist in Supabase ..."
+echo "ensuring schema + tables exist in Supabase ..."
 DSN="${DSN}" SCHEMA_PATH="${REPO_DIR}/sql/schema.sql" "${PY}" - <<'PY'
-import os, sys
+import os, sys, re, urllib.parse
 try:
     import psycopg
 except ImportError:
@@ -105,14 +145,23 @@ except ImportError:
 dsn = os.environ["DSN"]
 schema_sql = open(os.environ["SCHEMA_PATH"]).read()
 
+# Extract the schema name from the DSN's `options=-csearch_path=...`
+# query parameter. Whichever schema the user pointed their .env at is
+# the one we must `CREATE SCHEMA IF NOT EXISTS` for. Falls back to
+# ``public`` if the DSN didn't pin a schema.
+parsed = urllib.parse.urlparse(dsn)
+qs = urllib.parse.parse_qs(parsed.query)
+options = (qs.get("options") or [""])[0]
+m = re.search(r"-csearch_path[%3D=]+([^&\s]+)", options) or re.search(r"search_path[%3D=]+([^&\s]+)", options)
+schema_name = (m.group(1).strip('"') if m else "public") or "public"
+print(f"target schema (from DSN): {schema_name}")
+
 with psycopg.connect(dsn, connect_timeout=20) as conn:
     with conn.cursor() as cur:
-        # Create the dedicated schema; the DSN already sets search_path=ssl_service_test,
-        # so every subsequent CREATE TABLE lands in the right place.
-        cur.execute("CREATE SCHEMA IF NOT EXISTS ssl_service_test")
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema_name}"')
         cur.execute(schema_sql)
     conn.commit()
-print("schema ready: ssl_service_test")
+print(f"schema ready: {schema_name}")
 PY
 
 # --- Write the config at a temp path (NOT inside the repo) ---------------
@@ -153,7 +202,7 @@ echo "================================================================"
 echo "  Starting admin (admin-only — no Caddy reload, no sync loop)"
 echo "  URL:    http://127.0.0.1:8088/"
 echo "  Token:  dev-token"
-echo "  DB:     Supabase · schema ssl_service_test"
+echo "  DB:     ${DSN%%@*}@…"
 echo "  Config: ${CONFIG_PATH}"
 echo "================================================================"
 echo

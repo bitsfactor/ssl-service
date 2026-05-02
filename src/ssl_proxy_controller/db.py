@@ -353,6 +353,14 @@ class Database:
     use_pool: bool = True,
   ) -> None:
     self._dsn = dsn
+    # ``home_dsn`` is the DSN this admin booted with — the value of
+    # SSL_SERVICE_PG_DSN from .env. Even after ``swap_to()`` flips
+    # ``self._dsn`` to a different working schema, ``self._home_dsn``
+    # stays put. It's the canonical location for the database registry
+    # itself: regardless of which schema the operator is currently
+    # working in, the list of schemas they CAN switch to lives in the
+    # home schema's ``system_config['databases']``. See ``home_connect``.
+    self._home_dsn = dsn
     self._pool = None
     if use_pool and ConnectionPool is not None:
       try:
@@ -467,6 +475,72 @@ class Database:
     else:
       with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
         yield connection
+
+  @property
+  def home_dsn(self) -> str:
+    """The DSN this admin originally booted with. Stays put across
+    ``swap_to()`` calls. Use this for things that should always live
+    on the admin's home schema, like the database registry."""
+    return self._home_dsn
+
+  @contextmanager
+  def home_connect(self) -> Iterator[psycopg.Connection]:
+    """Open a fresh connection to the home DSN regardless of what
+    ``swap_to()`` did to the working pool. We deliberately do NOT
+    keep a separate pool here — registry traffic is low-volume
+    (a few requests when the operator opens the Databases page) and
+    a per-call connection avoids a second always-on TLS link to the
+    same Postgres instance."""
+    with psycopg.connect(self._home_dsn, row_factory=dict_row) as connection:
+      yield connection
+
+  # ---- home-schema system_config helpers (used by db_registry) ----
+
+  def get_system_config_home(self, key: str) -> dict | None:
+    """Like ``get_system_config`` but always reads from the home schema
+    — independent of whether ``swap_to()`` has flipped the working
+    pool to a different schema."""
+    import json as _json
+    with self.home_connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          "SELECT COALESCE(value, '{}'::jsonb) AS value FROM system_config WHERE key = %s",
+          (key,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+          return None
+        val = row["value"]
+        if isinstance(val, str):
+          try:
+            val = _json.loads(val)
+          except Exception:
+            val = {}
+        return val if isinstance(val, dict) else {}
+
+  def upsert_system_config_home(self, key: str, value: dict) -> dict:
+    """Like ``upsert_system_config`` but writes to the home schema."""
+    import json as _json
+    with self.home_connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          INSERT INTO system_config (key, value)
+          VALUES (%s, %s::jsonb)
+          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+          RETURNING COALESCE(value, '{}'::jsonb) AS value
+          """,
+          (key, _json.dumps(value or {})),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+    val = row["value"]
+    if isinstance(val, str):
+      try:
+        val = _json.loads(val)
+      except Exception:
+        val = {}
+    return val if isinstance(val, dict) else {}
 
   _ROUTE_SELECT_COLUMNS = """
     domain,
