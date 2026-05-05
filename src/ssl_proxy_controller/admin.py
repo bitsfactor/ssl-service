@@ -6398,6 +6398,56 @@ def _build_router(ctx: AdminContext) -> _Router:
                       "tokens_linked": linked})
     return results
 
+  def xout_assignments_bulk_handler(request: _Request) -> _Response:
+    """Bulk-assign one preset to N nodes.
+
+    Body: ``{nodes: ["us01", "us-he"], preset_id: 3}``.
+
+    Each xout container runs `load_resolved_preset()` on a 30s tick and
+    detects an assignment change by hashing the resolved inbound list,
+    so writing here is enough — no separate "kick" call is needed.
+    """
+    _require_readwrite(ctx)
+    p = request.json_body() or {}
+    raw_nodes = p.get("nodes")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "nodes must be a non-empty list",
+                      code="nodes_required")
+    try:
+      preset_id = int(p.get("preset_id") or 0)
+    except (TypeError, ValueError):
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "preset_id must be an integer",
+                      code="invalid_preset_id")
+    if preset_id <= 0:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "preset_id is required",
+                      code="preset_id_required")
+    if ctx.database.get_xout_preset(preset_id) is None:
+      raise HttpError(HTTPStatus.NOT_FOUND,
+                      f"xout preset {preset_id} not found",
+                      code="preset_not_found")
+    # Dedup nodes; refuse names we don't recognise so a typo doesn't
+    # silently leave half the operator's intent unapplied.
+    seen: set[str] = set()
+    targets: list[str] = []
+    for n in raw_nodes:
+      nn = _normalize_node_name(str(n))
+      if nn and nn not in seen:
+        seen.add(nn)
+        targets.append(nn)
+    unknown = [nn for nn in targets if ctx.database.get_node(nn) is None]
+    if unknown:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      f"unknown node(s): {', '.join(unknown)}",
+                      code="unknown_nodes")
+    actor = "admin"
+    for nn in targets:
+      ctx.database.upsert_xout_assignment(nn, preset_id, applied_by=actor)
+    return _json_response(HTTPStatus.OK,
+      {"assigned": targets, "preset_id": preset_id})
+
   def xout_sync_tokens_handler(request: _Request) -> _Response:
     """Public wrapper around _xout_sync_tokens_on_nodes.
 
@@ -7419,6 +7469,7 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("GET",    "/api/xout/tokens/{id}/subscription", with_auth(xout_tokens_subscription_handler))
   router.add("POST",   "/api/xout/sync-traffic",             with_auth(xout_sync_traffic_handler))
   router.add("POST",   "/api/xout/sync-tokens",              with_auth(xout_sync_tokens_handler))
+  router.add("POST",   "/api/xout/assignments",              with_auth(xout_assignments_bulk_handler))
   router.add("GET",    "/api/xout/nodes/{name}/traffic-summary",
              with_auth(xout_node_traffic_summary_handler))
   router.add("GET",    "/api/xout/nodes/{name}/subscription",

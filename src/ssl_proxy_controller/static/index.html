@@ -10462,6 +10462,9 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
 
     // Card 3: Nodes
     const nodesCard = h("div", { class: "card" });
+    const assignPresetBtn = h("button", { class: "btn btn-sm btn-primary",
+      title: "Assign a preset to the checked nodes (xout reads its preset assignment from the DB on every 30s tick)",
+      onclick: () => bulkAssignPreset() }, "Assign preset");
     const syncTrafficBtn = h("button", { class: "btn btn-sm",
       title: "Pull live traffic stats from selected nodes (or all)",
       onclick: () => bulkSyncTraffic() }, "Sync traffic");
@@ -10472,7 +10475,7 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
       h("h2", null, "Deployed nodes"),
       h("div", { class: "row", style: "gap: 6px; flex: 1; justify-content: flex-end" },
         h("span", { class: "hint", id: "xout-nodes-count" }, ""),
-        syncTrafficBtn, syncTokensBtn)));
+        assignPresetBtn, syncTrafficBtn, syncTokensBtn)));
     const nodesBody = h("div", { class: "card-body" });
     nodesCard.appendChild(nodesBody);
     root.appendChild(nodesCard);
@@ -10497,6 +10500,67 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
       } catch (err) {
         toast("error", "Sync traffic failed", err.message);
       }
+    }
+
+    async function bulkAssignPreset() {
+      // Pick nodes — explicit selection required so the operator
+      // can't accidentally retarget every node by clicking the wrong
+      // button while no checkboxes are ticked.
+      const nodes = selectedNodeNames();
+      if (!nodes.length) {
+        toast("error", "No nodes selected",
+              "Tick the rows you want to retarget, then click Assign preset.");
+        return;
+      }
+      if (!cachedPresets.length) {
+        toast("error", "No presets",
+              "Create a preset in the Presets section first.");
+        return;
+      }
+      const sel = h("select", { class: "select" });
+      for (const p of cachedPresets) {
+        const ibCount = (p.inbounds || []).length;
+        sel.appendChild(h("option", { value: String(p.id) },
+          `${p.name}  (${ibCount} inbound${ibCount === 1 ? "" : "s"})`));
+      }
+      // Pre-select the most-common current preset across the selection so
+      // the operator usually just clicks Save to confirm.
+      const currentByNode = {};
+      for (const n of cachedNodes) {
+        if (nodes.includes(n.node_name) && n.preset_id) {
+          currentByNode[String(n.preset_id)] =
+            (currentByNode[String(n.preset_id)] || 0) + 1;
+        }
+      }
+      const top = Object.entries(currentByNode)
+        .sort((a, b) => b[1] - a[1])[0];
+      if (top) sel.value = top[0];
+
+      const summary = h("div", { class: "muted", style: "font-size: 12.5px" },
+        `Assigning to ${nodes.length} node${nodes.length === 1 ? "" : "s"}: `,
+        h("span", { class: "mono" }, nodes.join(", ")));
+
+      openModal({
+        title: "Assign xout preset",
+        body: h("div", { class: "form-grid" },
+          h("label", null, "Preset"), sel,
+          h("div", { style: "grid-column: 1/-1" }, summary),
+          h("div", { style: "grid-column: 1/-1; font-size: 12px",
+                     class: "muted" },
+            "Each xout container reads its assignment from the database on its next 30-second tick. ",
+            "If the rendered preset hash changes, xray restarts with the new config; ",
+            "existing connections drop briefly. No deploy needed.")),
+        saveLabel: "Assign",
+        onSave: async () => {
+          const presetId = parseInt(sel.value, 10);
+          if (!presetId) throw new Error("pick a preset");
+          await api("POST", "/api/xout/assignments",
+                    { nodes, preset_id: presetId });
+          toast("success", "Preset assigned",
+                `${nodes.length} node${nodes.length === 1 ? "" : "s"}`);
+          refresh();
+        },
+      });
     }
     async function bulkSyncTokens() {
       const nodes = selectedNodeNames();
