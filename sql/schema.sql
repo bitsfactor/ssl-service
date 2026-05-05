@@ -82,25 +82,24 @@ $$;
 CREATE TABLE IF NOT EXISTS route_upstreams (
   id BIGSERIAL PRIMARY KEY,
   domain TEXT NOT NULL REFERENCES routes(domain) ON DELETE CASCADE,
-  target TEXT NOT NULL,
+  -- Upstream "host:port" stored as two structured fields so port-conflict
+  -- detection and type-safety on the port number are real SQL queries
+  -- instead of TEXT parsing.
+  target_host TEXT NOT NULL,
+  target_port INTEGER NOT NULL CHECK (target_port > 0 AND target_port < 65536),
   weight INTEGER NOT NULL DEFAULT 1 CHECK (weight > 0),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_route_upstreams_domain_target
-  ON route_upstreams (domain, target);
+-- Multiple domains pointing at the same upstream is allowed (multi-domain
+-- fronting the same backend), so the unique constraint is per (domain,
+-- host, port), not just (host, port).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_route_upstreams_domain_host_port
+  ON route_upstreams (domain, target_host, target_port);
 CREATE INDEX IF NOT EXISTS idx_route_upstreams_domain
   ON route_upstreams (domain);
-
--- Backfill any legacy row that has a non-null upstream_target but no
--- corresponding entry in route_upstreams yet. Safe to re-run.
-INSERT INTO route_upstreams (domain, target, weight, updated_at)
-SELECT r.domain, r.upstream_target, 1, NOW()
-FROM routes r
-WHERE r.upstream_target IS NOT NULL
-  AND NOT EXISTS (
-    SELECT 1 FROM route_upstreams ru WHERE ru.domain = r.domain
-  );
+CREATE INDEX IF NOT EXISTS idx_route_upstreams_host_port
+  ON route_upstreams (target_host, target_port);
 
 CREATE INDEX IF NOT EXISTS idx_routes_enabled ON routes (enabled);
 CREATE INDEX IF NOT EXISTS idx_certificates_not_after ON certificates (not_after);
@@ -307,6 +306,65 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_static_ips_ip_port_proto
 CREATE INDEX IF NOT EXISTS idx_static_ips_country ON static_ips (country);
 CREATE INDEX IF NOT EXISTS idx_static_ips_provider ON static_ips (provider);
 
+-- Credentials. Industry standard for residential/datacenter proxy
+-- providers (Bright Data, Oxylabs, Smartproxy, Decodo, IP2World, …)
+-- is ``user:pass@host:port`` — username is essential, not optional,
+-- because: (1) ``user:pass`` is the universal auth scheme; (2) many
+-- providers encode targeting parameters into the username (e.g.
+-- ``customer-leobits-cc-US-city-newyork-session-abc-lifetime-30``).
+-- Plaintext storage matches the existing nodes.ssh_password /
+-- ssh_keys.passphrase pattern.
+ALTER TABLE static_ips ADD COLUMN IF NOT EXISTS username TEXT;
+ALTER TABLE static_ips ADD COLUMN IF NOT EXISTS password TEXT;
+-- ``auth_mode`` distinguishes three legitimate states that the UI
+-- otherwise can't tell apart from "no creds set":
+--   NULL          — auto-detect from username/password (default)
+--   'anonymous'   — open public proxy; absence of creds is by design
+--   'whitelist'   — provider validates by source IP (no creds in URI)
+-- Plain TEXT (no CHECK constraint) so adding a future mode doesn't
+-- need a migration; valid values are enforced in application code.
+ALTER TABLE static_ips ADD COLUMN IF NOT EXISTS auth_mode TEXT;
+
+-- ``kind`` distinguishes how the row should be interpreted by every
+-- downstream consumer (geo lookup, quality probe, outbound resolver):
+--   'static'   — single endpoint with stable IP. ``ip`` is the actual
+--                IP we connect to AND the IP whose location/risk
+--                matters. (Default — preserves existing rows.)
+--   'gateway'  — provider gateway with a stable HOSTNAME and
+--                session-bound exit IPs encoded in the username
+--                (Bright Data, Oxylabs, Smartproxy / Decodo, IPRoyal,
+--                NetNut, Webshare). ``ip`` holds the gateway hostname
+--                (e.g. ``isp.decodo.com``); ``exit_ip`` holds the
+--                exit address geo / quality should be computed for.
+-- Application code enforces values; schema stays open-coded so adding
+-- a future kind (e.g. 'rotating') doesn't require a migration.
+ALTER TABLE static_ips ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'static';
+
+-- ``exit_ip`` is the upstream-bound exit IP for gateway entries — the
+-- address the gateway actually sends traffic from once authenticated.
+-- For 'static' kind this is always NULL. For 'gateway' kind it's the
+-- subject of geo / quality lookups (the gateway hostname's location
+-- doesn't tell us anything about the exit's apparent jurisdiction).
+ALTER TABLE static_ips ADD COLUMN IF NOT EXISTS exit_ip TEXT;
+
+-- ``gateway_provider`` is a short identifier for the upstream provider
+-- ('decodo', 'brightdata', 'oxylabs', 'iproyal', 'smartproxy',
+-- 'webshare', 'netnut', or any string) so the UI can render a provider
+-- badge and parsing logic can re-use provider-specific session-string
+-- conventions. NULL for 'static' kind.
+ALTER TABLE static_ips ADD COLUMN IF NOT EXISTS gateway_provider TEXT;
+
+-- ``expires_at`` — when the lease / subscription / paid period for
+-- this proxy entry runs out. Operator-set; we show a relative-date
+-- indicator on the row and color-code "expired", "<7d", "<30d",
+-- "ok" so an at-a-glance scan flags upcoming churn. NULL means
+-- "no expiry tracked" (free / public proxy / open-ended lease).
+ALTER TABLE static_ips ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_static_ips_kind ON static_ips (kind);
+CREATE INDEX IF NOT EXISTS idx_static_ips_exit_ip ON static_ips (exit_ip);
+CREATE INDEX IF NOT EXISTS idx_static_ips_expires_at ON static_ips (expires_at);
+
 DROP TRIGGER IF EXISTS static_ips_touch_updated_at ON static_ips;
 CREATE TRIGGER static_ips_touch_updated_at
 BEFORE UPDATE ON static_ips
@@ -317,13 +375,30 @@ CREATE TABLE IF NOT EXISTS ip_test_results (
   id BIGSERIAL PRIMARY KEY,
   ip_id BIGINT NOT NULL REFERENCES static_ips(id) ON DELETE CASCADE,
   test_kind TEXT NOT NULL DEFAULT 'connectivity'
-    CHECK (test_kind IN ('connectivity','probe','manual','loop','test_all')),
+    CHECK (test_kind IN ('connectivity','probe','manual','loop','test_all','speedtest','quality')),
   success BOOLEAN NOT NULL,
   latency_ms INTEGER,
   error TEXT,
   raw JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Older deployments still have the narrower CHECK constraint above.
+-- Re-create it to include the new kinds. Idempotent.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'ip_test_results_test_kind_check'
+      AND conrelid = 'ip_test_results'::regclass
+  ) THEN
+    ALTER TABLE ip_test_results DROP CONSTRAINT ip_test_results_test_kind_check;
+  END IF;
+  ALTER TABLE ip_test_results
+    ADD CONSTRAINT ip_test_results_test_kind_check
+    CHECK (test_kind IN ('connectivity','probe','manual','loop','test_all','speedtest','quality'));
+END;
+$$;
 
 CREATE INDEX IF NOT EXISTS idx_ip_test_results_ip_created
   ON ip_test_results (ip_id, created_at DESC);
@@ -612,7 +687,6 @@ CREATE TABLE IF NOT EXISTS xout_tokens (
   name TEXT NOT NULL UNIQUE,
   uuid TEXT NOT NULL UNIQUE,
   password TEXT,
-  is_default BOOLEAN NOT NULL DEFAULT FALSE,
   monthly_quota_gb INTEGER NOT NULL DEFAULT 1000
     CHECK (monthly_quota_gb >= 0 AND monthly_quota_gb <= 1000000),
   monthly_reset_day INTEGER NOT NULL DEFAULT 1
@@ -621,9 +695,9 @@ CREATE TABLE IF NOT EXISTS xout_tokens (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_xout_tokens_default_unique
-  ON xout_tokens ((1)) WHERE is_default;
+-- Note: ``is_default`` and its partial unique index used to live here.
+-- Both were dropped in the xout v2 migration further down — the operator
+-- now picks the token set explicitly at deploy time, no fallback default.
 
 DROP TRIGGER IF EXISTS xout_tokens_touch_updated_at ON xout_tokens;
 CREATE TRIGGER xout_tokens_touch_updated_at
@@ -669,6 +743,47 @@ CREATE INDEX IF NOT EXISTS idx_xout_traffic_daily_day
 CREATE INDEX IF NOT EXISTS idx_xout_traffic_daily_token
   ON xout_traffic_daily (token_id);
 
+-- xout v2 ---------------------------------------------------------------
+-- Token value: opaque alphanumeric URL slug (≥24 chars) used as the
+-- public identifier for a token in subscription URLs (separate from
+-- the internal numeric ``id`` and the VLESS ``uuid``). Auto-generated
+-- on row creation; the operator can regenerate but cannot pick the
+-- value (length+entropy = security).
+ALTER TABLE xout_tokens ADD COLUMN IF NOT EXISTS token_value TEXT;
+
+-- Backfill pre-existing rows. md5() of three jittered sources → 32 hex
+-- chars, take 24. Operator can immediately Regenerate after migration
+-- to upgrade to the proper python-secrets-token alphabet (a..zA..Z0..9)
+-- if they want — this DB-side fallback only exists so the NOT NULL
+-- constraint below doesn't blow up on rows we've already shipped.
+DO $$
+DECLARE
+  rec RECORD;
+BEGIN
+  FOR rec IN SELECT id FROM xout_tokens WHERE token_value IS NULL LOOP
+    UPDATE xout_tokens
+       SET token_value = substr(
+         md5(random()::text || clock_timestamp()::text || rec.id::text), 1, 24)
+     WHERE id = rec.id;
+  END LOOP;
+END $$;
+
+ALTER TABLE xout_tokens ALTER COLUMN token_value SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_xout_tokens_token_value
+  ON xout_tokens (token_value);
+
+-- is_default removed: the operator now picks token set explicitly at
+-- deploy time. Empty selection at deploy = error, no fallback.
+DROP INDEX IF EXISTS idx_xout_tokens_default_unique;
+ALTER TABLE xout_tokens DROP COLUMN IF EXISTS is_default;
+
+-- Preset outbounds: removed. Top-level outbounds were never read by
+-- the xout container's entrypoint — it derives outbounds per-inbound
+-- from each inbound's `outbound` field. Keeping it as dead data was
+-- misleading the operator, so the column is dropped here. The column
+-- existed only briefly between two earlier xout schema revisions.
+ALTER TABLE xout_presets DROP COLUMN IF EXISTS outbounds;
+
 -- Init defaults ----------------------------------------------------------
 -- The Initialize-a-node flow needs two pieces of credential material:
 --   1. an SSH private key it can drop into ~/.ssh on the new VPS so it can
@@ -707,6 +822,311 @@ CREATE TRIGGER ai_api_keys_touch_updated_at
 BEFORE UPDATE ON ai_api_keys
 FOR EACH ROW
 EXECUTE FUNCTION touch_updated_at();
+
+-- New Service flow extensions -------------------------------------------
+-- The "New Service" admin form generates a brand-new service repo from a
+-- template, registers it here, and creates a route for it. These columns
+-- carry the metadata that's specific to that flow:
+--   assigned_port     — host port the service binds to on its node; unique
+--                       across all services so no two compete for the same
+--                       port on the deploy node.
+--   local_repo_dir    — absolute path on the operator's machine where the
+--                       template was rendered. Surfaced in the UI as
+--                       "Open in Finder" so devs jump straight to the code.
+--   default_node_name — node the service was first deployed to. Routes
+--                       layer can later add more upstreams for HA, but
+--                       this records the original.
+--   status            — 'active' (deployable) | 'draft' (no repo URL yet,
+--                       no deploys allowed) | 'retired' (hidden from UI,
+--                       kept for history).
+--   product_yaml      — raw .product.yaml content cached at create time so
+--                       the products catalog can serve it without cloning
+--                       the repo. Refreshed on each deploy.
+--   product_enabled   — whether this service appears in the public
+--                       products catalog. Defaults to false; operator
+--                       flips on once the service is ready to ship.
+
+ALTER TABLE services ADD COLUMN IF NOT EXISTS assigned_port INTEGER
+  CHECK (assigned_port IS NULL OR (assigned_port > 0 AND assigned_port < 65536));
+ALTER TABLE services ADD COLUMN IF NOT EXISTS local_repo_dir TEXT;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS default_node_name TEXT;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
+  CHECK (status IN ('active','draft','retired'));
+ALTER TABLE services ADD COLUMN IF NOT EXISTS product_yaml TEXT;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS product_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_services_assigned_port
+  ON services (assigned_port) WHERE assigned_port IS NOT NULL;
+
+-- default_node_name → nodes(name). ON DELETE SET NULL so retiring a node
+-- doesn't cascade-delete every service that lived on it; ON UPDATE CASCADE
+-- so renaming a node still works.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'services_default_node_name_fkey'
+      AND conrelid = 'services'::regclass
+  ) THEN
+    ALTER TABLE services
+    ADD CONSTRAINT services_default_node_name_fkey
+    FOREIGN KEY (default_node_name) REFERENCES nodes(name)
+    ON DELETE SET NULL ON UPDATE CASCADE;
+  END IF;
+END;
+$$;
+
+-- Routes ↔ services link. When a route is created as part of a service
+-- (the New Service flow does this), we record the back-pointer so the
+-- admin UI can show the relationship and a "delete service" can offer
+-- to clean up its route too.
+ALTER TABLE routes ADD COLUMN IF NOT EXISTS service_name TEXT;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'routes_service_name_fkey'
+      AND conrelid = 'routes'::regclass
+  ) THEN
+    ALTER TABLE routes
+    ADD CONSTRAINT routes_service_name_fkey
+    FOREIGN KEY (service_name) REFERENCES services(name)
+    ON DELETE SET NULL ON UPDATE CASCADE;
+  END IF;
+END;
+$$;
+
+CREATE INDEX IF NOT EXISTS idx_routes_service_name ON routes (service_name);
+
+-- =========================================================================
+-- User system (lives in this same schema; ssl-service is read-only on these
+-- tables, the user-service deployed at user.develop.cc is the only writer).
+-- =========================================================================
+--
+-- Auth / identity ---------------------------------------------------------
+-- We use a single ``auth_users`` row per real person; the email lives on
+-- the row directly (a separate user_emails table can be added later if we
+-- ever need multi-email-per-user). Passwords live in their own table so a
+-- user with only OAuth has no row in auth_passwords. Sessions are
+-- DB-backed for v1 (simple revocation, no JWT verifier needed); v2 swaps
+-- to JWT + refresh tokens.
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- Email is stored as plain TEXT; the application lowercases on insert
+-- (and a unique index on LOWER(primary_email) enforces that anyway).
+-- We avoid citext to skip a non-default extension on managed Postgres.
+CREATE TABLE IF NOT EXISTS auth_users (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  primary_email   TEXT,
+  status          TEXT NOT NULL DEFAULT 'active'
+                  CHECK (status IN ('active','disabled','deleted')),
+  locale          TEXT NOT NULL DEFAULT 'zh-CN'
+                  CHECK (locale IN ('zh-CN','en-US')),
+  display_name    TEXT,
+  is_admin        BOOLEAN NOT NULL DEFAULT FALSE,
+  metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_primary_email
+  ON auth_users (LOWER(primary_email)) WHERE primary_email IS NOT NULL;
+
+DROP TRIGGER IF EXISTS auth_users_touch_updated_at ON auth_users;
+CREATE TRIGGER auth_users_touch_updated_at
+BEFORE UPDATE ON auth_users
+FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+CREATE TABLE IF NOT EXISTS auth_passwords (
+  user_id     UUID PRIMARY KEY REFERENCES auth_users(id) ON DELETE CASCADE,
+  argon2_hash TEXT NOT NULL,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS auth_passwords_touch_updated_at ON auth_passwords;
+CREATE TRIGGER auth_passwords_touch_updated_at
+BEFORE UPDATE ON auth_passwords
+FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+CREATE TABLE IF NOT EXISTS auth_oauth_links (
+  id                BIGSERIAL PRIMARY KEY,
+  user_id           UUID NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+  provider          TEXT NOT NULL CHECK (provider IN ('google','github')),
+  provider_user_id  TEXT NOT NULL,
+  profile           JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (provider, provider_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_auth_oauth_links_user
+  ON auth_oauth_links (user_id);
+
+-- Sessions: token is a high-entropy random string; we hash it before
+-- storing so a DB leak doesn't immediately give attackers usable
+-- session cookies. The plaintext is what goes into the cookie.
+CREATE TABLE IF NOT EXISTS auth_sessions (
+  token_hash    TEXT PRIMARY KEY,        -- sha256 of the cookie value
+  user_id       UUID NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at    TIMESTAMPTZ NOT NULL,
+  last_used_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  ip            TEXT,
+  user_agent    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user
+  ON auth_sessions (user_id, expires_at DESC);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires
+  ON auth_sessions (expires_at);
+
+CREATE TABLE IF NOT EXISTS auth_email_verifications (
+  token_hash  TEXT PRIMARY KEY,         -- sha256 of the link token
+  user_id     UUID NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+  kind        TEXT NOT NULL CHECK (kind IN ('verify_email','reset_password')),
+  email       TEXT NOT NULL,            -- the email this token authorizes
+  expires_at  TIMESTAMPTZ NOT NULL,
+  used_at     TIMESTAMPTZ,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_auth_email_verifications_user_kind
+  ON auth_email_verifications (user_id, kind, expires_at DESC);
+
+-- Products / billing -----------------------------------------------------
+-- ``kind`` distinguishes how the product is consumed:
+--   one_time  — a single payment, no expiry
+--   recurring — Stripe Subscription (monthly etc.)
+--   period    — single payment buys a fixed window (period_days)
+--
+-- Localized strings (name, description) live as JSONB keyed by BCP-47
+-- locale tag (e.g. {"zh-CN": "...", "en-US": "..."}).
+
+CREATE TABLE IF NOT EXISTS products (
+  id                 BIGSERIAL PRIMARY KEY,
+  code               TEXT NOT NULL UNIQUE,           -- slug, stable
+  kind               TEXT NOT NULL
+                     CHECK (kind IN ('one_time','recurring','period')),
+  price_cents        INTEGER NOT NULL CHECK (price_cents >= 0),
+  currency           TEXT NOT NULL DEFAULT 'USD',
+  period_days        INTEGER CHECK (period_days IS NULL OR period_days > 0),
+  stripe_price_id    TEXT,
+  name               JSONB NOT NULL DEFAULT '{}'::jsonb,
+  description        JSONB NOT NULL DEFAULT '{}'::jsonb,
+  metadata           JSONB NOT NULL DEFAULT '{}'::jsonb,
+  active             BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS products_touch_updated_at ON products;
+CREATE TRIGGER products_touch_updated_at
+BEFORE UPDATE ON products
+FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id                       BIGSERIAL PRIMARY KEY,
+  user_id                  UUID NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+  product_id               BIGINT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+  status                   TEXT NOT NULL
+                           CHECK (status IN ('pending','active','canceled','expired','over_quota')),
+  starts_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at               TIMESTAMPTZ,            -- NULL = no expiry
+  stripe_subscription_id   TEXT,
+  source                   TEXT NOT NULL DEFAULT 'manual'
+                           CHECK (source IN ('manual','stripe','grant')),
+  metadata                 JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_user_status
+  ON subscriptions (user_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_product
+  ON subscriptions (product_id);
+
+DROP TRIGGER IF EXISTS subscriptions_touch_updated_at ON subscriptions;
+CREATE TRIGGER subscriptions_touch_updated_at
+BEFORE UPDATE ON subscriptions
+FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- Usage / quotas ---------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS usage_events (
+  id          BIGSERIAL PRIMARY KEY,
+  user_id     UUID NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+  product_id  BIGINT REFERENCES products(id) ON DELETE SET NULL,
+  event       TEXT NOT NULL,
+  qty         DOUBLE PRECISION NOT NULL DEFAULT 1,
+  ts          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  source      TEXT,                                    -- service name that reported
+  metadata    JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_usage_events_user_ts
+  ON usage_events (user_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_events_product_ts
+  ON usage_events (product_id, ts DESC);
+
+CREATE TABLE IF NOT EXISTS usage_quotas (
+  user_id                 UUID NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+  product_id              BIGINT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  limit_qty               DOUBLE PRECISION NOT NULL,
+  reset_kind              TEXT NOT NULL DEFAULT 'never'
+                          CHECK (reset_kind IN ('never','monthly_first','monthly_anchor')),
+  reset_anchor_day        INTEGER CHECK (reset_anchor_day BETWEEN 1 AND 28),
+  current_period_start    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  current_period_consumed DOUBLE PRECISION NOT NULL DEFAULT 0,
+  updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, product_id)
+);
+
+DROP TRIGGER IF EXISTS usage_quotas_touch_updated_at ON usage_quotas;
+CREATE TRIGGER usage_quotas_touch_updated_at
+BEFORE UPDATE ON usage_quotas
+FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- Payments (Stripe drops payloads here via webhook, indexed for idempotency)
+
+CREATE TABLE IF NOT EXISTS payments (
+  id                          BIGSERIAL PRIMARY KEY,
+  user_id                     UUID REFERENCES auth_users(id) ON DELETE SET NULL,
+  product_id                  BIGINT REFERENCES products(id) ON DELETE SET NULL,
+  amount_cents                INTEGER NOT NULL,
+  currency                    TEXT NOT NULL DEFAULT 'USD',
+  status                      TEXT NOT NULL,           -- stripe payment status
+  stripe_payment_intent_id    TEXT UNIQUE,
+  stripe_event_id             TEXT UNIQUE,             -- webhook idempotency
+  created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  metadata                    JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_payments_user
+  ON payments (user_id, created_at DESC);
+
+-- xout user-system migration tables ---------------------------------------
+-- New tables, additive — leave the legacy xout_tokens / xout_node_tokens
+-- alone for now. The cut-over (P2) drops them once xout is rebuilt to
+-- consume auth_users.
+
+CREATE TABLE IF NOT EXISTS xout_products (
+  product_id        BIGINT PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE,
+  inbound_selector  JSONB NOT NULL DEFAULT '{}'::jsonb,
+  -- e.g. {"node_groups": ["us"], "tags": ["vless-tcp"]}
+  -- or   {"explicit": [["us01","vless-tcp"], ["us02","vless-tcp"]]}
+  metadata          JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS xout_products_touch_updated_at ON xout_products;
+CREATE TRIGGER xout_products_touch_updated_at
+BEFORE UPDATE ON xout_products
+FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+CREATE TABLE IF NOT EXISTS xout_node_users (
+  node_name        TEXT NOT NULL REFERENCES nodes(name) ON DELETE CASCADE ON UPDATE CASCADE,
+  user_id          UUID NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+  vless_uuid       UUID NOT NULL,                      -- = auth_users.id
+  provisioned_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_seen_at     TIMESTAMPTZ,
+  PRIMARY KEY (node_name, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_xout_node_users_user
+  ON xout_node_users (user_id);
 
 -- Sequence re-sync ------------------------------------------------------
 -- After cross-database sync (online→one or primary→one), BIGSERIAL columns

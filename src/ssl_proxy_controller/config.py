@@ -230,7 +230,9 @@ def load_config_from_env(env: dict[str, str] | None = None) -> AppConfig:
     SSL_SERVICE_ACME_STAGING      default false
     SSL_SERVICE_ACME_DNS_PROVIDER default cloudflare
     SSL_SERVICE_RENEW_BEFORE_DAYS default 30
-    SSL_SERVICE_POLL_INTERVAL_SECONDS  default 30
+    SSL_SERVICE_POLL_INTERVAL_SECONDS         default 30
+    SSL_SERVICE_RETRY_BACKOFF_SECONDS         default 3600
+    SSL_SERVICE_LOOP_ERROR_BACKOFF_SECONDS    default 10
   """
   e = env if env is not None else os.environ
 
@@ -260,10 +262,19 @@ def load_config_from_env(env: dict[str, str] | None = None) -> AppConfig:
     sync=SyncConfig(
       poll_interval_seconds=_get_int("SSL_SERVICE_POLL_INTERVAL_SECONDS", 30),
       renew_before_days=_get_int("SSL_SERVICE_RENEW_BEFORE_DAYS", 30),
+      retry_backoff_seconds=_get_int("SSL_SERVICE_RETRY_BACKOFF_SECONDS", 3600),
+      loop_error_backoff_seconds=_get_int("SSL_SERVICE_LOOP_ERROR_BACKOFF_SECONDS", 10),
     ),
     paths=PathsConfig(
       state_dir=Path(_get("SSL_SERVICE_STATE_DIR", "/app/state")),
       log_dir=Path(_get("SSL_SERVICE_LOG_DIR", "/app/logs")),
+      caddy_binary=_get("SSL_SERVICE_CADDY_BINARY", "/usr/bin/caddy"),
+      # The default is /usr/local/bin/certbot to match the in-container
+      # pip install location (Dockerfile installs certbot via pip, which
+      # puts it under /usr/local/bin). The PathsConfig dataclass default
+      # of /usr/bin/certbot is for the YAML-loader path; in env-only mode
+      # we shouldn't fall through to it.
+      certbot_binary=_get("SSL_SERVICE_CERTBOT_BINARY", "/usr/local/bin/certbot"),
     ),
     caddy=CaddyConfig(
       admin_url=_get("SSL_SERVICE_CADDY_ADMIN_URL", "http://127.0.0.1:2019"),
@@ -298,6 +309,28 @@ def load_config_from_env(env: dict[str, str] | None = None) -> AppConfig:
       port=_get_int("SSL_SERVICE_ADMIN_PORT", 8088),
       token=_get("SSL_SERVICE_ADMIN_TOKEN", ""),
     ),
+  )
+  # Numeric range checks — mirror what load_config() does for YAML so
+  # bad values surface at startup rather than as cryptic timeouts later.
+  config.sync.poll_interval_seconds = _require_int(
+    "SSL_SERVICE_POLL_INTERVAL_SECONDS",
+    config.sync.poll_interval_seconds, minimum=1,
+  )
+  config.sync.renew_before_days = _require_int(
+    "SSL_SERVICE_RENEW_BEFORE_DAYS",
+    config.sync.renew_before_days, minimum=0,
+  )
+  config.sync.retry_backoff_seconds = _require_int(
+    "SSL_SERVICE_RETRY_BACKOFF_SECONDS",
+    config.sync.retry_backoff_seconds, minimum=0,
+  )
+  config.sync.loop_error_backoff_seconds = _require_int(
+    "SSL_SERVICE_LOOP_ERROR_BACKOFF_SECONDS",
+    config.sync.loop_error_backoff_seconds, minimum=1,
+  )
+  config.acme.dns_propagation_seconds = _require_int(
+    "SSL_SERVICE_ACME_DNS_PROPAGATION_SECONDS",
+    config.acme.dns_propagation_seconds, minimum=0,
   )
   if config.mode == "readwrite" and not config.acme.email.strip():
     raise ValueError("SSL_SERVICE_ACME_EMAIL is required in readwrite mode")

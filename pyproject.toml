@@ -28,7 +28,12 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-"ssl_proxy_controller" = ["static/*", "static/**/*"]
+# Bundle the static admin SPA and the New Service template tree.
+# templates/service/ uses a `_dot_` filename prefix instead of literal
+# dotfiles so source distributions reliably include every file (some
+# packaging paths drop hidden files); the renderer strips `_dot_` →
+# `.` at write time.
+"ssl_proxy_controller" = ["static/*", "static/**/*", "templates/*", "templates/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

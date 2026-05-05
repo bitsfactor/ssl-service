@@ -251,15 +251,47 @@ def test_validate_upstream_target_rejects_invalid_value() -> None:
 def test_reload_caddy_runs_subprocess(monkeypatch) -> None:
   calls: list[list[str]] = []
 
-  def fake_run(command: list[str], check: bool) -> None:
+  class _Result:
+    def __init__(self) -> None:
+      self.returncode = 0
+      self.stdout = ""
+      self.stderr = ""
+
+  def fake_run(command: list[str], **kwargs) -> _Result:
     calls.append(command)
-    assert check is True
+    # The new reload_caddy captures output and uses a timeout so a
+    # hung Caddy admin endpoint can't block the controller loop.
+    assert kwargs.get("capture_output") is True
+    assert kwargs.get("text") is True
+    assert isinstance(kwargs.get("timeout"), (int, float))
+    return _Result()
 
   monkeypatch.setattr(subprocess, "run", fake_run)
 
   reload_caddy(["/usr/bin/caddy", "reload"])
 
   assert calls == [["/usr/bin/caddy", "reload"]]
+
+
+def test_reload_caddy_raises_with_stderr_on_nonzero_exit(monkeypatch) -> None:
+  class _Result:
+    def __init__(self) -> None:
+      self.returncode = 1
+      self.stdout = ""
+      self.stderr = "config parse error: foo"
+
+  monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _Result())
+  with pytest.raises(subprocess.CalledProcessError) as ei:
+    reload_caddy(["/usr/bin/caddy", "reload"])
+  assert "config parse error" in (ei.value.stderr or "")
+
+
+def test_reload_caddy_translates_timeout(monkeypatch) -> None:
+  def _raise_timeout(*args, **kwargs):
+    raise subprocess.TimeoutExpired(cmd=args[0] if args else [], timeout=kwargs.get("timeout", 0))
+  monkeypatch.setattr(subprocess, "run", _raise_timeout)
+  with pytest.raises(RuntimeError, match="caddy reload timed out"):
+    reload_caddy(["/usr/bin/caddy", "reload"], timeout=0.01)
 
 
 def test_render_caddyfile_renders_multiple_upstreams_with_lb_policy(tmp_path: Path) -> None:

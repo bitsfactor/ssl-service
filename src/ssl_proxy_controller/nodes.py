@@ -12,13 +12,16 @@ escape this module.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
 import re
 import shlex
+import tarfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import paramiko
@@ -31,6 +34,47 @@ from paramiko.ssh_exception import (
 )
 
 from .db import NodeRecord, NodeStatusRecord
+
+
+# ---------------------------------------------------------------------------
+# Local-source tar filter (used by deploy_service_with_manifest in local mode)
+# ---------------------------------------------------------------------------
+# Module-level so it's importable from tests. We exclude vcs / cache / build
+# artifacts AND the operator's actual env files (secrets — the platform writes
+# a fresh .env on the remote anyway). ``.env.example`` / ``.env.sample`` are
+# kept; those are documented samples, not secrets.
+
+LOCAL_SOURCE_TAR_SKIP_NAMES = frozenset({
+  ".git", ".venv", "__pycache__", "node_modules",
+  ".pytest_cache", "dist", "build", ".DS_Store",
+  ".env", ".env.local", ".env.development", ".env.production",
+  ".env.staging", ".env.test",
+})
+
+
+def _local_source_tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+  """Filter for ``tarfile.TarFile.add(..., filter=...)`` used by the
+  local-deploy code path.
+
+  ``info.name`` looks like ``"./path/to/file"`` (we always tar with
+  ``arcname="."``). We strip the leading ``"./"`` exactly once and then
+  inspect each path segment.
+
+  IMPORTANT: ``.lstrip("./")`` would treat ``"./"`` as a *set* of
+  characters and eat any leading ``"."`` in the first segment too
+  (turning ``".git/HEAD"`` into ``"git/HEAD"``), which would leak
+  ``.git`` past the filter — this was a real bug. ``.startswith("./")``
+  + slice strips the prefix exactly once.
+  """
+  rel = info.name
+  if rel == "." or rel == "":
+    return info
+  if rel.startswith("./"):
+    rel = rel[2:]
+  for seg in rel.split("/"):
+    if seg in LOCAL_SOURCE_TAR_SKIP_NAMES:
+      return None
+  return info
 
 
 DEFAULT_DEPLOY_COMMAND = (
@@ -143,14 +187,18 @@ def _open_client(
         return c, errors
       except AuthenticationException as exc:
         errors.append(f"{label}: auth rejected ({exc})")
-      except Exception as exc:  # noqa: BLE001
+      except Exception:  # noqa: BLE001
         # Network / banner / etc — surface and stop trying further keys
         # since the issue isn't the key.
-        try: c.close()
-        except Exception: pass
+        try:
+          c.close()
+        except Exception as close_exc:  # noqa: BLE001
+          LOGGER.debug("ssh: client close failed: %s", close_exc)
         raise
-      try: c.close()
-      except Exception: pass
+      try:
+        c.close()
+      except Exception as close_exc:  # noqa: BLE001
+        LOGGER.debug("ssh: client close failed: %s", close_exc)
     return None, errors
 
   if node.auth_method == "password":
@@ -160,7 +208,11 @@ def _open_client(
 
   if node.auth_method == "key":
     if not candidates:
-      raise ValueError("key auth requested but no keys are configured (inline or linked)")
+      raise ValueError(
+        f"key auth requested but no keys are configured "
+        f"(inline={'yes' if node.ssh_private_key else 'no'}, "
+        f"linked={len(links)} provided)"
+      )
     c, errors = _try_keys()
     if c is not None:
       return c
@@ -696,12 +748,21 @@ def deploy_service_with_manifest(
   deploy_timeout: float = 600.0,
   healthcheck_timeout: float = 120.0,
   linked_keys: list[dict] | None = None,
+  local_source_dir: str | None = None,
+  install_dir: str | None = None,
 ) -> ManifestDeployResult:
   """Run the rendered deploy script on a node, then verify healthcheck.
 
   Both scripts come pre-rendered from
   ``services_deploy.render_deploy_script`` /
   ``render_healthcheck_script`` — this function only does SSH plumbing.
+
+  When ``local_source_dir`` is provided, the function first packs that
+  directory into a tarball and pushes it to ``install_dir`` on the node
+  (via paramiko's exec_command + stdin tar pipe). This is the local-
+  deploy path: the service has no GitHub repo, the operator's local
+  rendered tree is the source of truth, and the deploy script
+  (rendered with ``source_mode="local"``) skips git entirely.
   """
   start = datetime.now(tz=UTC).timestamp()
   result = ManifestDeployResult(
@@ -722,8 +783,77 @@ def deploy_service_with_manifest(
   try:
     client = _open_client(node, linked_keys=linked_keys)
 
+    # 0. Local-source push (only when local_source_dir is set).
+    # We tar the local tree on the admin's machine and pipe it over
+    # SSH; the remote side cleans stale code, mkdir's install_dir,
+    # then untars in place.
+    local_revision = ""
+    if local_source_dir:
+      if not install_dir:
+        result.error = "local_source_dir requires install_dir"
+        return result
+      # No expanduser — system_config is required to give an absolute
+      # path. Whatever process runs admin (native or in a container)
+      # interprets the path directly. Documented in the New Service form.
+      src = Path(local_source_dir)
+      if not src.is_dir():
+        result.error = f"local_source_dir not a directory: {src}"
+        return result
+
+      buf = io.BytesIO()
+      with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(str(src), arcname=".", filter=_local_source_tar_filter)
+      tar_bytes = buf.getvalue()
+      # Use a sha256 prefix as the deployment "revision" — gives the
+      # operator a way to tell two local deploys apart in History.
+      local_revision = "local-" + hashlib.sha256(tar_bytes).hexdigest()[:12]
+      log_chunks.append(
+        f"=== local-source push ({len(tar_bytes)} bytes, {local_revision}) ==="
+      )
+
+      # Clean up code-shaped files before extracting, so renamed/removed
+      # files from the previous deploy don't linger. We use a denylist of
+      # paths to PRESERVE (data/, logs/, and the freshly-rewritten .env)
+      # plus a wildcard delete of everything else, so we're robust to
+      # whatever files the template ships now or in the future.
+      # Use `bash -c` explicitly so `shopt` works regardless of what
+      # the node's default login shell is. The cleanup deletes every
+      # top-level entry except data/ and logs/ (those are docker-compose
+      # bind-mount targets), then tars in the new tree.
+      cleanup_script = (
+        "set -e; "
+        f"mkdir -p {shlex.quote(install_dir)}; "
+        f"cd {shlex.quote(install_dir)}; "
+        "shopt -s nullglob dotglob; "
+        "for entry in *; do "
+        "  case \"$entry\" in "
+        "    data|logs|.|..) continue;; "
+        "    *) rm -rf -- \"$entry\";; "
+        "  esac; "
+        "done; "
+        "tar xzf - -C ."
+      )
+      push_cmd = f"bash -c {shlex.quote(cleanup_script)}"
+      stdin, stdout, stderr = client.exec_command(push_cmd, timeout=deploy_timeout)
+      stdin.write(tar_bytes)
+      stdin.flush()
+      stdin.channel.shutdown_write()
+      push_out = stdout.read().decode("utf-8", errors="replace")
+      push_err = stderr.read().decode("utf-8", errors="replace")
+      push_exit = stdout.channel.recv_exit_status()
+      if push_out: log_chunks.append(push_out)
+      if push_err: log_chunks.append(push_err)
+      if push_exit != 0:
+        result.error = f"local source push failed (exit={push_exit})"
+        result.log_text = "\n".join(log_chunks)
+        return result
+
     # 1. Run the deploy script. We pipe it via stdin to bash so we
     # don't have to fight quoting on the heredoc inside the script.
+    # When local mode pushed source, prepend LOCAL_REVISION export so
+    # the script's DEPLOYED_SHA captures it.
+    if local_revision:
+      deploy_script = f"export LOCAL_REVISION={shlex.quote(local_revision)}\n{deploy_script}"
     stdin, stdout, stderr = client.exec_command(
       "bash -s -- 2>&1", timeout=deploy_timeout,
     )

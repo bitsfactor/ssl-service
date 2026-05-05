@@ -1,0 +1,58 @@
+service: user
+runtime: compose
+compose_file: docker-compose.yml
+install_dir_template: /opt/{name}
+
+required_env:
+  - USER_SERVICE_PG_DSN
+  - ADMIN_SERVICE_TOKEN
+
+defaults:
+  PORT: "8200"
+  LOG_LEVEL: info
+  TZ: Asia/Shanghai
+  # Token consumed by the X-Service-Token header on /api/usage —
+  # rotate when adding new caller services. Keep low-trust: this
+  # only authorizes write to usage_events, never user data.
+  USAGE_INGEST_TOKEN: change-me-in-system-config
+  # Shared secret matching ssl-service's
+  # system_config[user_service.admin_token]. The ssl-service admin
+  # proxy sends it as X-Admin-Service-Token; user-service treats a
+  # match as admin without needing a cookie session. MUST match
+  # exactly — if missing, admin endpoints work via cookie only.
+  ADMIN_SERVICE_TOKEN: change-me-in-system-config
+  # Cookie security — for prod, the deploy override sets this to
+  # the canonical user.develop.cc + secure flag.
+  SESSION_COOKIE_DOMAIN: ""
+  SESSION_COOKIE_SECURE: "true"
+  # Password reset / verify-email URL prefix the user clicks. The
+  # actual link is built as <PUBLIC_URL>/auth/verify?token=...
+  PUBLIC_URL: "https://user.develop.cc"
+
+secrets:
+  - env: USER_SERVICE_PG_DSN
+    from: system_config:databases.entries[id=f499f7431634].dsn
+  - env: USAGE_INGEST_TOKEN
+    from: system_config:user_service.usage_ingest_token
+  - env: ADMIN_SERVICE_TOKEN
+    from: system_config:user_service.admin_token
+
+exposed_ports:
+  - 8200
+
+healthcheck:
+  url: http://localhost:${PORT}/health
+  expect_status: 200
+  timeout_seconds: 30
+  retries: 6
+  interval_seconds: 5
+
+depends_on: []
+
+hooks:
+  pre_deploy: scripts/pre_deploy.sh
+  post_deploy: scripts/post_deploy.sh
+
+volumes:
+  - /opt/{name}/data
+  - /opt/{name}/logs

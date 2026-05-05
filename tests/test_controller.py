@@ -452,7 +452,20 @@ def test_run_forever_sleeps_after_loop_error(monkeypatch, tmp_path: Path) -> Non
     controller.stop()
 
   monkeypatch.setattr(controller, "run_once", fake_run_once)
-  monkeypatch.setattr("ssl_proxy_controller.controller.time.sleep", lambda seconds: events.append(("sleep", seconds)))
+  # The interruptible sleep is implemented via Event.wait; replace the
+  # event with a fake whose wait() logs the duration and returns False
+  # so the loop iterates instead of blocking on the real event.
+  class _FakeEvent:
+    def __init__(self) -> None:
+      self._set = False
+    def set(self) -> None:
+      self._set = True
+    def is_set(self) -> bool:
+      return self._set
+    def wait(self, seconds=None):
+      events.append(("sleep", seconds))
+      return self._set
+  controller._stop_event = _FakeEvent()
 
   controller.run_forever()
 
@@ -468,7 +481,17 @@ def test_run_forever_does_not_sleep_after_stop(monkeypatch, tmp_path: Path) -> N
   monkeypatch.setattr(controller, "ensure_directories", lambda: None)
   monkeypatch.setattr("ssl_proxy_controller.controller.signal.signal", lambda *_args: None)
   monkeypatch.setattr(controller, "run_once", controller.stop)
-  monkeypatch.setattr("ssl_proxy_controller.controller.time.sleep", lambda seconds: sleeps.append(seconds))
+  class _FakeEvent:
+    def __init__(self) -> None:
+      self._set = False
+    def set(self) -> None:
+      self._set = True
+    def is_set(self) -> bool:
+      return self._set
+    def wait(self, seconds=None):
+      sleeps.append(seconds)
+      return self._set
+  controller._stop_event = _FakeEvent()
 
   controller.run_forever()
 

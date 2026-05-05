@@ -64,16 +64,19 @@ def test_issue_certificate_reads_certbot_output(monkeypatch, tmp_path: Path) -> 
   command_calls: list[list[str]] = []
   original_path = Path
 
-  def fake_run(command: list[str], check: bool, capture_output: bool = False, text: bool = False):
+  def fake_run(command: list[str], check: bool = False, capture_output: bool = False, text: bool = False, timeout: float | None = None):
     command_calls.append(command)
-    assert check is True
     if command == [config.paths.certbot_binary, "plugins"]:
+      assert check is True
       assert capture_output is True
       assert text is True
       return subprocess.CompletedProcess(command, 0, stdout="dns-cloudflare", stderr="")
-    assert capture_output is False
-    assert text is False
-    return None
+    # The certbot issuance run uses bounded time + captured output so
+    # failures can be diagnosed from the controller log.
+    assert capture_output is True
+    assert text is True
+    assert isinstance(timeout, (int, float)) and timeout > 0
+    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
   def fake_path(value: str) -> Path:
     if value == "/etc/letsencrypt/live":
@@ -170,16 +173,23 @@ def test_issue_certificate_retries_after_identical_cloudflare_record_error(monke
   cleanup_calls: list[tuple[str, str, str]] = []
   original_path = Path
 
-  def fake_run(command: list[str], check: bool, capture_output: bool = False, text: bool = False):
+  def fake_run(command: list[str], check: bool = False, capture_output: bool = False, text: bool = False, timeout: float | None = None):
     command_calls.append(command)
-    assert check is True
     if command == [config.paths.certbot_binary, "plugins"]:
+      assert check is True
       return subprocess.CompletedProcess(command, 0, stdout="dns-cloudflare", stderr="")
+    # Certbot issuance: must capture output + use a bounded timeout so
+    # the controller can survive a hung run.
+    assert capture_output is True
+    assert text is True
+    assert isinstance(timeout, (int, float)) and timeout > 0
     if len(command_calls) == 2:
-      raise subprocess.CalledProcessError(
-        1,
-        command,
-        output="",
+      # First certbot run fails with the "record exists" CF error; the
+      # new _run_certbot reports failure via a non-zero return code,
+      # which the recovery wrapper translates to CalledProcessError.
+      return subprocess.CompletedProcess(
+        command, 1,
+        stdout="",
         stderr="Error communicating with the Cloudflare API: An identical record already exists.",
       )
     return subprocess.CompletedProcess(command, 0, stdout="", stderr="")

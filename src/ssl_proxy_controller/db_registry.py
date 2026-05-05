@@ -114,12 +114,30 @@ def _normalize_registry(data: Any) -> dict:
 
 def _load(database) -> dict:
   """Read the registry from system_config['databases'] **on the home
-  schema**. Returns ``_empty_registry()`` if not yet seeded."""
+  schema**.
+
+  Returns ``_empty_registry()`` if the row simply hasn't been seeded
+  yet — that's a normal first-boot state. Other errors (network down,
+  auth failure, missing ``system_config`` table) are propagated; the
+  prior behavior of swallowing them silently led to confusing UX where
+  a Postgres outage rendered as an empty-looking Databases page that
+  the operator would then "helpfully" repopulate."""
   try:
     raw = database.get_system_config_home(_SYS_KEY)
-  except Exception:  # noqa: BLE001
-    LOGGER.exception("could not read system_config[%s]; treating as empty", _SYS_KEY)
-    return _empty_registry()
+  except Exception as exc:  # noqa: BLE001
+    # Distinguish "table doesn't exist yet" (a fresh schema before
+    # apply-schema runs) from "real failure". psycopg surfaces this as
+    # UndefinedTable; we recognise it both by class name and SQLSTATE
+    # so we don't have to import the optional psycopg.errors path.
+    name = type(exc).__name__
+    sqlstate = getattr(exc, "sqlstate", None)
+    if name == "UndefinedTable" or sqlstate == "42P01":
+      LOGGER.info(
+        "system_config table not present yet; treating registry as empty",
+      )
+      return _empty_registry()
+    LOGGER.exception("could not read system_config[%s]", _SYS_KEY)
+    raise
   return _normalize_registry(raw)
 
 

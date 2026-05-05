@@ -270,6 +270,42 @@ class FakeDatabase:
     self.node_statuses[status.node_name] = status
     return status
 
+  # node ssh-key links ---------------------------------------------------
+  # admin.create_node + admin.list_nodes call list_node_ssh_key_links() to
+  # render the per-node "linked keys" view. The fake doesn't actually
+  # support multi-key linking; returning an empty list keeps the admin
+  # path happy without forcing every node test to set up the registry.
+  def list_node_ssh_key_links(self, node_name: str) -> list[dict]:
+    _ = node_name
+    return []
+
+  def list_all_node_ssh_key_links(self) -> dict[str, list[dict]]:
+    return {name: [] for name in self.nodes}
+
+  def latest_init_run_per_node(self, node_names: list[str] | None = None) -> dict[str, "NodeInitRunRecord"]:
+    """Return the most recent init_run per node. ``node_names`` (when
+    given) restricts the result to that subset — admin uses this on the
+    list view to avoid scanning every run table-wide."""
+    wanted = set(node_names) if node_names is not None else None
+    out: dict[str, NodeInitRunRecord] = {}
+    for run in self.init_runs.values():
+      if wanted is not None and run.node_name not in wanted:
+        continue
+      cur = out.get(run.node_name)
+      if cur is None or run.started_at > cur.started_at:
+        out[run.node_name] = run
+    return out
+
+  def link_ssh_key_to_node(self, node_name: str, ssh_key_id: int, *, priority: int = 100) -> None:
+    _ = node_name, ssh_key_id, priority
+
+  def unlink_ssh_key_from_node(self, node_name: str, ssh_key_id: int) -> bool:
+    _ = node_name, ssh_key_id
+    return False
+
+  def replace_node_ssh_key_links(self, node_name: str, key_ids: list[int]) -> None:
+    _ = node_name, key_ids
+
   # init runs ------------------------------------------------------------
   def insert_init_run(self, node_name: str, config_snapshot: dict | None = None) -> NodeInitRunRecord:
     self._init_run_seq += 1
@@ -445,7 +481,11 @@ def test_create_route_accepts_multiple_upstreams_and_lb_policy() -> None:
   )
   assert result["lb_policy"] == "ip_hash"
   assert len(result["upstreams"]) == 3
-  assert result["upstreams"][0] == {"target": "10.0.0.10:6111", "weight": 1}
+  # The response surfaces both the legacy ``target`` string and the
+  # structured ``host`` / ``port`` fields after the route-port refactor.
+  assert result["upstreams"][0] == {
+    "target": "10.0.0.10:6111", "host": "10.0.0.10", "port": 6111, "weight": 1,
+  }
   assert result["upstream_target"] == "10.0.0.10:6111"
   stored = ctx.database.routes["balanced.example.com"]
   assert stored.lb_policy == "ip_hash"
@@ -823,7 +863,7 @@ def test_list_nodes_includes_status_payload() -> None:
     os_release="Ubuntu 22.04", last_probed_at=datetime.now(tz=UTC),
     last_probe_error=None,
   ))
-  rows = list_nodes(ctx)
+  rows = list_nodes(ctx, with_status=True)
   assert rows[0]["name"] == "edge-1"
   assert rows[0]["status"]["reachable"] is True
   assert rows[0]["status"]["service_mode"] == "readwrite"
@@ -847,7 +887,7 @@ def test_probe_node_action_uses_module_and_persists_status(monkeypatch) -> None:
     os_release="Debian 12", last_probed_at=datetime.now(tz=UTC),
     last_probe_error=None, raw_probe={"sections": {}},
   )
-  monkeypatch.setattr(nodes_mod, "probe_node", lambda node: fake_status)
+  monkeypatch.setattr(nodes_mod, "probe_node", lambda node, **_kw: fake_status)
   result = probe_node_action(ctx, "edge-1")
   assert result["reachable"] is True
   assert result["service_mode"] == "readonly"
@@ -858,7 +898,7 @@ def test_deploy_node_action_runs_command(monkeypatch) -> None:
   ctx = make_context()
   create_node(ctx, _node_payload(deploy_command="echo deploy"))
   captured = {}
-  def fake_deploy(node, override_command=None):
+  def fake_deploy(node, override_command=None, **_kw):
     captured["override"] = override_command
     captured["node_name"] = node.name
     return nodes_mod.CommandResult("echo deploy", 0, "deploy ok\n", "", 0.01)
@@ -873,7 +913,7 @@ def test_update_node_action_uses_override_command(monkeypatch) -> None:
   ctx = make_context()
   create_node(ctx, _node_payload())
   captured = {}
-  def fake_update(node, override_command=None):
+  def fake_update(node, override_command=None, **_kw):
     captured["override"] = override_command
     return nodes_mod.CommandResult(override_command or "default", 0, "ok\n", "", 0.01)
   monkeypatch.setattr(nodes_mod, "update_service", fake_update)
@@ -901,7 +941,7 @@ def test_start_init_run_persists_payload_to_node(monkeypatch) -> None:
   ctx = make_context()
   create_node(ctx, _node_payload())
   scheduled = {}
-  def fake_schedule(database, node, cfg):
+  def fake_schedule(database, node, cfg, **_kw):
     scheduled["node_name"] = node.name
     scheduled["cfg"] = cfg
     rec = database.insert_init_run(node.name, config_snapshot=cfg.to_json())

@@ -6,6 +6,7 @@ import logging
 import shutil
 import signal
 import sys
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -45,7 +46,11 @@ class Controller:
     self.certs_dir = self.state_dir / "certs"
     self.runtime_state_path = self.state_dir / "state" / "state.json"
     self._running = True
-    # Honor the registry's active_id at startup. The bootstrap DSN
+    # Event used to break out of time.sleep() promptly on SIGTERM/SIGINT
+    # — without it, the controller can sit in sleep() for tens of seconds
+    # after a stop signal, which makes container restarts feel slow.
+    self._stop_event = threading.Event()
+    # Honor the registry's selected entry at startup. The bootstrap DSN
     # gets us into the database so we can read system_config; if the
     # operator previously hit Activate on a different entry, swap
     # over to it. This survives the absence of any local YAML file.
@@ -53,11 +58,11 @@ class Controller:
       from . import db_registry as _reg  # local import to avoid cycle
       active = _reg.get_active_dsn(self.database)
       if active and active != config.postgres.dsn:
-        LOGGER.info("Controller: registry active_id differs from bootstrap "
-                    "DSN; swapping pool to active DSN")
+        LOGGER.info("Controller: registry-selected DSN differs from "
+                    "bootstrap DSN; swapping pool to selected DSN")
         self.database.swap_to(active)
     except Exception:  # noqa: BLE001
-      LOGGER.exception("Controller: could not read registry active_id; "
+      LOGGER.exception("Controller: could not read registry selected entry; "
                        "staying on bootstrap DSN")
 
   def ensure_directories(self) -> None:
@@ -72,6 +77,13 @@ class Controller:
 
   def stop(self, *_args: object) -> None:
     self._running = False
+    # Wake any thread blocked in self._stop_event.wait(...) so the
+    # main loop returns immediately instead of sleeping out the
+    # remainder of poll_interval_seconds.
+    try:
+      self._stop_event.set()
+    except Exception:  # noqa: BLE001
+      pass
 
   def run_forever(self) -> None:
     self.ensure_directories()
@@ -96,11 +108,15 @@ class Controller:
           LOGGER.exception("controller loop failed")
           if not self._running:
             break
-          time.sleep(self.config.sync.loop_error_backoff_seconds)
+          # Interruptible sleep — wakes on stop signal so the loop
+          # exits promptly instead of waiting out the full backoff.
+          if self._stop_event.wait(self.config.sync.loop_error_backoff_seconds):
+            break
           continue
         if not self._running:
           break
-        time.sleep(self.config.sync.poll_interval_seconds)
+        if self._stop_event.wait(self.config.sync.poll_interval_seconds):
+          break
     finally:
       if admin_server is not None:
         admin_server.stop()
@@ -159,9 +175,17 @@ class Controller:
         except Exception as exc:
           LOGGER.exception("certificate issuance failed for %s", domain)
           retry_after = datetime.now(tz=UTC) + timedelta(seconds=self.config.sync.retry_backoff_seconds)
-          self.database.record_certificate_error(domain, str(exc), retry_after)
+          try:
+            self.database.record_certificate_error(domain, str(exc), retry_after)
+          except Exception:  # noqa: BLE001
+            LOGGER.exception("could not record certificate error for %s", domain)
         finally:
-          self.database.unlock(connection, lock_key)
+          # Never let an unlock failure mask the original exception
+          # path or break the surrounding loop iteration.
+          try:
+            self.database.unlock(connection, lock_key)
+          except Exception:  # noqa: BLE001
+            LOGGER.exception("failed to release advisory lock for %s", domain)
 
   def _sync_local_certificates(self, certificates: dict[str, CertificateRecord]) -> bool:
     changed = False
@@ -315,7 +339,11 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, controller.stop)
     try:
       while controller._running:
-        time.sleep(1)
+        # Use the controller's stop_event for interruptible sleep.
+        # On SIGTERM/SIGINT, controller.stop() sets the event and the
+        # wait returns immediately.
+        if controller._stop_event.wait(timeout=1):
+          break
     finally:
       admin_server.stop()
     return 0

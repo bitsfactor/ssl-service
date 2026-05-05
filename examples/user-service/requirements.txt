@@ -1,0 +1,24 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+# psycopg for the shared Postgres connection
+psycopg[binary]==3.2.3
+psycopg_pool==3.2.3
+# argon2id password hashing
+argon2-cffi==23.1.0
+# pyyaml for /product/info reading .product.yaml
+pyyaml==6.0.2
+# pydantic 2 (FastAPI dep) for request/response models
+pydantic==2.9.2
+# pydantic[email] adds email-validator for EmailStr fields
+email-validator==2.2.0
+# segno renders QR codes to SVG (pure Python, no native deps).
+# Used by /sub-qr/{token}.svg so the SPA doesn't need a client-side
+# QR encoder.
+segno==1.6.6
+# Stripe SDK — used by the checkout-session create endpoint and
+# webhook signature verification. Pinned to a recent stable.
+stripe==11.5.0
+# httpx — outbound HTTP for Google OAuth token exchange. urllib works
+# but httpx gives saner timeout/redirect handling and is already a
+# common dependency.
+httpx==0.27.2

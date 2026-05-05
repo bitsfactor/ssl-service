@@ -334,13 +334,16 @@ DEFAULT_STEPS: list[Step] = [
 # Verification helpers
 # ---------------------------------------------------------------------------
 
-def _verify_new_ssh_port(node: NodeRecord, new_port: int, log: Callable[[str], None]) -> bool:
+def _verify_new_ssh_port(
+  node: NodeRecord, new_port: int, log: Callable[[str], None],
+  *, linked_keys: list[dict] | None = None,
+) -> bool:
   """Try to SSH to the node on the new port. Returns True if it works."""
   log(f"\n[verify] connecting on new port {new_port}...\n")
   patched = NodeRecord(**{**{f.name: getattr(node, f.name) for f in node.__dataclass_fields__.values()}, "ssh_port": new_port})  # type: ignore[arg-type]
   for attempt in range(1, 4):
     try:
-      client = nodes_mod._open_client(patched, timeout=10.0)
+      client = nodes_mod._open_client(patched, timeout=10.0, linked_keys=linked_keys)
       client.close()
       log(f"[verify] OK on attempt {attempt}\n")
       return True
@@ -378,7 +381,10 @@ def _make_logger(database: Database, run_id: int) -> tuple[Callable[[str], None]
   return log, _do_flush
 
 
-def run_init(database: Database, node: NodeRecord, cfg: InitConfig, run_id: int) -> None:
+def run_init(
+  database: Database, node: NodeRecord, cfg: InitConfig, run_id: int,
+  *, linked_keys: list[dict] | None = None,
+) -> None:
   """Synchronous worker. Runs in a background thread."""
   log, flush = _make_logger(database, run_id)
   database.update_init_run(run_id, status="running")
@@ -387,7 +393,7 @@ def run_init(database: Database, node: NodeRecord, cfg: InitConfig, run_id: int)
 
   # Build the SSH client up-front so connection failures are fatal.
   try:
-    ssh = nodes_mod._open_client(node, timeout=10.0)
+    ssh = nodes_mod._open_client(node, timeout=10.0, linked_keys=linked_keys)
   except Exception as exc:
     log(f"[fatal] could not connect: {type(exc).__name__}: {exc}\n")
     flush()
@@ -431,7 +437,7 @@ def run_init(database: Database, node: NodeRecord, cfg: InitConfig, run_id: int)
 
   # If we changed the port, verify and update the node row.
   if ssh_port_changed_to:
-    ok = _verify_new_ssh_port(node, ssh_port_changed_to, log)
+    ok = _verify_new_ssh_port(node, ssh_port_changed_to, log, linked_keys=linked_keys)
     if ok:
       database.update_node(node.name, {"ssh_port": ssh_port_changed_to})
       log(f"[ok] nodes.ssh_port updated to {ssh_port_changed_to}\n")
@@ -452,15 +458,20 @@ def run_init(database: Database, node: NodeRecord, cfg: InitConfig, run_id: int)
   )
 
 
-def schedule_init_run(database: Database, node: NodeRecord, cfg: InitConfig) -> NodeInitRunRecord:
+def schedule_init_run(
+  database: Database, node: NodeRecord, cfg: InitConfig,
+  *, linked_keys: list[dict] | None = None,
+) -> NodeInitRunRecord:
   """Insert a new init run row and start the worker thread."""
   run = database.insert_init_run(node.name, config_snapshot=cfg.to_json())
   thread = threading.Thread(
     target=run_init,
     args=(database, node, cfg, run.id),
+    kwargs={"linked_keys": linked_keys},
     name=f"node-init-{node.name}-{run.id}",
     daemon=True,
   )
   thread.start()
-  LOGGER.info("nodes_init.scheduled node=%s run_id=%s", node.name, run.id)
+  LOGGER.info("nodes_init.scheduled node=%s run_id=%s linked_keys=%d",
+              node.name, run.id, len(linked_keys or []))
   return run

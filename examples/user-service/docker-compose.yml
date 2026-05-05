@@ -1,0 +1,13 @@
+services:
+  user:
+    build: .
+    image: user:local
+    container_name: user
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8200:${PORT}"
+    volumes:
+      - /opt/user/data:/app/data
+      - /opt/user/logs:/app/logs

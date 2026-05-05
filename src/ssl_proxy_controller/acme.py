@@ -114,6 +114,33 @@ def _cleanup_cloudflare_acme_txt_records(zone_id: str, zone_token: str, domain: 
     _cloudflare_request(zone_token, "DELETE", delete_url)
 
 
+_CERTBOT_TIMEOUT_SECONDS = 600  # 10 minutes — DNS-01 propagation is slow
+
+
+def _run_certbot(command: list[str]) -> None:
+  """Run certbot once with bounded time + captured output. Raises
+  ``subprocess.CalledProcessError`` (carrying stdout+stderr) on
+  non-zero exit so callers can inspect the actual failure rather
+  than only see the exit code."""
+  try:
+    result = subprocess.run(
+      command,
+      check=False,
+      capture_output=True,
+      text=True,
+      timeout=_CERTBOT_TIMEOUT_SECONDS,
+    )
+  except subprocess.TimeoutExpired as exc:
+    raise RuntimeError(
+      f"certbot timed out after {_CERTBOT_TIMEOUT_SECONDS}s"
+    ) from exc
+  if result.returncode != 0:
+    raise subprocess.CalledProcessError(
+      result.returncode, command,
+      output=result.stdout, stderr=result.stderr,
+    )
+
+
 def _run_certbot_with_cloudflare_recovery(command: list[str], zone_id: str, zone_token: str, domain: str) -> None:
   # PROACTIVE cleanup: always purge any pre-existing _acme-challenge TXT
   # records for this domain before invoking certbot. This is the user-
@@ -139,7 +166,7 @@ def _run_certbot_with_cloudflare_recovery(command: list[str], zone_id: str, zone
     )
 
   try:
-    subprocess.run(command, check=True)
+    _run_certbot(command)
     return
   except subprocess.CalledProcessError as exc:
     details = " ".join(part for part in [str(exc), getattr(exc, "stderr", "") or "", getattr(exc, "stdout", "") or ""] if part)
@@ -149,7 +176,7 @@ def _run_certbot_with_cloudflare_recovery(command: list[str], zone_id: str, zone
   # Reactive recovery: cleanup again (a record may have been re-created
   # between our pre-cleanup and the certbot call by some race) and retry.
   _cleanup_cloudflare_acme_txt_records(zone_id, zone_token, domain)
-  subprocess.run(command, check=True)
+  _run_certbot(command)
 
 
 def issue_certificate(config: AppConfig, database: Database, domain: str) -> CertificateRecord:

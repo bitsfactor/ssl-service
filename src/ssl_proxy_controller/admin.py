@@ -26,6 +26,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
+import urllib.error
 from urllib.parse import parse_qs, urlsplit
 
 from .caddy import reload_caddy, validate_upstream_target
@@ -53,6 +54,7 @@ from . import nodes as nodes_mod
 from . import nodes_init as nodes_init_mod
 from . import db_sync as db_sync_mod
 from . import db_registry as db_registry_mod
+from . import services_create as services_create_mod
 
 LOGGER = logging.getLogger("ssl_proxy_controller.admin")
 
@@ -97,8 +99,17 @@ def _route_to_dict(route: RouteRecord) -> dict[str, Any]:
   return {
     "domain": route.domain,
     "upstream_target": route.upstream_target,
+    # Surface both the legacy ``target`` string and the structured
+    # ``host`` / ``port`` so existing UI keeps rendering and any new
+    # client can read the typed fields directly.
     "upstreams": [
-      {"target": up.target, "weight": up.weight} for up in (route.upstreams or [])
+      {
+        "target": up.target,
+        "host": up.target_host,
+        "port": up.target_port,
+        "weight": up.weight,
+      }
+      for up in (route.upstreams or [])
     ],
     "lb_policy": route.lb_policy,
     "enabled": route.enabled,
@@ -229,34 +240,90 @@ def _normalize_lb_policy(value: Any, *, default: str = "random") -> str:
 
 
 def _normalize_upstream_entry(raw: Any) -> UpstreamRecord:
-  """Accept either a bare string/int or `{target, weight?}` dict."""
+  """Accept any of three shapes:
+
+  - bare ``"host:port"`` string (legacy positional)
+  - ``{"target": "host:port", "weight"?: int}``  (legacy dict)
+  - ``{"host": "...", "port": int, "weight"?: int}``  (structured, preferred)
+
+  The structured form is what new clients should send; the two legacy
+  forms keep the existing admin UI and any external callers working
+  while we migrate.
+  """
+  host_raw = None
+  port_raw = None
+  target_raw = None
+  weight_raw = 1
+
   if isinstance(raw, dict):
-    target_raw = raw.get("target")
-    weight_raw = raw.get("weight", 1)
-    if weight_raw is None:
-      weight_raw = 1
-    if isinstance(weight_raw, bool) or not isinstance(weight_raw, int):
-      try:
-        weight = int(weight_raw)
-      except (TypeError, ValueError) as exc:
+    weight_raw = raw.get("weight", 1) if raw.get("weight") is not None else 1
+    if "host" in raw or "port" in raw:
+      host_raw = raw.get("host")
+      port_raw = raw.get("port")
+      if "target" in raw:
         raise HttpError(
-          HTTPStatus.BAD_REQUEST, "upstream weight must be an integer", code="invalid_upstream"
-        ) from exc
+          HTTPStatus.BAD_REQUEST,
+          "upstream: provide host+port OR target, not both",
+          code="invalid_upstream",
+        )
     else:
-      weight = int(weight_raw)
-    if weight < 1 or weight > 1000:
-      raise HttpError(
-        HTTPStatus.BAD_REQUEST,
-        "upstream weight must be between 1 and 1000",
-        code="invalid_upstream",
-      )
+      target_raw = raw.get("target")
   else:
     target_raw = raw
-    weight = 1
+
+  # weight check
+  if isinstance(weight_raw, bool) or not isinstance(weight_raw, int):
+    try:
+      weight = int(weight_raw)
+    except (TypeError, ValueError) as exc:
+      raise HttpError(
+        HTTPStatus.BAD_REQUEST, "upstream weight must be an integer", code="invalid_upstream",
+      ) from exc
+  else:
+    weight = int(weight_raw)
+  if weight < 1 or weight > 1000:
+    raise HttpError(
+      HTTPStatus.BAD_REQUEST,
+      "upstream weight must be between 1 and 1000",
+      code="invalid_upstream",
+    )
+
+  if host_raw is not None or port_raw is not None:
+    # Structured form. Re-use validate_upstream_target by composing back
+    # to a string so we get one canonical validation path (host charset,
+    # IPv6 brackets, port range) — then construct from structured fields.
+    if not host_raw:
+      raise HttpError(
+        HTTPStatus.BAD_REQUEST, "upstream host is required", code="invalid_upstream",
+      )
+    try:
+      port_int = int(port_raw)
+    except (TypeError, ValueError) as exc:
+      raise HttpError(
+        HTTPStatus.BAD_REQUEST, "upstream port must be an integer", code="invalid_upstream",
+      ) from exc
+    composed = f"{host_raw}:{port_int}"
+    try:
+      validated = validate_upstream_target(composed)
+    except ValueError as exc:
+      raise HttpError(
+        HTTPStatus.BAD_REQUEST, str(exc), code="invalid_upstream",
+      ) from exc
+    # Round-trip parse: validate_upstream_target normalises the host
+    # casing / IPv6 form, so use the cleaned-up string.
+    if validated.startswith("["):
+      cleaned_host, _, cleaned_port = validated.partition("]:")
+      cleaned_host = cleaned_host  # keep leading "["
+    else:
+      cleaned_host, _, cleaned_port = validated.rpartition(":")
+    return UpstreamRecord(
+      target_host=cleaned_host, target_port=int(cleaned_port), weight=weight,
+    )
+
   target = _normalize_upstream_target(target_raw)
   if target is None:
     raise HttpError(
-      HTTPStatus.BAD_REQUEST, "upstream target is required", code="invalid_upstream"
+      HTTPStatus.BAD_REQUEST, "upstream target is required", code="invalid_upstream",
     )
   return UpstreamRecord(target=target, weight=weight)
 
@@ -1128,68 +1195,6 @@ def reconcile_node_services(
                      node_name, len(to_upsert))
 
 
-def deploy_node_service(ctx: AdminContext, node_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-  """Deploy a registered service to a node via docker compose.
-
-  Payload:
-    service: name of the service in the catalog (required)
-    branch: override default_branch (optional)
-    env_overrides: dict of {KEY: value} merged into service.default_env
-    rebuild: whether to pass --build (default true)
-  """
-  _require_readwrite(ctx)
-  node_name = _normalize_node_name(node_name)
-  node = ctx.database.get_node(node_name)
-  if node is None:
-    raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {node_name}", code="node_not_found")
-  service_name = (payload or {}).get("service")
-  if not service_name:
-    raise HttpError(HTTPStatus.BAD_REQUEST, "service is required", code="service_required")
-  service_name = _normalize_service_name(service_name)
-  service = ctx.database.get_service(service_name)
-  if service is None:
-    raise HttpError(HTTPStatus.NOT_FOUND, f"service not found: {service_name}", code="service_not_found")
-
-  branch = (payload.get("branch") or service.default_branch).strip() or "main"
-  env_overrides = _normalize_env_dict(payload.get("env_overrides"))
-  effective_env = dict(service.default_env or {})
-  effective_env.update(env_overrides)
-  rebuild = bool(payload.get("rebuild", True))
-
-  command = nodes_mod.build_compose_deploy_command(
-    service_name=service.name,
-    github_repo_url=service.github_repo_url,
-    branch=branch,
-    install_dir=service.install_dir_template or "/opt/{name}",
-    compose_file=service.compose_file or "docker-compose.yml",
-    env=effective_env,
-    pre_deploy_command=service.pre_deploy_command,
-    post_deploy_command=service.post_deploy_command,
-    compose_template=service.compose_template,
-    config_files=service.config_files,
-    rebuild=rebuild,
-  )
-  if payload.get("dry_run"):
-    return {"node": node.name, "service": service.name, "command": command, "dry_run": True}
-
-  try:
-    result = nodes_mod.run_command(node, command, timeout=900.0,
-                                    linked_keys=_ssh_credentials_for_node(ctx, node.name))
-  except Exception as exc:
-    raise HttpError(HTTPStatus.BAD_GATEWAY, f"deploy failed: {exc}", code="deploy_failed") from exc
-  LOGGER.info("admin.deploy_service node=%s service=%s exit=%s", node.name, service.name, result.exit_code)
-  return {
-    "node": node.name,
-    "service": service.name,
-    "branch": branch,
-    "command": command,
-    "exit_code": result.exit_code,
-    "stdout": result.stdout,
-    "stderr": result.stderr,
-    "duration_seconds": result.duration_seconds,
-  }
-
-
 def uninstall_node_services(
   ctx: AdminContext, name: str, payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -1293,7 +1298,7 @@ def uninstall_node_services(
   }
 
 
-def clean_node(
+def clear_node(
   ctx: AdminContext, name: str, payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
   """Aggressive reset for a dirty VPS — sibling of uninstall_node_services
@@ -1325,7 +1330,7 @@ def clean_node(
   payload = payload or {}
   if (payload.get("confirm") or "").strip().lower() != "yes":
     raise HttpError(HTTPStatus.BAD_REQUEST,
-                    "must POST {\"confirm\": \"yes\"} to run a destructive clean",
+                    "must POST {\"confirm\": \"yes\"} to run a destructive clear",
                     code="confirm_required")
 
   import shlex as _shlex
@@ -1335,7 +1340,7 @@ def clean_node(
     for s in catalog
   ]
 
-  parts: list[str] = ["set -u", "echo '== clean-server =='"]
+  parts: list[str] = ["set -u", "echo '== clear-server =='"]
 
   # 1) Docker: stop+rm everything, then prune.
   parts.extend([
@@ -1380,7 +1385,7 @@ def clean_node(
       f'echo "===END===<rm:{d}>"',
     ])
 
-  parts.append('echo "== clean-server done =="')
+  parts.append('echo "== clear-server done =="')
 
   script = "\n".join(parts)
   try:
@@ -1390,7 +1395,7 @@ def clean_node(
     )
   except Exception as exc:
     raise HttpError(HTTPStatus.BAD_GATEWAY,
-                    f"clean failed: {exc}", code="clean_failed") from exc
+                    f"clear failed: {exc}", code="clear_failed") from exc
 
   out = result.stdout or ""
 
@@ -1414,7 +1419,7 @@ def clean_node(
     try:
       ctx.database.delete_service_node_state(s.name, node.name)
     except Exception:
-      LOGGER.exception("clean: clearing service_node_state for %s/%s failed",
+      LOGGER.exception("clear: clearing service_node_state for %s/%s failed",
                        s.name, node.name)
 
   return {
@@ -1544,6 +1549,13 @@ def _service_to_dict(service: ServiceRecord) -> dict[str, Any]:
     "deploy_yaml_fetched_at": _to_jsonable(service.deploy_yaml_fetched_at),
     "has_manifest": bool(service.deploy_yaml),
     "config_schema": list(service.config_schema or []),
+    # New Service flow fields.
+    "assigned_port": service.assigned_port,
+    "local_repo_dir": service.local_repo_dir,
+    "default_node_name": service.default_node_name,
+    "status": service.status,
+    "product_yaml": service.product_yaml,
+    "product_enabled": bool(service.product_enabled),
   }
 
 
@@ -1694,6 +1706,210 @@ def delete_service(ctx: AdminContext, name: str) -> dict[str, Any]:
   if not ctx.database.delete_service(name):
     raise HttpError(HTTPStatus.NOT_FOUND, f"service not found: {name}", code="service_not_found")
   return {"name": name, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# New Service flow — admin form that materialises a brand-new repo from
+# the templates/service tree, registers it, and creates a route for it.
+# Backed by services_create_mod.create_service.
+# ---------------------------------------------------------------------------
+
+
+def service_create_new_defaults(ctx: AdminContext) -> dict[str, Any]:
+  """Pre-fill data for the New Service form.
+
+  Surfaces what the operator needs to choose: which deploy nodes exist,
+  what domain suffix is configured, whether GitHub is configured at all.
+  Never returns the raw GitHub token — only a boolean ``configured``
+  flag — so the form can warn if the operator hasn't set it yet.
+  """
+  cfg = lambda key: ctx.database.get_system_config(key) or {}
+  ports = cfg("services.port_pool")
+  port_start = int(ports.get("start") or 8100)
+  port_end = int(ports.get("end") or 8999)
+  domain_suffix = (cfg("services.default_domain_suffix") or {}).get("suffix") or "develop.cc"
+  default_node = (cfg("services.default_deploy_node") or {}).get("name") or ""
+  local_repos_dir = (cfg("services.local_repos_dir") or {}).get("path") or ""
+  github_token_set = bool((cfg("github.api_token") or {}).get("token"))
+
+  used_ports: set[int] = set()
+  for s in ctx.database.list_services():
+    if s.assigned_port:
+      used_ports.add(int(s.assigned_port))
+  next_port: int | None = None
+  for candidate in range(port_start, port_end + 1):
+    if candidate not in used_ports:
+      next_port = candidate
+      break
+
+  return {
+    "domain_suffix": domain_suffix,
+    "default_deploy_node": default_node,
+    "local_repos_dir": local_repos_dir,
+    "github_token_configured": github_token_set,
+    "port_pool": {"start": port_start, "end": port_end, "next_free": next_port},
+    "nodes": [
+      {"name": n.name, "host": n.host}
+      for n in ctx.database.list_nodes()
+    ],
+  }
+
+
+def service_push_to_github(ctx: AdminContext, name: str,
+                           payload: dict[str, Any] | None = None) -> dict[str, Any]:
+  """Push a previously-created (draft, local-only) service to GitHub.
+
+  Use case: operator created the service before configuring the GitHub
+  PAT, so it sat in ``status=draft`` with empty ``github_repo_url``.
+  Now they've added the token in Settings and want the existing local
+  repo (already git-init'd with one commit by the New Service flow) to
+  land on GitHub. We:
+
+    1. Validate the service is in a state where this makes sense
+       (draft, has local_repo_dir, token is set, dir + .git exist on disk)
+    2. Call _github_create_repo (POST /user/repos), capture the resolved
+       owner from GitHub's response
+    3. git remote add origin <token-url>; git push; rewrite to clean URL
+    4. UPDATE services SET github_repo_url=..., status='active'
+
+  ``payload.repo_name`` overrides the GitHub repo name (default: service name).
+  """
+  _require_readwrite(ctx)
+  name = _normalize_service_name(name)
+  s = ctx.database.get_service(name)
+  if s is None:
+    raise HttpError(HTTPStatus.NOT_FOUND, f"service not found: {name}",
+                    code="service_not_found")
+  if (s.github_repo_url or "").strip():
+    raise HttpError(
+      HTTPStatus.BAD_REQUEST,
+      f"service '{name}' already has github_repo_url={s.github_repo_url}",
+      code="already_pushed",
+    )
+  if not (s.local_repo_dir or "").strip():
+    raise HttpError(
+      HTTPStatus.BAD_REQUEST,
+      f"service '{name}' has no local_repo_dir — nothing to push",
+      code="no_local_repo",
+    )
+  token = (ctx.database.get_system_config("github.api_token") or {}).get("token", "")
+  if not token:
+    raise HttpError(
+      HTTPStatus.BAD_REQUEST,
+      "github.api_token not set; configure it in Settings → GitHub first",
+      code="github_token_missing",
+    )
+
+  from pathlib import Path as _Path
+  local_repo_dir = _Path(s.local_repo_dir)
+  if not local_repo_dir.is_dir():
+    raise HttpError(
+      HTTPStatus.BAD_REQUEST,
+      f"local_repo_dir missing on disk: {local_repo_dir}",
+      code="local_repo_missing",
+    )
+  if not (local_repo_dir / ".git").exists():
+    raise HttpError(
+      HTTPStatus.BAD_REQUEST,
+      f"local_repo_dir is not a git repo: {local_repo_dir}",
+      code="not_a_git_repo",
+    )
+
+  repo_name = ((payload or {}).get("repo_name") or name).strip() or name
+
+  try:
+    resolved_owner = services_create_mod._github_create_repo(token, repo_name)
+  except (RuntimeError, urllib.error.URLError) as exc:
+    raise HttpError(HTTPStatus.BAD_REQUEST,
+                    f"github create failed: {exc}",
+                    code="github_create_failed") from exc
+
+  token_url = (
+    f"https://x-access-token:{token}@github.com/{resolved_owner}/{repo_name}.git"
+  )
+  clean_url = f"https://github.com/{resolved_owner}/{repo_name}.git"
+
+  # Remove any pre-existing 'origin' remote (e.g. from a previous failed
+  # push attempt) so `git remote add` doesn't error.
+  try:
+    services_create_mod._run(
+      ["git", "remote", "remove", "origin"], cwd=local_repo_dir,
+    )
+  except RuntimeError:
+    pass  # not present — fine
+
+  try:
+    services_create_mod._run(
+      ["git", "remote", "add", "origin", token_url], cwd=local_repo_dir,
+    )
+    services_create_mod._run(
+      ["git", "push", "-u", "origin", "main"], cwd=local_repo_dir,
+    )
+    services_create_mod._run(
+      ["git", "remote", "set-url", "origin", clean_url], cwd=local_repo_dir,
+    )
+  except RuntimeError as exc:
+    raise HttpError(HTTPStatus.BAD_REQUEST, f"git push failed: {exc}",
+                    code="github_push_failed") from exc
+
+  repo_url = f"https://github.com/{resolved_owner}/{repo_name}"
+  ctx.database.update_service(name, {
+    "github_repo_url": repo_url,
+    "status": "active",
+  })
+  refreshed = ctx.database.get_service(name)
+  LOGGER.info("admin.service_push_to_github name=%s url=%s", name, repo_url)
+  return {
+    "name": name,
+    "github_repo_url": repo_url,
+    "resolved_owner": resolved_owner,
+    "status": "active",
+    "service": _service_to_dict(refreshed) if refreshed else None,
+  }
+
+
+def service_create_new(ctx: AdminContext, payload: dict[str, Any]) -> dict[str, Any]:
+  """Run the New Service flow synchronously and return structured progress.
+
+  On any failure inside ``services_create_mod.create_service``, we still
+  return 200 with the partial result wrapped under ``error`` — the UI
+  renders the per-step log either way. Pure validation errors (bad
+  payload shape) raise :class:`HttpError`.
+  """
+  _require_readwrite(ctx)
+  if not isinstance(payload, dict):
+    raise HttpError(HTTPStatus.BAD_REQUEST, "payload must be an object", code="invalid_payload")
+  name = (payload.get("name") or "").strip()
+  if not name:
+    raise HttpError(HTTPStatus.BAD_REQUEST, "name is required", code="name_required")
+  deploy_node_name = (payload.get("deploy_node_name") or "").strip()
+  if not deploy_node_name:
+    raise HttpError(HTTPStatus.BAD_REQUEST, "deploy_node_name is required",
+                    code="deploy_node_required")
+  domain = (payload.get("domain") or "").strip()
+  if not domain:
+    raise HttpError(HTTPStatus.BAD_REQUEST, "domain is required", code="domain_required")
+  display_name = (payload.get("display_name") or "").strip() or None
+  repo_name = (payload.get("repo_name") or "").strip() or None
+  push_to_github = bool(payload.get("push_to_github", True))
+
+  try:
+    result = services_create_mod.create_service(
+      ctx.database,
+      name=name,
+      display_name=display_name,
+      repo_name=repo_name,
+      deploy_node_name=deploy_node_name,
+      domain=domain,
+      push_to_github=push_to_github,
+    )
+  except services_create_mod.CreateServiceError as exc:
+    LOGGER.warning("admin.service_create_new failed name=%s: %s", name, exc)
+    body = exc.result.to_dict()
+    body["error"] = {"code": exc.code, "message": str(exc)}
+    return body
+  LOGGER.info("admin.service_create_new ok name=%s steps=%d", name, len(result.steps))
+  return result.to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -1881,14 +2097,33 @@ def deploy_service_to_nodes(
   def _deploy_one(n: NodeRecord) -> dict[str, Any]:
     node_env = _env_for_node(n)
     env_file = services_deploy_mod.render_env_file(node_env)
+    # local-deploy fires when the service has no GitHub repo URL but does
+    # have a local rendered tree on the operator's machine. In that case
+    # we skip git on the remote and ship the tree directly via SSH.
+    repo_url = (s.github_repo_url or "").strip()
+    local_repo_dir = (s.local_repo_dir or "").strip()
+    use_local = not repo_url and bool(local_repo_dir)
+    if not repo_url and not use_local:
+      # Neither a GitHub URL nor a local rendered tree — there's nothing
+      # to ship. Fail loudly here instead of letting `git clone ""` blow
+      # up on the remote with a confusing error.
+      raise HttpError(
+        HTTPStatus.BAD_REQUEST,
+        f"service '{s.name}' has neither github_repo_url nor "
+        "local_repo_dir; nothing to deploy",
+        code="service_no_source",
+      )
+    source_mode = "local" if use_local else "git"
     deploy_script = services_deploy_mod.render_deploy_script(
       manifest=manifest,
-      service_repo_url=s.github_repo_url,
+      service_repo_url=repo_url,
       service_branch=s.default_branch or "main",
       revision=revision,
       env_file_content=env_file,
       extra_files=extra_files or None,
+      source_mode=source_mode,
     )
+    install_dir = manifest.install_dir()
     hc_script = services_deploy_mod.render_healthcheck_script(manifest, node_env)
     dep = ctx.database.insert_service_deployment(
       service_name=s.name, node_name=n.name,
@@ -1901,6 +2136,8 @@ def deploy_service_to_nodes(
         deploy_script=deploy_script,
         healthcheck_script=hc_script,
         linked_keys=_ssh_credentials_for_node(ctx, n.name),
+        local_source_dir=local_repo_dir if use_local else None,
+        install_dir=install_dir if use_local else None,
       )
     except Exception as exc:  # noqa: BLE001
       LOGGER.exception("deploy_service crashed for node=%s", n.name)
@@ -2180,7 +2417,10 @@ def start_init_run(ctx: AdminContext, name: str, payload: dict[str, Any] | None)
     codex_api_key=codex_api_key,
     timezone=node.init_timezone or "Asia/Shanghai",
   )
-  run = nodes_init_mod.schedule_init_run(ctx.database, node, cfg)
+  run = nodes_init_mod.schedule_init_run(
+    ctx.database, node, cfg,
+    linked_keys=_ssh_credentials_for_node(ctx, node.name),
+  )
   return _init_run_to_dict(run)
 
 
@@ -2342,6 +2582,7 @@ def trigger_sync_now(ctx: AdminContext) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 from . import static_ips as static_ips_mod  # noqa: E402
+from . import static_ip_quality as static_ip_quality_mod  # noqa: E402
 
 # Port range — single source of truth, mirrors the schema CHECK constraint
 # `port > 0 AND port < 65536`.
@@ -2355,6 +2596,9 @@ _TEST_KINDS = ("connectivity", "probe", "manual", "loop", "test_all")
 
 
 def _static_ip_to_dict(rec: StaticIpRecord) -> dict[str, Any]:
+  # username + password returned in plaintext, matching the existing
+  # pattern for nodes.ssh_password. ``has_*`` flags allow the UI to
+  # render "configured / missing" without inspecting secret bodies.
   return {
     "id": rec.id,
     "ip": rec.ip,
@@ -2373,7 +2617,112 @@ def _static_ip_to_dict(rec: StaticIpRecord) -> dict[str, Any]:
     "last_probe_at": _to_jsonable(rec.last_probe_at),
     "created_at": _to_jsonable(rec.created_at),
     "updated_at": _to_jsonable(rec.updated_at),
+    "username": rec.username,
+    "password": rec.password,
+    "has_username": bool(rec.username),
+    "has_password": bool(rec.password),
+    "auth_mode": rec.auth_mode,
+    # Gateway proxy fields (Decodo / BrightData / Oxylabs / etc.).
+    # ``kind == "static"`` for legacy rows; ``"gateway"`` for hostnames
+    # that route many sticky sessions via username encoding.
+    "kind": rec.kind or "static",
+    "exit_ip": rec.exit_ip,
+    # ``gateway_provider`` was originally a gateway-only label but is
+    # now universal — the operator's "vendor" / "purchased from" tag.
+    # Applies to every row (Decodo / proxy-cheap / RapidSeedBox /
+    # personal-server / etc.). The frontend renders it as "Vendor".
+    "gateway_provider": rec.gateway_provider,
+    # Lease / subscription expiry. NULL = no expiry tracked.
+    "expires_at": _to_jsonable(rec.expires_at),
   }
+
+
+def _coerce_expires_at(value: Any) -> "datetime | None":
+  """Parse an ``expires_at`` value submitted via the API.
+
+  Accepts ISO-8601 strings (with or without timezone — assume UTC if
+  none) or null. Returns ``datetime`` or None. Wide-tolerant — the
+  goal is "anything the HTML datetime-local picker can produce should
+  parse". Rejects only obviously-bogus strings.
+  """
+  if value is None or value == "":
+    return None
+  if isinstance(value, datetime):
+    return value
+  if not isinstance(value, str):
+    raise HttpError(HTTPStatus.BAD_REQUEST,
+                    "expires_at must be an ISO-8601 string or null",
+                    code="invalid_expires_at")
+  s = value.strip()
+  if not s:
+    return None
+  # ``datetime-local`` inputs come without timezone — treat as UTC for
+  # consistency with the rest of our timestamps.
+  try:
+    if s.endswith("Z"):
+      return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(s)
+    if parsed.tzinfo is None:
+      parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+  except ValueError as exc:
+    raise HttpError(HTTPStatus.BAD_REQUEST,
+                    f"expires_at could not be parsed: {exc}",
+                    code="invalid_expires_at") from exc
+
+
+# Allowed values for the auth_mode field. NULL means "auto-detect".
+_VALID_AUTH_MODES: frozenset[str] = frozenset({"anonymous", "whitelist", "userpass"})
+
+# Allowed values for the kind field. The constraint is open in SQL so
+# adding a new kind doesn't require a migration; the API enforces.
+#   'static'       — single IP, IP-bound credentials.
+#   'gateway'      — provider hostname (Decodo / BrightData / Oxylabs)
+#                    with session-encoded usernames.
+#   'xout_inbound' — pointer to an inbound on one of OUR xout-deployed
+#                    nodes. Lets operators register a self-hosted xray
+#                    inbound (typically VLESS / Reality, but also
+#                    socks / http) as a first-class entry in the
+#                    static_ips catalog. With this we can keep the
+#                    Xout preset's outbound picker source-of-truth in
+#                    one place — static_ips — instead of having a
+#                    parallel "pick another xout node" path.
+_VALID_KINDS: frozenset[str] = frozenset({"static", "gateway", "xout_inbound"})
+
+
+def _coerce_kind(value: Any) -> str:
+  """Validate the ``kind`` field. Default 'static' when unset (which
+  is also the SQL default — explicit here for symmetry with how the
+  bulk parser produces records)."""
+  if value is None or value == "":
+    return "static"
+  if not isinstance(value, str):
+    raise HttpError(HTTPStatus.BAD_REQUEST, "kind must be a string", code="invalid_kind")
+  s = value.strip().lower()
+  if s not in _VALID_KINDS:
+    raise HttpError(
+      HTTPStatus.BAD_REQUEST,
+      f"kind must be one of: {', '.join(sorted(_VALID_KINDS))}",
+      code="invalid_kind",
+    )
+  return s
+
+
+def _coerce_auth_mode(value: Any) -> str | None:
+  if value is None:
+    return None
+  if not isinstance(value, str):
+    raise HttpError(HTTPStatus.BAD_REQUEST, "auth_mode must be a string", code="invalid_auth_mode")
+  s = value.strip().lower()
+  if not s:
+    return None
+  if s not in _VALID_AUTH_MODES:
+    raise HttpError(
+      HTTPStatus.BAD_REQUEST,
+      f"auth_mode must be one of: {', '.join(sorted(_VALID_AUTH_MODES))} (or null)",
+      code="invalid_auth_mode",
+    )
+  return s
 
 
 def _ip_test_result_to_dict(rec: IpTestResultRecord) -> dict[str, Any]:
@@ -2436,7 +2785,7 @@ def _normalize_static_ip_port(value: Any) -> int | None:
   return port
 
 
-_STATIC_IP_SORTS = ("country", "provider", "ip", "created")
+_STATIC_IP_SORTS = ("country", "provider", "vendor", "expires", "ip", "created")
 
 
 def list_static_ips(ctx: AdminContext, *, sort: str = "country") -> list[dict[str, Any]]:
@@ -2466,6 +2815,47 @@ def get_static_ip_detail(ctx: AdminContext, ip_id: int) -> dict[str, Any]:
   return payload
 
 
+def _coerce_str_or_none(value: Any) -> str | None:
+  """Empty string / None / whitespace-only → None. Otherwise the
+  trimmed string. Keeps the DB column NULL semantics consistent with
+  the older country/provider handling."""
+  if value is None:
+    return None
+  if not isinstance(value, str):
+    raise HttpError(HTTPStatus.BAD_REQUEST, "must be a string", code="invalid_type")
+  s = value.strip()
+  return s or None
+
+
+def _maybe_autofill_geo(ip: str, country: str | None, provider: str | None) -> tuple[str | None, str | None, dict | None]:
+  """Best-effort country/provider auto-population.
+
+  Runs a single ipapi.co / ip-api.com geo lookup and returns
+  ``(country, provider, geo_blob)`` with each value defaulting to
+  whatever the caller already had — geo only fills the slot when the
+  caller left it empty. ``geo_blob`` is the raw lookup result so we
+  can still stash it under ``static_info.geo`` for the Details modal
+  even when the operator typed in their own country/provider.
+
+  Skipped entirely when the operator provided BOTH country and
+  provider already (no point making a network call). Bounded wall
+  time via ``lookup_geo_basics`` ensures the create endpoint stays
+  responsive even when geo providers misbehave.
+  """
+  if (country or "").strip() and (provider or "").strip():
+    return country, provider, None
+  try:
+    geo = static_ips_mod.lookup_geo_basics(ip)
+  except Exception:  # noqa: BLE001
+    LOGGER.exception("static-ip geo autofill failed for %s", ip)
+    return country, provider, None
+  if not geo:
+    return country, provider, None
+  filled_country = country or geo.get("country") or None
+  filled_provider = provider or geo.get("org") or None
+  return filled_country, filled_provider, geo
+
+
 def create_static_ip(ctx: AdminContext, payload: dict[str, Any]) -> dict[str, Any]:
   ip = _normalize_ip(payload.get("ip"))
   port = _normalize_static_ip_port(payload.get("port"))
@@ -2474,6 +2864,13 @@ def create_static_ip(ctx: AdminContext, payload: dict[str, Any]) -> dict[str, An
   provider = (payload.get("provider") or None)
   label = (payload.get("label") or None)
   notes = (payload.get("notes") or None)
+  username = _coerce_str_or_none(payload.get("username"))
+  password = _coerce_str_or_none(payload.get("password"))
+  auth_mode = _coerce_auth_mode(payload.get("auth_mode"))
+  kind = _coerce_kind(payload.get("kind"))
+  exit_ip = _coerce_str_or_none(payload.get("exit_ip"))
+  gateway_provider = _coerce_str_or_none(payload.get("gateway_provider"))
+  expires_at = _coerce_expires_at(payload.get("expires_at"))
   loop = payload.get("loop_test_seconds")
   loop_seconds: int | None = None
   if loop not in (None, "", 0):
@@ -2481,11 +2878,33 @@ def create_static_ip(ctx: AdminContext, payload: dict[str, Any]) -> dict[str, An
       loop_seconds = max(1, int(loop))
     except (TypeError, ValueError) as exc:
       raise HttpError(HTTPStatus.BAD_REQUEST, "loop_test_seconds must be an integer", code="invalid_loop") from exc
+
+  # Auto-populate country/provider from a geo API when the operator
+  # didn't fill them in. Best-effort: a slow / failed lookup never
+  # blocks the insert. Stashing the full geo blob into static_info so
+  # the Details modal has it without a separate Probe click.
+  #
+  # For gateway rows we look up the EXIT IP, not the gateway hostname:
+  # the gateway's location tells us nothing about where the proxy will
+  # actually appear from. When ``exit_ip`` is missing, we skip auto-geo
+  # entirely (the connection still works; the operator can add the
+  # exit IP later in Edit and re-run a Quality report).
+  geo_subject = exit_ip if (kind == "gateway" and exit_ip) else ip
+  country, provider, geo_blob = _maybe_autofill_geo(geo_subject, country, provider)
+  static_info: dict | None = None
+  if geo_blob:
+    static_info = {"geo": geo_blob}
+
   rec = ctx.database.insert_static_ip(
     ip=ip, port=port, protocol=protocol,
     country=country, provider=provider,
     label=label, notes=notes,
+    static_info=static_info,
     loop_test_seconds=loop_seconds,
+    username=username, password=password,
+    auth_mode=auth_mode,
+    kind=kind, exit_ip=exit_ip, gateway_provider=gateway_provider,
+    expires_at=expires_at,
   )
   return _static_ip_to_dict(rec)
 
@@ -2503,6 +2922,18 @@ def update_static_ip_record(
   for key in ("country", "provider", "label", "notes"):
     if key in payload:
       fields[key] = (payload[key] or None)
+  for key in ("username", "password"):
+    if key in payload:
+      fields[key] = _coerce_str_or_none(payload[key])
+  if "auth_mode" in payload:
+    fields["auth_mode"] = _coerce_auth_mode(payload["auth_mode"])
+  if "kind" in payload:
+    fields["kind"] = _coerce_kind(payload["kind"])
+  for key in ("exit_ip", "gateway_provider"):
+    if key in payload:
+      fields[key] = _coerce_str_or_none(payload[key])
+  if "expires_at" in payload:
+    fields["expires_at"] = _coerce_expires_at(payload["expires_at"])
   if "loop_test_seconds" in payload:
     val = payload["loop_test_seconds"]
     if val in (None, "", 0):
@@ -2523,6 +2954,176 @@ def delete_static_ip_record(ctx: AdminContext, ip_id: int) -> dict[str, Any]:
   if not ok:
     raise HttpError(HTTPStatus.NOT_FOUND, f"static ip not found: {ip_id}", code="ip_not_found")
   return {"deleted": True, "id": int(ip_id)}
+
+
+def run_ip_speed_test(
+  ctx: AdminContext, ip_id: int,
+  *, include_latency: bool = True,
+  include_bandwidth: bool = True,
+  include_app_rtt: bool = True,
+) -> dict[str, Any]:
+  """Speed test action — latency / bandwidth / application-layer RTT
+  for one static IP. Each component is opt-in via the keyword flags
+  so the unified Test modal can run latency-only without paying the
+  ~30s bandwidth probe cost."""
+  rec = ctx.database.get_static_ip(int(ip_id))
+  if rec is None:
+    raise HttpError(HTTPStatus.NOT_FOUND, f"static ip not found: {ip_id}", code="ip_not_found")
+  result = static_ip_quality_mod.run_speed_test(
+    rec,
+    include_latency=include_latency,
+    include_bandwidth=include_bandwidth,
+    include_app_rtt=include_app_rtt,
+  )
+  # Best-effort persist; never fail the response on logging failure.
+  try:
+    ctx.database.insert_ip_test_result(
+      ip_id=rec.id, test_kind="speedtest",
+      success=bool(result.get("ok")),
+      latency_ms=(result.get("latency") or {}).get("p50_ms"),
+      error=(result.get("latency") or {}).get("error") if not result.get("ok") else None,
+      raw=result,
+    )
+  except Exception:  # noqa: BLE001
+    LOGGER.exception("failed to persist speedtest result for ip_id=%s", rec.id)
+  # Also stash the latest snapshot in static_info so the Details modal
+  # can render it without a fresh API hit. We add a ``cached_at`` ISO
+  # timestamp so the UI can show "last run X ago" before the operator
+  # decides whether to refresh.
+  result["cached_at"] = datetime.now(UTC).isoformat()
+  try:
+    base = dict(rec.static_info or {})
+    base["speedtest"] = result
+    ctx.database.update_static_ip(rec.id, {"static_info": base})
+  except Exception:  # noqa: BLE001
+    LOGGER.exception("failed to cache speedtest into static_info for %s", rec.id)
+  return {"id": rec.id, "ip": rec.ip, "result": result}
+
+
+def run_ip_quality_report(ctx: AdminContext, ip_id: int) -> dict[str, Any]:
+  """Quality report action — multi-source fraud / proxy / streaming
+  classification for one static IP. All sources are keyless (ip-api,
+  RDAP, Spamhaus DNS, Scamalytics scrape, streaming probes); the
+  earlier paid-API sources (proxycheck.io, AbuseIPDB, IPQualityScore)
+  were removed because every useful field they exposed required a
+  paid plan."""
+  rec = ctx.database.get_static_ip(int(ip_id))
+  if rec is None:
+    raise HttpError(HTTPStatus.NOT_FOUND, f"static ip not found: {ip_id}", code="ip_not_found")
+  result = static_ip_quality_mod.run_quality_report(rec, include_streaming=True)
+  try:
+    ok = bool((result.get("ip_api") or {}).get("country"))
+    ctx.database.insert_ip_test_result(
+      ip_id=rec.id, test_kind="quality",
+      success=ok, latency_ms=None, error=None, raw=result,
+    )
+  except Exception:  # noqa: BLE001
+    LOGGER.exception("failed to persist quality result for ip_id=%s", rec.id)
+  result["cached_at"] = datetime.now(UTC).isoformat()
+  try:
+    base = dict(rec.static_info or {})
+    base["quality"] = result
+    ctx.database.update_static_ip(rec.id, {"static_info": base})
+  except Exception:  # noqa: BLE001
+    LOGGER.exception("failed to cache quality into static_info for %s", rec.id)
+  return {"id": rec.id, "ip": rec.ip, "result": result}
+
+
+def run_ip_quality_report_batch(
+  ctx: AdminContext, ids: list[int] | None = None,
+) -> dict[str, Any]:
+  """Run :func:`run_ip_quality_report` against many rows in parallel.
+
+  Args:
+    ids: explicit list of row ids to run. ``None`` or empty list means
+      "run on every row in the catalog".
+
+  Returns:
+    ``{total, success, fail, results, errors}`` — same shape as the
+    existing test-all summary so the UI can re-use the toast logic.
+
+  Concurrency is bounded to 4 because each report makes 5+ outbound
+  HTTP requests (ip-api, RDAP, Scamalytics, streaming x16). Higher
+  concurrency saturates the admin host's outbound and starts erroring
+  on rate-limited endpoints.
+  """
+  from concurrent.futures import ThreadPoolExecutor, as_completed
+  rows = ctx.database.list_static_ips()
+  if ids:
+    keep = set(int(i) for i in ids)
+    rows = [r for r in rows if r.id in keep]
+  if not rows:
+    return {"total": 0, "success": 0, "fail": 0, "results": [], "errors": []}
+
+  def _one(rec):
+    try:
+      result = static_ip_quality_mod.run_quality_report(rec, include_streaming=True)
+      result["cached_at"] = datetime.now(UTC).isoformat()
+      # Persist into ip_test_results for history.
+      try:
+        ok = bool((result.get("ip_api") or {}).get("country"))
+        ctx.database.insert_ip_test_result(
+          ip_id=rec.id, test_kind="quality",
+          success=ok, latency_ms=None, error=result.get("error"), raw=result,
+        )
+      except Exception:  # noqa: BLE001
+        LOGGER.exception("persist quality batch result failed: id=%s", rec.id)
+      # Merge into static_info.quality.
+      try:
+        base = dict(rec.static_info or {})
+        base["quality"] = result
+        ctx.database.update_static_ip(rec.id, {"static_info": base})
+      except Exception:  # noqa: BLE001
+        LOGGER.exception("cache quality batch result failed: id=%s", rec.id)
+      ok = result.get("error") is None and bool((result.get("ip_api") or {}).get("country"))
+      return {"id": rec.id, "ip": rec.ip, "ok": ok,
+              "country": (result.get("ip_api") or {}).get("country"),
+              "scam": (result.get("scamalytics") or {}).get("score"),
+              "spamhaus": (result.get("spamhaus") or {}).get("listed"),
+              "unlocked": sum(1 for s in (result.get("streaming") or [])
+                              if s.get("status") == "available"),
+              "error": result.get("error")}
+    except Exception as exc:  # noqa: BLE001
+      LOGGER.exception("quality batch run failed: id=%s", rec.id)
+      return {"id": rec.id, "ip": rec.ip, "ok": False, "error": str(exc)[:200]}
+
+  results: list[dict[str, Any]] = []
+  errors: list[dict[str, Any]] = []
+  with ThreadPoolExecutor(max_workers=4) as ex:
+    futures = [ex.submit(_one, r) for r in rows]
+    for f in as_completed(futures):
+      try:
+        results.append(f.result())
+      except Exception as exc:  # noqa: BLE001
+        errors.append({"error": str(exc)[:200]})
+  ok = sum(1 for r in results if r.get("ok"))
+  fail = len(results) - ok
+  return {
+    "total": len(rows), "success": ok, "fail": fail,
+    "results": results, "errors": errors,
+    "at": datetime.now(UTC).isoformat(),
+  }
+
+
+def lookup_static_ip_geo(_ctx: AdminContext, ip: str) -> dict[str, Any]:
+  """Standalone geo lookup endpoint. Used by the Edit modal so the
+  operator can hit a "Lookup country" button when adding a row whose
+  geo wasn't populated automatically — for example, an IP that was
+  bulk-pasted before the auto-fill was wired up."""
+  ip = _normalize_ip(ip)
+  geo = static_ips_mod.lookup_geo_basics(ip)
+  if not geo:
+    return {"ip": ip, "found": False}
+  return {
+    "ip": ip,
+    "found": True,
+    "country": geo.get("country"),
+    "country_code": geo.get("country_code"),
+    "city": geo.get("city"),
+    "org": geo.get("org"),
+    "asn": geo.get("asn"),
+    "raw_source": geo.get("raw_source"),
+  }
 
 
 def _ai_parser_config(ctx: AdminContext) -> dict[str, Any]:
@@ -2553,12 +3154,69 @@ def _ai_parser_config(ctx: AdminContext) -> dict[str, Any]:
   return cfg
 
 
+def _bulk_autofill_geo(parsed: list[dict[str, Any]]) -> None:
+  """In-place: for each parsed row whose country/provider slot is
+  empty, run a geo lookup in parallel and fill the gap.
+
+  Bounded to 8 workers so a 50-row batch resolves in ~5 s instead of
+  the ~3 minutes a serial loop would need on a remote DB. Failures
+  per row are silent — geo is best-effort, the row still inserts.
+
+  For gateway rows (kind='gateway'), we look up the EXIT IP rather
+  than the gateway hostname, because the gateway's location tells us
+  nothing about where the proxy will appear from. Rows with kind=
+  'gateway' but no extracted exit_ip are skipped — partial geo for
+  gateways is worse than none.
+  """
+  from concurrent.futures import ThreadPoolExecutor
+  needs: list[tuple[int, str]] = []
+  for i, rec in enumerate(parsed):
+    if not isinstance(rec, dict):
+      continue
+    if (rec.get("country") or "").strip() and (rec.get("provider") or "").strip():
+      continue
+    if (rec.get("kind") or "static") == "gateway":
+      ip = (rec.get("exit_ip") or "").strip()
+      # No exit_ip = no useful geo for this row; the gateway hostname
+      # geo would mislead more than it informs.
+      if not ip:
+        continue
+    else:
+      ip = (rec.get("ip") or "").strip()
+      if not ip:
+        continue
+    needs.append((i, ip))
+  if not needs:
+    return
+  def _one(item: tuple[int, str]):
+    idx, ip = item
+    try:
+      return idx, static_ips_mod.lookup_geo_basics(ip)
+    except Exception:  # noqa: BLE001
+      return idx, None
+  with ThreadPoolExecutor(max_workers=min(8, len(needs))) as ex:
+    for idx, geo in ex.map(_one, needs):
+      if not geo:
+        continue
+      rec = parsed[idx]
+      if not (rec.get("country") or "").strip() and geo.get("country"):
+        rec["country"] = geo["country"]
+      if not (rec.get("provider") or "").strip() and geo.get("org"):
+        rec["provider"] = geo["org"]
+
+
 def parse_bulk_static_ips(ctx: AdminContext, payload: dict[str, Any]) -> dict[str, Any]:
   text = (payload.get("text") or "")
   commit = bool(payload.get("commit"))
   ai_cfg = _ai_parser_config(ctx)
   ai_was_configured = bool(ai_cfg.get("openai") or ai_cfg.get("anthropic"))
   parsed, mode = static_ips_mod.parse_bulk_input(text, config=ai_cfg)
+  # Auto-fill country/provider when committing — operators bulk-pasting
+  # ``user:pass@host:port`` lines almost never include geo, and asking
+  # them to click Lookup on every new row would defeat the point of
+  # bulk add. Only runs on commit (preview is geo-free for speed).
+  if commit and parsed:
+    _bulk_autofill_geo(parsed)
   created: list[dict[str, Any]] = []
   errors: list[dict[str, Any]] = []
   if commit and parsed:
@@ -2581,6 +3239,14 @@ def parse_bulk_static_ips(ctx: AdminContext, payload: dict[str, Any]) -> dict[st
           errors.append({"input": rec, "error": "empty ip"})
           continue
         try:
+          # Pre-coerce expires_at — fallback path may receive AI-parser
+          # output where the field is a string instead of a datetime.
+          exp = rec.get("expires_at")
+          if isinstance(exp, str):
+            try:
+              exp = _coerce_expires_at(exp)
+            except HttpError:
+              exp = None  # bad string -> drop, don't fail the row
           row = ctx.database.insert_static_ip(
             ip=ip_val,
             port=rec.get("port"),
@@ -2588,6 +3254,16 @@ def parse_bulk_static_ips(ctx: AdminContext, payload: dict[str, Any]) -> dict[st
             country=rec.get("country"),
             provider=rec.get("provider"),
             label=rec.get("label"),
+            notes=rec.get("notes"),
+            static_info=rec.get("static_info"),
+            loop_test_seconds=rec.get("loop_test_seconds"),
+            username=rec.get("username"),
+            password=rec.get("password"),
+            auth_mode=rec.get("auth_mode"),
+            kind=rec.get("kind") or "static",
+            exit_ip=rec.get("exit_ip"),
+            gateway_provider=rec.get("gateway_provider"),
+            expires_at=exp,
           )
           created.append(_static_ip_to_dict(row))
         except Exception as exc:  # noqa: BLE001
@@ -2729,11 +3405,25 @@ def run_ip_static_probe(ctx: AdminContext, ip_id: int) -> dict[str, Any]:
   rec = ctx.database.get_static_ip(int(ip_id))
   if rec is None:
     raise HttpError(HTTPStatus.NOT_FOUND, f"static ip not found: {ip_id}", code="ip_not_found")
-  info = static_ips_mod.probe_static_info(rec.ip)
+  # For gateway rows, geo-look up the EXIT IP rather than the gateway
+  # hostname — the gateway's location tells us nothing useful about
+  # where the proxy will appear from. Falls back to the gateway host
+  # when no exit_ip is set (rare; surfaces as a misleading-but-non-
+  # broken result).
+  probe_subject = (rec.exit_ip or rec.ip) if (rec.kind or "static") == "gateway" else rec.ip
+  info = static_ips_mod.probe_static_info(probe_subject)
   geo = info.get("geo") or {}
   geo_error = geo.get("error") if isinstance(geo, dict) else None
+  # MERGE the new probe data into the existing static_info dict
+  # instead of REPLACING. Otherwise running Probe wipes out cached
+  # speedtest / quality / vless / xout_inbound / etc. blobs that
+  # other actions populated. The probe contributes ``geo`` and
+  # ``unlock`` and ``probed_from``; everything else stays.
+  base = dict(rec.static_info or {})
+  for k, v in (info or {}).items():
+    base[k] = v
   ctx.database.update_static_ip(rec.id, {
-    "static_info": info,
+    "static_info": base,
     "last_probe_at": datetime.now(tz=UTC),
   })
   ctx.database.insert_ip_test_result(
@@ -2747,7 +3437,7 @@ def run_ip_static_probe(ctx: AdminContext, ip_id: int) -> dict[str, Any]:
   return {
     "id": rec.id,
     "ip": rec.ip,
-    "static_info": info,
+    "static_info": base,
   }
 
 
@@ -2755,10 +3445,208 @@ def run_ip_static_probe(ctx: AdminContext, ip_id: int) -> dict[str, Any]:
 # System config (key/value store, plain text)
 # ---------------------------------------------------------------------------
 
-# Recognized keys → schema (allowed sub-keys). Unknown sub-keys are
-# rejected so a typo like "api_ky" doesn't silently get persisted.
+# ---------------------------------------------------------------------------
+# Settings registry — single source of truth for both
+#   1) the system_config write-side validator (which keys + sub-keys exist), and
+#   2) the SPA Settings page (which renders cards from this same data).
+#
+# A registry entry describes ONE settings card:
+#   group       — section header on the Settings page (groups consecutive cards)
+#   title       — card title
+#   hint        — one-line description shown next to the title
+#   key         — the system_config key this card writes (e.g. "github.api_token")
+#   fields      — list of {name,label,type,placeholder,hint,secret} field defs
+#   status_msg  — function (value:dict) → string, shown under the buttons.
+#                 OR a {configured: str, missing: str} pair.
+#
+# Field types: text · password · number · url · email · select · bool ·
+#              hidden (validated but not rendered)
+#
+# Adding a new service's settings = appending to ``SETTINGS_REGISTRY``.
+# No HTML/JS edits needed; the SPA fetches /api/settings-schema and
+# renders. The set of allowed sub-keys is derived from `fields`.
+# ---------------------------------------------------------------------------
+
+SETTINGS_REGISTRY: list[dict[str, Any]] = [
+  # ===== AI & integrations ============================================
+  {
+    "group": "Integrations",
+    "key": "ai_api",
+    "title": "AI API",
+    "hint": "OpenAI-compatible endpoint used by the AI Quality report.",
+    "fields": [
+      {"name": "provider", "label": "Provider",  "type": "select",
+       "options": [{"value": "openai", "label": "OpenAI-compatible"},
+                    {"value": "anthropic", "label": "Anthropic"}]},
+      {"name": "base_url", "label": "Base URL",  "type": "url",
+       "placeholder": "https://api.openai.com/v1"},
+      {"name": "api_key",  "label": "API key",   "type": "password",
+       "secret": True},
+      {"name": "model",    "label": "Model",     "type": "text",
+       "placeholder": "gpt-4"},
+    ],
+    "status_msg": {"configured": "configured", "missing": "not configured"},
+  },
+  {
+    "group": "Integrations",
+    "key": "github.api_token",
+    "title": "GitHub",
+    "hint": "Personal access token used by the New Service flow to "
+            "auto-create + push private repos. Owner is detected from the token.",
+    "fields": [
+      {"name": "token", "label": "Personal access token", "type": "password",
+       "secret": True,
+       "placeholder": "ghp_xxxxxxxx (classic) or github_pat_… (fine-grained)",
+       "hint": "scope `repo` (classic) or Administration+Contents+Metadata"},
+    ],
+    "status_msg": {"configured": "configured · new services auto-push to your namespace",
+                    "missing": "not configured — services will be created local-only"},
+  },
+
+  # ===== Services platform ============================================
+  {
+    "group": "Services platform",
+    "key": "services.local_repos_dir",
+    "title": "Local repos directory",
+    "hint": "Where the New Service form renders new repos on the admin's machine.",
+    "fields": [
+      {"name": "path", "label": "Absolute path", "type": "text",
+       "placeholder": "/Users/you/projects"},
+    ],
+  },
+  {
+    "group": "Services platform",
+    "key": "services.default_domain_suffix",
+    "title": "Default domain suffix",
+    "hint": "Suffix appended to new service hostnames (e.g. ``develop.cc``).",
+    "fields": [
+      {"name": "suffix", "label": "Suffix", "type": "text", "placeholder": "develop.cc"},
+    ],
+  },
+  {
+    "group": "Services platform",
+    "key": "services.default_deploy_node",
+    "title": "Default deploy node",
+    "hint": "Node name pre-selected in the New Service deploy step.",
+    "fields": [
+      {"name": "name", "label": "Node name", "type": "text", "placeholder": "us01"},
+    ],
+  },
+  {
+    "group": "Services platform",
+    "key": "services.port_pool",
+    "title": "Service port pool",
+    "hint": "Port range used by the New Service flow when allocating an upstream port.",
+    "fields": [
+      {"name": "start", "label": "Start", "type": "number", "placeholder": "8100"},
+      {"name": "end",   "label": "End",   "type": "number", "placeholder": "8999"},
+    ],
+  },
+
+  # ===== User-service ==================================================
+  {
+    "group": "User Service",
+    "key": "user_service.base_url",
+    "title": "User Service base URL",
+    "hint": "Public URL where user-service is reachable. The Users + Products "
+            "admin pages proxy through this URL.",
+    "fields": [
+      {"name": "url", "label": "Base URL", "type": "url",
+       "placeholder": "https://user.develop.cc"},
+    ],
+  },
+  {
+    "group": "User Service",
+    "key": "user_service.admin_token",
+    "title": "User Service admin token",
+    "hint": "Shared service-to-service token (matches ADMIN_SERVICE_TOKEN env "
+            "in user-service). Sent as X-Admin-Service-Token by the proxy.",
+    "fields": [
+      {"name": "token", "label": "Admin service token", "type": "password",
+       "secret": True},
+    ],
+  },
+
+  # ===== Stripe (used by user-service) =================================
+  {
+    "group": "Billing",
+    "key": "stripe.api_key",
+    "title": "Stripe API key",
+    "hint": "Secret key. Used by user-service /api/checkout/create-session.",
+    "fields": [
+      {"name": "key", "label": "Secret key", "type": "password", "secret": True,
+       "placeholder": "sk_test_… or sk_live_…"},
+    ],
+  },
+  {
+    "group": "Billing",
+    "key": "stripe.webhook_secret",
+    "title": "Stripe webhook secret",
+    "hint": "From the Stripe webhook endpoint config. Used to verify "
+            "/api/stripe/webhook signatures.",
+    "fields": [
+      {"name": "secret", "label": "Webhook signing secret", "type": "password",
+       "secret": True, "placeholder": "whsec_…"},
+    ],
+  },
+
+  # ===== OAuth providers ==============================================
+  {
+    "group": "OAuth providers",
+    "key": "oauth.google",
+    "title": "Google",
+    "hint": "Client ID + secret from a Google Cloud OAuth client. The "
+            "redirect URI must match exactly: "
+            "{PUBLIC_URL}/api/auth/oauth/google/callback.",
+    "fields": [
+      {"name": "client_id",    "label": "Client ID",     "type": "text",
+       "placeholder": "xxxx.apps.googleusercontent.com"},
+      {"name": "client_secret","label": "Client secret", "type": "password",
+       "secret": True, "placeholder": "GOCSPX-…"},
+      {"name": "redirect_uri", "label": "Redirect URI",  "type": "url",
+       "placeholder": "https://user.develop.cc/api/auth/oauth/google/callback"},
+    ],
+    "status_msg": {"configured": "configured — Google sign-in available",
+                    "missing": "not configured — Google button hidden"},
+  },
+
+  # ===== Email (used by user-service) ==================================
+  {
+    "group": "Email",
+    "key": "smtp.config",
+    "title": "SMTP",
+    "hint": "Used by user-service for email verification + password reset. "
+            "Without it, links fall back to ``docker logs`` (dev only).",
+    "fields": [
+      {"name": "host",       "label": "Host",       "type": "text",
+       "placeholder": "smtp.example.com"},
+      {"name": "port",       "label": "Port",       "type": "number",
+       "placeholder": "587"},
+      {"name": "user",       "label": "User",       "type": "text"},
+      {"name": "password",   "label": "Password",   "type": "password", "secret": True},
+      {"name": "from_email", "label": "From email", "type": "email",
+       "placeholder": "no-reply@example.com"},
+      {"name": "from_name",  "label": "From name",  "type": "text",
+       "placeholder": "User Service"},
+      {"name": "starttls",   "label": "Use STARTTLS","type": "bool"},
+    ],
+  },
+]
+
+
+def _settings_registry_index() -> dict[str, dict[str, Any]]:
+  """Lookup keyed by `key`. Built once at module import."""
+  return {entry["key"]: entry for entry in SETTINGS_REGISTRY}
+
+
+_SETTINGS_BY_KEY = _settings_registry_index()
+
+
+# Recognized keys → schema (allowed sub-keys). Derived from
+# SETTINGS_REGISTRY so the SPA and the validator can never drift.
 SYSTEM_CONFIG_SCHEMAS: dict[str, set[str]] = {
-  "ai_api": {"provider", "base_url", "api_key", "model"},
+  entry["key"]: {f["name"] for f in entry["fields"]}
+  for entry in SETTINGS_REGISTRY
 }
 SYSTEM_CONFIG_KEYS = tuple(SYSTEM_CONFIG_SCHEMAS.keys())
 
@@ -3631,12 +4519,6 @@ def _build_router(ctx: AdminContext) -> _Router:
       HTTPStatus.OK, deploy_node_action(ctx, request.path_params["name"], payload)
     )
 
-  def node_deploy_service_handler(request: _Request) -> _Response:
-    payload = request.json_body() if request.body else {}
-    return _json_response(
-      HTTPStatus.OK, deploy_node_service(ctx, request.path_params["name"], payload)
-    )
-
   def node_update_handler(request: _Request) -> _Response:
     payload = request.json_body() if request.body else {}
     return _json_response(
@@ -3648,9 +4530,9 @@ def _build_router(ctx: AdminContext) -> _Router:
       uninstall_node_services(ctx, request.path_params["name"],
                               request.json_body() if request.body else {}))
 
-  def node_clean_handler(request: _Request) -> _Response:
+  def node_clear_handler(request: _Request) -> _Response:
     return _json_response(HTTPStatus.OK,
-      clean_node(ctx, request.path_params["name"],
+      clear_node(ctx, request.path_params["name"],
                  request.json_body() if request.body else {}))
 
   def node_run_handler(request: _Request) -> _Response:
@@ -3752,6 +4634,19 @@ def _build_router(ctx: AdminContext) -> _Router:
   def service_delete_handler(request: _Request) -> _Response:
     return _json_response(HTTPStatus.OK, delete_service(ctx, request.path_params["name"]))
 
+  def service_new_defaults_handler(_request: _Request) -> _Response:
+    return _json_response(HTTPStatus.OK, service_create_new_defaults(ctx))
+
+  def service_new_handler(request: _Request) -> _Response:
+    return _json_response(HTTPStatus.OK, service_create_new(ctx, request.json_body()))
+
+  def service_push_to_github_handler(request: _Request) -> _Response:
+    payload = request.json_body() if request.body else {}
+    return _json_response(
+      HTTPStatus.OK,
+      service_push_to_github(ctx, request.path_params["name"], payload),
+    )
+
   router.add("GET", "/api/status", with_auth(overview_handler))
   router.add("GET", "/api/overview", with_auth(overview_handler))
   router.add("GET", "/api/routes", with_auth(list_routes_handler))
@@ -3780,13 +4675,12 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("DELETE", "/api/nodes/{name}", with_auth(node_delete_handler))
   router.add("POST", "/api/nodes/{name}/probe", with_auth(node_probe_handler))
   router.add("POST", "/api/nodes/{name}/deploy", with_auth(node_deploy_handler))
-  router.add("POST", "/api/nodes/{name}/deploy-service", with_auth(node_deploy_service_handler))
   router.add("POST", "/api/nodes/{name}/update", with_auth(node_update_handler))
   router.add("POST", "/api/nodes/{name}/run", with_auth(node_run_handler))
   router.add("POST", "/api/nodes/{name}/uninstall-services",
              with_auth(node_uninstall_services_handler))
-  router.add("POST", "/api/nodes/{name}/clean",
-             with_auth(node_clean_handler))
+  router.add("POST", "/api/nodes/{name}/clear",
+             with_auth(node_clear_handler))
   router.add("GET", "/api/host/ssh-keys", with_auth(host_ssh_keys_handler))
   router.add("POST", "/api/host/ssh-keys/read", with_auth(host_ssh_keys_read_handler))
   router.add("POST", "/api/nodes/{name}/init/start", with_auth(init_start_handler))
@@ -3945,12 +4839,203 @@ def _build_router(ctx: AdminContext) -> _Router:
     return _json_response(HTTPStatus.OK, response)
 
   def service_deploy_handler(request: _Request) -> _Response:
-    return _json_response(
-      HTTPStatus.OK,
-      deploy_service_to_nodes(ctx, request.path_params["name"], request.json_body()),
-    )
+    name = request.path_params["name"]
+    payload = request.json_body() or {}
+    # xout has its own per-deploy state (preset assignment + token set).
+    # Validate + persist + render preset.json into extra_files BEFORE
+    # the generic deploy runs. After deploy succeeds, run sync-tokens
+    # on the successful nodes so cached subscription strings reflect
+    # the new container's resolved Reality public key.
+    if name == "xout":
+      _xout_prepare_deploy_payload(payload)
+    result = deploy_service_to_nodes(ctx, name, payload)
+    if name == "xout":
+      good_nodes = [r["node"] for r in (result.get("results") or [])
+                    if r.get("ok") and r.get("node")]
+      if good_nodes:
+        try:
+          result["xout_post_sync"] = _xout_sync_tokens_on_nodes(good_nodes)
+        except Exception:  # noqa: BLE001
+          # Sync is best-effort; deploy itself succeeded so don't fail
+          # the response. The operator can retry from the Xout tab.
+          LOGGER.exception("xout post-deploy sync failed for %s", good_nodes)
+    return _json_response(HTTPStatus.OK, result)
 
   # ---------- xout channel ----------------------------------------------
+
+  def _refresh_xout_inbound_snapshot(rec, *, presets_cache=None, assignments_cache=None,
+                                     nodes_cache=None):
+    """Re-resolve a kind='xout_inbound' row from its source xout
+    inbound and persist any divergence back to the DB. Returns the
+    refreshed StaticIpRecord (or the original if nothing changed).
+
+    Operators want xout-imported rows to track the source live: if
+    they change a port, regenerate a session token, or re-assign a
+    preset, the static_ips row's ``host`` / ``port`` / ``auth`` /
+    vendor / preset_name should follow without manual intervention.
+
+    Reality public_keys for VLESS inbounds are NOT auto-refreshed
+    here — they only exist on the node (in /data/preset.json.resolved)
+    and require an SSH round trip. The "Re-sync from Xout" menu item
+    handles that path on demand.
+
+    The optional cache args let callers refresh many rows in one DB
+    round trip — instead of N×3 lookups, the caller passes pre-built
+    dicts keyed by name/id.
+    """
+    if (rec.kind or "static") != "xout_inbound":
+      return rec
+    meta = (rec.static_info or {}).get("xout_inbound") or {}
+    node_name = (meta.get("node_name") or "").strip()
+    inbound_tag = (meta.get("inbound_tag") or "").strip()
+    if not (node_name and inbound_tag):
+      return rec  # nothing to resolve
+
+    # Resolve node + assignment + preset, optionally from caches.
+    if nodes_cache is not None:
+      node = nodes_cache.get(node_name)
+    else:
+      node = ctx.database.get_node(node_name)
+    if node is None:
+      return rec  # source node deleted — keep last-known snapshot
+
+    if assignments_cache is not None:
+      assignment = assignments_cache.get(node_name)
+    else:
+      assignment = ctx.database.get_xout_assignment(node_name)
+    if assignment is None:
+      return rec  # node has no preset assigned right now
+
+    preset_id = assignment.get("preset_id")
+    if presets_cache is not None:
+      preset = presets_cache.get(preset_id)
+    else:
+      preset = ctx.database.get_xout_preset(preset_id) if preset_id else None
+    if preset is None:
+      return rec
+
+    target_ib = next((i for i in (preset.get("inbounds") or [])
+                      if i.get("tag") == inbound_tag), None)
+    if target_ib is None:
+      # Inbound was renamed or deleted — keep the snapshot as-is so
+      # the row stays usable until the operator decides what to do.
+      return rec
+
+    # ----- Compute live values
+    proto_in = (target_ib.get("protocol") or "").lower()
+    if proto_in in ("socks", "socks5"):
+      new_protocol = "socks5"
+    elif proto_in in ("http", "https"):
+      new_protocol = "http"
+    elif proto_in == "vless":
+      new_protocol = "vless"
+    else:
+      return rec  # unsupported protocol — bail
+    try:
+      new_port = int(target_ib.get("port") or 0)
+    except (TypeError, ValueError):
+      new_port = 0
+
+    # Auth refreshes for socks/http — pulled straight from the preset.
+    new_username = rec.username
+    new_password = rec.password
+    if proto_in in ("socks", "socks5", "http", "https"):
+      auth = target_ib.get("auth") or {}
+      new_username = auth.get("user") or None
+      new_password = auth.get("pass") or None
+
+    fields: dict[str, Any] = {}
+    if rec.ip != node.host:
+      fields["ip"] = node.host
+    if new_port and rec.port != new_port:
+      fields["port"] = new_port
+    if rec.protocol != new_protocol:
+      fields["protocol"] = new_protocol
+    if rec.username != new_username:
+      fields["username"] = new_username
+    if rec.password != new_password:
+      fields["password"] = new_password
+    # Vendor — auto-track the source node's name UNLESS the operator
+    # has manually overridden it. We persist the last value we set
+    # under ``static_info.xout_inbound.last_synced_vendor``; if the
+    # current row's vendor matches that (or is empty / matches the
+    # previous node_name from when this row was first imported), we
+    # treat it as auto-managed and update. Otherwise the operator
+    # set something custom — leave it alone.
+    last_synced_vendor = meta.get("last_synced_vendor")
+    operator_overrode = (
+      rec.gateway_provider
+      and last_synced_vendor is not None
+      and rec.gateway_provider != last_synced_vendor
+      and rec.gateway_provider != node_name
+    )
+    new_meta = dict(meta)
+    sync_vendor = (rec.gateway_provider != node_name) and not operator_overrode
+    if sync_vendor:
+      fields["gateway_provider"] = node_name
+      new_meta["last_synced_vendor"] = node_name
+    elif last_synced_vendor != node_name:
+      # Even if we're not overwriting (operator override OR already
+      # equal), bring the back-ref forward so the next compare uses
+      # the current node_name as the "last auto value" baseline.
+      new_meta["last_synced_vendor"] = node_name
+
+    # Refresh the static_info.xout_inbound back-ref in case the
+    # assigned preset changed (preset_id / preset_name divergence).
+    new_preset_name = preset.get("name") or ""
+    meta_changed = (
+      new_meta.get("last_synced_vendor") != meta.get("last_synced_vendor")
+      or meta.get("preset_id") != preset_id
+      or meta.get("preset_name") != new_preset_name
+    )
+    if meta_changed:
+      new_meta["preset_id"] = int(preset_id) if preset_id else None
+      new_meta["preset_name"] = new_preset_name
+      new_static_info = dict(rec.static_info or {})
+      new_static_info["xout_inbound"] = new_meta
+      fields["static_info"] = new_static_info
+
+    if not fields:
+      return rec
+    refreshed = ctx.database.update_static_ip(rec.id, fields)
+    return refreshed or rec
+
+  def _refresh_xout_inbound_rows(rows):
+    """Batch-refresh every kind='xout_inbound' row in ``rows`` against
+    the live xout state. Builds one cache of nodes / assignments /
+    presets so we don't hammer the DB with N×3 lookups."""
+    xout_rows = [r for r in rows if (r.kind or "static") == "xout_inbound"]
+    if not xout_rows:
+      return rows
+    # Build caches once.
+    try:
+      nodes_cache = {n.name: n for n in (ctx.database.list_nodes() or [])}
+    except Exception:  # noqa: BLE001
+      nodes_cache = {}
+    try:
+      assignments_cache = {a["node_name"]: a
+                           for a in (ctx.database.list_xout_assignments() or [])}
+    except Exception:  # noqa: BLE001
+      assignments_cache = {}
+    try:
+      presets_cache = {p["id"]: p
+                       for p in (ctx.database.list_xout_presets() or [])}
+    except Exception:  # noqa: BLE001
+      presets_cache = {}
+
+    # Refresh in place — replace each xout_inbound row with its live
+    # version while preserving original list ordering.
+    by_id = {r.id: r for r in rows}
+    for r in xout_rows:
+      try:
+        fresh = _refresh_xout_inbound_snapshot(r,
+          presets_cache=presets_cache,
+          assignments_cache=assignments_cache,
+          nodes_cache=nodes_cache)
+        by_id[r.id] = fresh
+      except Exception:  # noqa: BLE001
+        LOGGER.exception("xout_inbound auto-resync failed for id=%s", r.id)
+    return [by_id[r.id] for r in rows]
 
   def _xout_normalize_inbound(entry: Any, idx: int) -> dict:
     """Validate + normalize one inbound config from a preset.
@@ -3972,8 +5057,28 @@ def _build_router(ctx: AdminContext) -> _Router:
       raise HttpError(HTTPStatus.BAD_REQUEST, f"inbound[{idx}].port out of range",
                       code="invalid_inbound")
     tag = (entry.get("tag") or f"in{idx}").strip()
-    if not re.match(r"^[a-zA-Z0-9._-]+$", tag):
-      raise HttpError(HTTPStatus.BAD_REQUEST, f"inbound[{idx}].tag has invalid chars",
+    # Tag becomes the client-visible node label in subscription URIs
+    # (vless://...#<tag>) and Clash proxy names — both support UTF-8,
+    # so allow Unicode word chars (CJK included) plus . _ - . We also
+    # allow { and } so the operator can embed the {node_name} template
+    # placeholder; _xout_resolve_preset substitutes it at deploy time.
+    # Reject whitespace and shell metas so the bash-rendered preset.json
+    # heredoc + xray's tag references stay safe. Cap length so the
+    # subscription URLs don't become absurd (allow some headroom for
+    # the substituted form too).
+    if not (1 <= len(tag) <= 96) or not re.match(r"^[\w.\-{}]+$", tag, re.UNICODE):
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      f"inbound[{idx}].tag must be 1-96 chars: letters/digits "
+                      f"(unicode ok), dot, underscore, hyphen, or {{node_name}} "
+                      f"placeholder — no spaces",
+                      code="invalid_inbound")
+    # Brace balance: any `{`/`}` that survives the {node_name} removal
+    # is a stray and would render an unresolvable tag at deploy time.
+    _post_template = tag.replace("{node_name}", "")
+    if "{" in _post_template or "}" in _post_template:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      f"inbound[{idx}].tag has stray '{{' or '}}' — "
+                      f"the only allowed template token is '{{node_name}}'",
                       code="invalid_inbound")
     out: dict[str, Any] = {"tag": tag, "protocol": protocol, "port": port}
     if protocol == "vless":
@@ -4053,21 +5158,16 @@ def _build_router(ctx: AdminContext) -> _Router:
                         f"inbound[{idx}].outbound.static_ip_id is required",
                         code="invalid_inbound")
       out["outbound"] = {"type": "static_ip", "static_ip_id": sid}
-    elif ob_type == "xout_inbound":
-      target_node = (ob.get("node_name") or "").strip()
-      target_tag  = (ob.get("inbound_tag") or "").strip()
-      if not target_node or not target_tag:
-        raise HttpError(HTTPStatus.BAD_REQUEST,
-                        f"inbound[{idx}].outbound.node_name + inbound_tag required",
-                        code="invalid_inbound")
-      out["outbound"] = {
-        "type": "xout_inbound",
-        "node_name": target_node,
-        "inbound_tag": target_tag,
-      }
+    # NOTE: the legacy "xout_inbound" outbound type was removed. The
+    # equivalent feature now flows through the static_ips registry
+    # (Static IPs page → Import from Xout). Operators have a single
+    # unified registry of upstream proxies instead of two parallel
+    # picker types in the preset editor. Existing presets that still
+    # reference "xout_inbound" are rejected here so deploys fail loud
+    # rather than silently dropping the outbound.
     else:
       raise HttpError(HTTPStatus.BAD_REQUEST,
-                      f"inbound[{idx}].outbound.type must be direct/http/socks/vless/static_ip/xout_inbound",
+                      f"inbound[{idx}].outbound.type must be direct/http/socks/vless/static_ip",
                       code="invalid_inbound")
     return out
 
@@ -4087,90 +5187,95 @@ def _build_router(ctx: AdminContext) -> _Router:
         raise HttpError(HTTPStatus.BAD_REQUEST,
                         f"outbound static_ip_id={sid} not found",
                         code="outbound_unresolved")
+      # For xout_inbound rows, re-resolve from the source live before
+      # we render the deploy artifact. The row in static_ips is a
+      # snapshot; the source preset is the source of truth at deploy
+      # time. Without this, an operator who changes the inbound's
+      # port / auth on the source node would have to manually re-
+      # import here for the change to take effect.
+      if (rec.kind or "static") == "xout_inbound":
+        try:
+          rec = _refresh_xout_inbound_snapshot(rec)
+        except Exception:  # noqa: BLE001
+          LOGGER.exception("xout_inbound resync at deploy failed for id=%s", sid)
+      if not rec.port or not (1 <= rec.port <= 65535):
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"static_ip {sid} has no usable port",
+                        code="outbound_unresolved")
       proto = (rec.protocol or "").lower()
+      # VLESS-Reality outbound: pull uuid / sni / pubkey / short_id
+      # from static_info.vless. This populates rows imported via the
+      # "Import from Xout" flow.
+      if proto == "vless":
+        v = (rec.static_info or {}).get("vless") or {}
+        uuid = (v.get("uuid") or "").strip()
+        sni = (v.get("sni") or "").strip()
+        pub = (v.get("pubkey") or v.get("public_key") or "").strip()
+        if not (uuid and sni and pub):
+          raise HttpError(HTTPStatus.BAD_REQUEST,
+                          f"static_ip {sid} (VLESS) missing uuid / sni / pubkey — "
+                          "re-import from Xout once the inbound is deployed",
+                          code="outbound_unresolved")
+        return {
+          "type": "vless",
+          "host": rec.ip, "port": int(rec.port),
+          "uuid": uuid, "sni": sni, "pubkey": pub,
+          "short_id": (v.get("short_id") or ""),
+        }
+      # SOCKS / HTTP outbound: registry's username / password are sent
+      # verbatim. This is exactly what makes provider-gateway entries
+      # (Decodo / BrightData / Oxylabs / etc.) work — the username
+      # carries the session-binding directives.
       if proto in ("socks", "socks5"):
         out_type = "socks"
       elif proto in ("http", "https"):
         out_type = "http"
       else:
         raise HttpError(HTTPStatus.BAD_REQUEST,
-                        f"static_ip {sid} protocol '{rec.protocol}' is not pickable as an outbound (need http/socks)",
+                        f"static_ip {sid} protocol '{rec.protocol}' is not pickable as an outbound (need http/socks/vless)",
                         code="outbound_unresolved")
-      if not rec.port or not (1 <= rec.port <= 65535):
-        raise HttpError(HTTPStatus.BAD_REQUEST,
-                        f"static_ip {sid} has no usable port",
-                        code="outbound_unresolved")
-      return {"type": out_type, "host": rec.ip, "port": int(rec.port), "user": "", "pass": ""}
-    if t == "xout_inbound":
-      target_node = ob.get("node_name") or ""
-      target_tag  = ob.get("inbound_tag") or ""
-      a = ctx.database.get_xout_assignment(target_node)
-      if a is None:
-        raise HttpError(HTTPStatus.BAD_REQUEST,
-                        f"node {target_node!r} has no xout preset assigned",
-                        code="outbound_unresolved")
-      p = ctx.database.get_xout_preset(a["preset_id"])
-      if p is None:
-        raise HttpError(HTTPStatus.BAD_REQUEST,
-                        f"xout preset {a['preset_id']} (assigned to {target_node}) is gone",
-                        code="outbound_unresolved")
-      target_ib = next((i for i in (p["inbounds"] or [])
-                        if i.get("tag") == target_tag), None)
-      if target_ib is None:
-        raise HttpError(HTTPStatus.BAD_REQUEST,
-                        f"inbound tag {target_tag!r} not found on {target_node}",
-                        code="outbound_unresolved")
-      proto = target_ib.get("protocol")
-      if proto not in ("http", "socks"):
-        raise HttpError(HTTPStatus.BAD_REQUEST,
-                        f"only http/socks xout inbounds are pickable as outbounds (got {proto})",
-                        code="outbound_unresolved")
-      node = ctx.database.get_node(target_node)
-      if node is None:
-        raise HttpError(HTTPStatus.BAD_REQUEST,
-                        f"node {target_node!r} not found",
-                        code="outbound_unresolved")
-      auth = target_ib.get("auth") or {}
       return {
-        "type": proto,
-        "host": node.host,
-        "port": int(target_ib.get("port") or 0),
-        "user": str(auth.get("user") or ""),
-        "pass": str(auth.get("pass") or ""),
+        "type": out_type, "host": rec.ip, "port": int(rec.port),
+        "user": rec.username or "", "pass": rec.password or "",
       }
-    # direct / http / socks / vless — already concrete
+    # direct / http / socks / vless — already concrete. The legacy
+    # "xout_inbound" outbound type was removed; preset entries that
+    # still carry it are rejected at validation time.
     return ob
 
   def _xout_resolve_preset(preset: dict, *, node_name: str | None = None) -> list[dict]:
     """Walk preset['inbounds'] and replace each referential outbound
     with its concrete form. For VLESS inbounds, also bake in the user
-    list from xout_node_tokens for this node (or, if no rows yet,
-    fall back to the default token). The preset's own 'users' field
-    is ignored when a node-specific assignment exists — the platform
-    is the source of truth, not the preset row."""
-    # Fetch tokens to fold in. If node_name is None we fall back to default.
+    list from xout_node_tokens for this node. The preset's own 'users'
+    field is ignored when a node-specific assignment exists — the
+    platform is the source of truth, not the preset row.
+
+    No automatic fallback if a node has zero tokens provisioned: a
+    VLESS inbound without users gets the 'auto' placeholder so xray
+    can still boot (entrypoint resolves it). The deploy flow rejects
+    empty token selection up-front, so this branch is reserved for
+    sync/introspection paths where it's expected to occasionally hit
+    zero tokens (e.g. node deleted right before sync)."""
     tokens_for_node: list[dict] = []
     if node_name:
       try:
         tokens_for_node = ctx.database.list_xout_node_tokens_for_node(node_name)
       except Exception:
         tokens_for_node = []
-    if not tokens_for_node:
-      default_tok = None
-      try:
-        default_tok = ctx.database.get_default_xout_token()
-      except Exception:
-        default_tok = None
-      if default_tok is not None:
-        tokens_for_node = [{
-          "token_id": default_tok["id"],
-          "token_name": default_tok["name"],
-          "token_uuid": default_tok["uuid"],
-        }]
 
     out: list[dict] = []
     for ib in (preset.get("inbounds") or []):
       ib2 = dict(ib)
+      # Tag-template substitution: ``{node_name}`` is a stable
+      # placeholder operators put into the preset (e.g. via the
+      # "Batch from Static IPs" flow) so the rendered tag becomes
+      # node-specific without duplicating the preset per node. We
+      # also substitute it into ``label`` and ``description`` slots
+      # if present, in case the operator templated those too.
+      if node_name:
+        for _slot in ("tag", "label", "description"):
+          if isinstance(ib2.get(_slot), str):
+            ib2[_slot] = ib2[_slot].replace("{node_name}", node_name)
       ib2["outbound"] = _xout_resolve_outbound(ib.get("outbound") or {"type": "direct"})
       if ib2.get("protocol") == "vless":
         if tokens_for_node:
@@ -4196,7 +5301,35 @@ def _build_router(ctx: AdminContext) -> _Router:
     if not isinstance(raw, list) or not raw:
       raise HttpError(HTTPStatus.BAD_REQUEST,
                       "inbounds must be a non-empty array", code="invalid_inbounds")
-    return [_xout_normalize_inbound(e, i) for i, e in enumerate(raw)]
+    out = [_xout_normalize_inbound(e, i) for i, e in enumerate(raw)]
+    # Distinct port per inbound — xray's SO_REUSEPORT will silently accept
+    # multiple listeners on the same port, but only one wins per accepted
+    # connection (chosen by the kernel), and the others' Reality keys
+    # never get used → most client connections fail handshake. Reject the
+    # config up front rather than surface a flaky deploy.
+    seen: dict[int, str] = {}
+    # Distinct tag per inbound — xray uses tags for outbound references
+    # and subscription URLs, and duplicates would make routing
+    # ambiguous. The {node_name} placeholder counts as a literal here
+    # (it's the same template, hence still a duplicate); the picker
+    # disambiguates with -2/-3 suffixes before save.
+    seen_tags: set[str] = set()
+    for ib in out:
+      port = ib["port"]
+      if port in seen:
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"port {port} is reused by inbound {seen[port]!r} "
+                        f"and {ib['tag']!r} — every inbound needs a unique port",
+                        code="duplicate_port")
+      seen[port] = ib["tag"]
+      tag = ib["tag"]
+      if tag in seen_tags:
+        raise HttpError(HTTPStatus.BAD_REQUEST,
+                        f"tag {tag!r} is used by more than one inbound — "
+                        f"every inbound needs a unique tag",
+                        code="duplicate_tag")
+      seen_tags.add(tag)
+    return out
 
   def xout_presets_list_handler(_request: _Request) -> _Response:
     return _json_response(HTTPStatus.OK, {"presets": ctx.database.list_xout_presets()})
@@ -4255,6 +5388,34 @@ def _build_router(ctx: AdminContext) -> _Router:
       raise HttpError(HTTPStatus.NOT_FOUND, f"preset not found: {pid}", code="preset_not_found")
     return _json_response(HTTPStatus.OK, {"deleted": True})
 
+  def xout_presets_preview_handler(request: _Request) -> _Response:
+    """Return the inbounds list with referential outbounds resolved
+    against the current registry (static_ip → concrete host:port:user:pass,
+    xout_inbound → resolved address). VLESS users[] are shown with the
+    'auto' placeholder — at deploy time they're replaced by the operator's
+    selected token set. This is exactly what would ship to a node minus
+    the per-node user substitution."""
+    pid = int(request.path_params["preset_id"])
+    preset = ctx.database.get_xout_preset(pid)
+    if preset is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"preset not found: {pid}",
+                      code="preset_not_found")
+    try:
+      resolved = _xout_resolve_preset(preset, node_name=None)
+    except HttpError:
+      raise
+    except Exception as exc:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      f"could not resolve preset: {exc}",
+                      code="preview_failed") from exc
+    return _json_response(HTTPStatus.OK, {
+      "preset": {"id": preset["id"], "name": preset["name"]},
+      "resolved_inbounds": resolved,
+      "note": ("Users '[{name: default, uuid: auto}]' are placeholders. "
+               "At deploy time the platform replaces them with the token "
+               "set you pick in Services → xout → Deploy."),
+    })
+
   def xout_nodes_list_handler(_request: _Request) -> _Response:
     """List all nodes that have xout deployed (have a service_node_state row
     for service_name='xout'), plus their current preset assignment."""
@@ -4278,98 +5439,161 @@ def _build_router(ctx: AdminContext) -> _Router:
       })
     return _json_response(HTTPStatus.OK, {"nodes": out})
 
-  def xout_node_deploy_handler(request: _Request) -> _Response:
-    """Deploy xout to one node using the chosen preset.
-    Body: {preset_id: int}
-    Resolves any referential outbounds (static_ip, xout_inbound) to their
-    concrete addresses, renders the inbounds array as
-    /opt/xout/data/preset.json on the target, then runs the standard
-    deploy_service_to_nodes flow with extra_files set."""
-    _require_readwrite(ctx)
-    node_name = _normalize_node_name(request.path_params["node_name"])
-    n = ctx.database.get_node(node_name)
-    if n is None:
-      raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {node_name}",
-                      code="node_not_found")
-    payload = request.json_body() or {}
+  def _xout_prepare_deploy_payload(payload: dict) -> dict:
+    """Validate xout-specific deploy payload and persist the per-node
+    state (preset assignment + token set) so the resolved preset.json
+    we ship to each node reflects the operator's selection.
+
+    Mutates ``payload`` to inject the rendered preset.json into
+    ``extra_files['data/preset.json']`` so the existing
+    deploy_service_to_nodes flow ships it with no special-casing.
+
+    Token set is full-replaced on every selected node — the tokens the
+    operator picks at deploy time become the authoritative set.
+
+    Raises HttpError on validation failure."""
+    raw_tokens = payload.get("tokens")
+    if not isinstance(raw_tokens, list) or not raw_tokens:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "tokens must be a non-empty list of token ids",
+                      code="tokens_required")
+    try:
+      token_ids = [int(t) for t in raw_tokens]
+    except (TypeError, ValueError):
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "tokens must be integer ids",
+                      code="invalid_tokens") from None
     try:
       preset_id = int(payload.get("preset_id") or 0)
     except (TypeError, ValueError):
-      raise HttpError(HTTPStatus.BAD_REQUEST, "preset_id must be an integer",
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "preset_id must be an integer",
                       code="invalid_preset_id") from None
+    if not preset_id:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "preset_id is required",
+                      code="preset_id_required")
+
     preset = ctx.database.get_xout_preset(preset_id)
     if preset is None:
-      raise HttpError(HTTPStatus.NOT_FOUND, f"preset not found: {preset_id}",
+      raise HttpError(HTTPStatus.NOT_FOUND,
+                      f"preset not found: {preset_id}",
                       code="preset_not_found")
 
-    # Pre-record the assignment so list_xout_assignments shows the right
-    # preset even if deploy is still mid-flight.
-    ctx.database.upsert_xout_assignment(node_name, preset_id, applied_by="admin")
+    # Validate every selected token exists. This catches stale UI state
+    # (token deleted between modal-open and Deploy click).
+    missing_tokens: list[int] = []
+    for tid in token_ids:
+      if ctx.database.get_xout_token(tid) is None:
+        missing_tokens.append(tid)
+    if missing_tokens:
+      raise HttpError(HTTPStatus.NOT_FOUND,
+                      f"token(s) not found: {missing_tokens}",
+                      code="token_not_found")
 
-    # Expand referential outbounds (static_ip / xout_inbound) NOW so the
-    # rendered preset.json carries concrete host/port/auth.
-    resolved_inbounds = _xout_resolve_preset(preset, node_name=node_name)
+    # Resolve target nodes. Mirrors the same logic deploy_service_to_nodes
+    # uses so we hit the exact node set both for state writes and the
+    # subsequent deploy.
+    if payload.get("all"):
+      target_names = [n.name for n in ctx.database.list_nodes()]
+    else:
+      raw_nodes = payload.get("nodes") or []
+      target_names = [str(n).strip() for n in raw_nodes if str(n).strip()]
+    if not target_names:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "nodes must be a non-empty list (or set all=true)",
+                      code="nodes_required")
+
+    # Persist the (preset, tokens) selection BEFORE the actual deploy so
+    # that mid-deploy crashes don't leave the cache out of sync with what
+    # the container is about to render.
+    for nn in target_names:
+      ctx.database.upsert_xout_assignment(nn, preset_id, applied_by="admin")
+      ctx.database.replace_xout_node_token_set(nn, token_ids)
+
+    # Resolve the preset using one of the selected nodes — they all have
+    # the same token set now, so the rendered output is identical.
+    sample_node = target_names[0]
+    resolved_inbounds = _xout_resolve_preset(preset, node_name=sample_node)
 
     import json as _json
     preset_json = _json.dumps(resolved_inbounds, indent=2)
-    return _json_response(HTTPStatus.OK, deploy_service_to_nodes(
-      ctx, "xout", {
-        "nodes": [node_name],
-        "triggered_by": payload.get("triggered_by") or "xout-channel",
-        "extra_files": {"data/preset.json": preset_json},
-      },
-    ))
+    extra = dict(payload.get("extra_files") or {})
+    extra["data/preset.json"] = preset_json
+    payload["extra_files"] = extra
+    payload.setdefault("triggered_by", "xout-channel")
+    return {
+      "preset_id": preset_id,
+      "token_ids": token_ids,
+      "target_names": target_names,
+    }
 
   def xout_outbound_targets_handler(_request: _Request) -> _Response:
-    """Unified picker source for the per-inbound Outbound editor: lists
-    every static IP from the registry that is usable as an upstream proxy
-    (http/socks) plus every http/socks inbound that another xout node is
-    currently serving (resolved via xout_node_assignments). VLESS chains
-    aren't auto-pickable because the upstream's Reality public key is
-    auto-generated on the node and not stored in our DB — those still
-    work via the manual editor."""
+    """Unified picker source for the per-inbound Outbound editor:
+    lists every entry in the static_ips registry that is usable as an
+    upstream proxy. The legacy "xout_inbound" picker type was removed —
+    operators now register an xout-deployed inbound as a static_ips
+    row (Static IPs page → Import from Xout) and pick it from this
+    same list. One catalog instead of two parallel ones.
+
+    Eligible protocols: ``http`` / ``https`` / ``socks`` / ``socks5``
+    / ``vless``. VLESS rows must have ``static_info.vless.{uuid, sni,
+    pubkey}`` populated (the import-from-xout flow does this; manual
+    rows can fill it via Edit)."""
     out: list[dict] = []
-    # 1) Static IPs in the registry
     for ip in ctx.database.list_static_ips():
       proto = (ip.protocol or "").lower()
-      if proto not in ("http", "https", "socks", "socks5"):
+      if proto in ("socks", "socks5"):
+        pick_type = "socks"
+      elif proto in ("http", "https"):
+        pick_type = "http"
+      elif proto == "vless":
+        # Only surface VLESS rows that actually have the Reality
+        # fields populated — otherwise the resolver would 500 at
+        # deploy time.
+        v = (ip.static_info or {}).get("vless") or {}
+        if not (v.get("uuid") and v.get("sni")
+                and (v.get("pubkey") or v.get("public_key"))):
+          continue
+        pick_type = "vless"
+      else:
         continue
-      pick_type = "socks" if proto in ("socks", "socks5") else "http"
-      label_parts = [f"{ip.ip}:{ip.port if ip.port else '?'}"]
-      if ip.country: label_parts.append(ip.country)
-      if ip.label: label_parts.append(ip.label)
+      # Build the operator-facing label. For gateway rows we lead with
+      # the exit IP (the meaningful identifier) and tag the provider;
+      # for xout_inbound rows we surface the source node + tag; for
+      # plain static rows we use the legacy "ip:port country" form.
+      ip_kind = (ip.kind or "static")
+      if ip_kind == "gateway":
+        head = ip.exit_ip or "(no exit IP)"
+        gw_tag = ip.gateway_provider or "gateway"
+        label_parts = [head, f"via {ip.ip}:{ip.port if ip.port else '?'}"]
+        if ip.country: label_parts.append(ip.country)
+        label = " · ".join(label_parts) + f"  ({pick_type}, {gw_tag})"
+      elif ip_kind == "xout_inbound":
+        meta = (ip.static_info or {}).get("xout_inbound") or {}
+        node_n = meta.get("node_name") or "?"
+        inb_t = meta.get("inbound_tag") or "?"
+        label_parts = [f"{ip.ip}:{ip.port if ip.port else '?'}"]
+        if ip.country: label_parts.append(ip.country)
+        label = " · ".join(label_parts) + f"  ({pick_type}, xout {node_n}/{inb_t})"
+      else:
+        label_parts = [f"{ip.ip}:{ip.port if ip.port else '?'}"]
+        if ip.country: label_parts.append(ip.country)
+        if ip.label: label_parts.append(ip.label)
+        label = " · ".join(label_parts) + f"  ({pick_type})"
       out.append({
         "kind": "static_ip",
         "id": ip.id,
-        "label": " · ".join(label_parts) + f"  ({pick_type})",
+        "label": label,
         "protocol": pick_type,
         "host": ip.ip,
         "port": ip.port,
+        # Surface the registry kind so the picker can render an icon
+        # if it wants. Cheap to include.
+        "static_ip_kind": ip_kind,
+        "exit_ip": ip.exit_ip,
+        "gateway_provider": ip.gateway_provider,
       })
-    # 2) Xout inbounds that are currently assigned to nodes
-    assignments = ctx.database.list_xout_assignments()
-    presets_by_id = {p["id"]: p for p in ctx.database.list_xout_presets()}
-    for a in assignments:
-      p = presets_by_id.get(a["preset_id"])
-      if p is None: continue
-      node = ctx.database.get_node(a["node_name"])
-      if node is None: continue
-      for ib in (p["inbounds"] or []):
-        if ib.get("protocol") not in ("http", "socks"):
-          continue  # vless not auto-pickable (reality pubkey not in DB)
-        auth = ib.get("auth") or {}
-        out.append({
-          "kind": "xout_inbound",
-          "node_name": node.name,
-          "inbound_tag": ib.get("tag"),
-          "preset_name": p["name"],
-          "label": f"{node.name}:{ib.get('port')} ({ib.get('protocol')})  via preset '{p['name']}' / {ib.get('tag')}"
-                   + (" [auth]" if auth.get("user") else ""),
-          "protocol": ib.get("protocol"),
-          "host": node.host,
-          "port": ib.get("port"),
-          "has_auth": bool(auth.get("user")),
-        })
     return _json_response(HTTPStatus.OK, {"targets": out})
 
   # ---------- xout tokens (= users) ----------
@@ -4379,28 +5603,46 @@ def _build_router(ctx: AdminContext) -> _Router:
     return str(_uuid.uuid4())
 
   def _build_subscriptions_for_token(token: dict, node_assignments: dict[str, dict]) -> dict:
-    """Build the aggregated VLESS subscription content for one token
-    across all nodes that have this token assigned. Returns
+    """Build the aggregated subscription content for one token across
+    every node that has this token assigned. Returns
     {raw: [uri,...], plain: 'uri\nuri\n...', base64: '...', clash: 'yaml-string'}.
 
-    Only VLESS inbounds are included. HTTP and SOCKS are gateway-style
-    proxies — operators configure them directly in the browser / system
-    settings (the inbound's host:port + auth), not via subscription.
-    Including them in a subscription URL would confuse most clients,
-    which expect a homogeneous protocol list."""
+    The subscription includes ONE entry per inbound:
+      - VLESS inbounds become ``vless://<token-uuid>@host:port#tag``
+        (Reality params from the inbound's reality{} block)
+      - SOCKS / HTTP inbounds become ``socks5://[user:pass@]host:port#tag``
+        / ``http://[user:pass@]host:port#tag`` (auth from the inbound's
+        auth{} block; absent for anonymous inbounds)
+
+    The tag (e.g. ``us01-香港``) becomes the client-side proxy label so
+    operators who build presets where each inbound represents a
+    different exit country (one VLESS direct + N SOCKS chained to N
+    different upstreams) get one subscription point per exit-country.
+    """
     import base64 as _b64
     from urllib.parse import quote as _q
+
+    # Quote a YAML scalar that may contain double-quotes or newlines.
+    # Always uses double-quoted form so any special char is safe;
+    # only ``"`` and ``\`` need escaping.
+    def _yq(s: str) -> str:
+      s = "" if s is None else str(s)
+      return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
     uris: list[str] = []
+    # Minimal Clash config — proxy nodes only, no rules. Clients merge
+    # this into their main rule set. Each entry is a YAML object.
+    clash_lines: list[str] = ["proxies:"]
     for node_name, info in node_assignments.items():
       preset = info.get("preset")
       node = info.get("node")
       if not preset or not node:
         continue
+      host = node.host
       for ib in (preset.get("inbounds") or []):
-        proto = ib.get("protocol")
+        proto = (ib.get("protocol") or "").lower()
         port = ib.get("port")
-        tag = ib.get("tag", "")
-        host = node.host
+        tag = ib.get("tag", "") or proto or "node"
         if proto == "vless":
           reality = ib.get("reality") or {}
           sni = reality.get("sni", "")
@@ -4413,7 +5655,10 @@ def _build_router(ctx: AdminContext) -> _Router:
           # without the actual public key.
           if not pub or pub.lower() == "auto":
             continue
-          frag = _q(f"{node_name}-{tag}", safe="")
+          # Display name = inbound tag verbatim (operator-chosen, e.g.
+          # "美国" / "香港"). No node-name prefix or token-name suffix —
+          # the tag is intentionally the user-facing label.
+          frag = _q(tag, safe="")
           uri = (
             f"vless://{token['uuid']}@{host}:{port}"
             f"?encryption=none&security=reality&type=tcp&flow="
@@ -4421,41 +5666,8 @@ def _build_router(ctx: AdminContext) -> _Router:
             f"&pbk={_q(pub, safe='')}&sid={_q(sid, safe='')}&fp=chrome#{frag}"
           )
           uris.append(uri)
-        # http / socks are intentionally skipped — they're not "subscription
-        # targets" in the sense most clients expect. Their host:port +
-        # auth show up in the Test and Verify-Traffic modals; the operator
-        # plugs them directly into browser/system proxy settings.
-
-    plain = "\n".join(uris) + "\n" if uris else ""
-    b64 = _b64.b64encode(plain.encode("utf-8")).decode("ascii") if plain else ""
-
-    # Quote a YAML scalar that may contain double-quotes or newlines.
-    # We always use double-quoted form so any special char is safe; only
-    # `"` and `\` need escaping inside that form.
-    def _yq(s: str) -> str:
-      s = "" if s is None else str(s)
-      return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-    # Minimal Clash config — proxy nodes only, no rules. Clients merge
-    # this into their main rule set. Each entry is a YAML object.
-    clash_lines: list[str] = ["proxies:"]
-    for node_name, info in node_assignments.items():
-      preset = info.get("preset")
-      node = info.get("node")
-      if not preset or not node:
-        continue
-      for ib in (preset.get("inbounds") or []):
-        proto = ib.get("protocol")
-        port = ib.get("port")
-        tag = ib.get("tag", "")
-        host = node.host
-        if proto == "vless":
-          reality = ib.get("reality") or {}
-          pk_clash = reality.get("public_key") or reality.get("pubkey") or ""
-          if not pk_clash or pk_clash.lower() == "auto":
-            continue
           clash_lines.extend([
-            f"  - name: {_yq(f'{node_name}-{tag}')}",
+            f"  - name: {_yq(tag)}",
             f"    type: vless",
             f"    server: {_yq(host)}",
             f"    port: {port}",
@@ -4464,14 +5676,42 @@ def _build_router(ctx: AdminContext) -> _Router:
             f"    tls: true",
             f"    udp: true",
             f"    flow: \"\"",
-            f"    servername: {_yq(reality.get('sni',''))}",
+            f"    servername: {_yq(sni)}",
             f"    reality-opts:",
-            f"      public-key: {_yq(pk_clash)}",
-            f"      short-id: {_yq(reality.get('short_id',''))}",
+            f"      public-key: {_yq(pub)}",
+            f"      short-id: {_yq(sid)}",
             f"    client-fingerprint: chrome",
           ])
-        # http / socks intentionally skipped — see comment in the URI
-        # builder above. Subscription = VLESS-only.
+        elif proto in ("socks", "socks5", "http", "https"):
+          # Each socks/http inbound is a real client-facing endpoint.
+          # Auth (if any) is configured on the inbound itself — same
+          # for every token, since SOCKS/HTTP don't have per-user
+          # identity at the wire level.
+          auth = ib.get("auth") or {}
+          u = (auth.get("user") or "").strip()
+          p = (auth.get("pass") or "")
+          scheme = "socks5" if proto in ("socks", "socks5") else "http"
+          cred = (f"{_q(u, safe='')}:{_q(p, safe='')}@" if u else "")
+          frag = _q(tag, safe="")
+          uri = f"{scheme}://{cred}{host}:{port}#{frag}"
+          uris.append(uri)
+          clash_type = "socks5" if scheme == "socks5" else "http"
+          clash_lines.extend([
+            f"  - name: {_yq(tag)}",
+            f"    type: {clash_type}",
+            f"    server: {_yq(host)}",
+            f"    port: {port}",
+          ])
+          if u:
+            clash_lines.extend([
+              f"    username: {_yq(u)}",
+              f"    password: {_yq(p)}",
+            ])
+          if clash_type == "socks5":
+            clash_lines.append(f"    udp: true")
+
+    plain = "\n".join(uris) + "\n" if uris else ""
+    b64 = _b64.b64encode(plain.encode("utf-8")).decode("ascii") if plain else ""
     clash = "\n".join(clash_lines) + ("\n" if len(clash_lines) > 1 else "")
 
     return {
@@ -4609,32 +5849,17 @@ def _build_router(ctx: AdminContext) -> _Router:
   def xout_tokens_delete_handler(request: _Request) -> _Response:
     _require_readwrite(ctx)
     tid = int(request.path_params["id"])
-    # Snapshot whether this is the default BEFORE delete — we need the
-    # info to decide whether to auto-promote a successor.
-    existing = ctx.database.get_xout_token(tid)
-    was_default = bool(existing and existing.get("is_default"))
     if not ctx.database.delete_xout_token(tid):
       raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
                       code="token_not_found")
-    promoted = None
-    if was_default:
-      # Promote the alphabetically-first remaining token to default so
-      # newly-deployed nodes always get a valid seed user. If none left,
-      # leave as-is — _xout_resolve_preset gracefully falls through to
-      # the empty-users path (entrypoint generates a placeholder).
-      remaining = ctx.database.list_xout_tokens()
-      if remaining:
-        promoted = ctx.database.set_default_xout_token(remaining[0]["id"])
-    return _json_response(HTTPStatus.OK, {
-      "deleted": True,
-      "promoted_default_id": promoted["id"] if promoted else None,
-      "promoted_default_name": promoted["name"] if promoted else None,
-    })
+    return _json_response(HTTPStatus.OK, {"deleted": True})
 
-  def xout_tokens_set_default_handler(request: _Request) -> _Response:
+  def xout_tokens_regenerate_value_handler(request: _Request) -> _Response:
+    """Roll the token's public URL slug. Existing subscription URLs
+    that embed the old value stop working immediately."""
     _require_readwrite(ctx)
     tid = int(request.path_params["id"])
-    rec = ctx.database.set_default_xout_token(tid)
+    rec = ctx.database.regenerate_xout_token_value(tid)
     if rec is None:
       raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
                       code="token_not_found")
@@ -4728,82 +5953,6 @@ def _build_router(ctx: AdminContext) -> _Router:
       "plain": plain,
       "base64": b64,
       "clash": clash,
-    })
-
-  def xout_tokens_publish_handler(request: _Request) -> _Response:
-    """Mark this token as provisioned on the requested nodes.
-    Body: ``{nodes: [...], deploy: true|false}`` (deploy defaults to
-    false). Idempotent — token's UUID is stable so existing client
-    subscriptions keep working.
-
-    With ``deploy: true`` we also re-run the per-node deploy step so
-    the new token is baked into ``/data/preset.json`` immediately.
-    Without it, the publish only writes the junction rows and the
-    operator must trigger Deploy on each affected node manually."""
-    _require_readwrite(ctx)
-    tid = int(request.path_params["id"])
-    token = ctx.database.get_xout_token(tid)
-    if token is None:
-      raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
-                      code="token_not_found")
-    p = request.json_body() or {}
-    raw_nodes = p.get("nodes") or []
-    if not isinstance(raw_nodes, list) or not raw_nodes:
-      raise HttpError(HTTPStatus.BAD_REQUEST,
-                      "nodes must be a non-empty list",
-                      code="nodes_required")
-    auto_deploy = bool(p.get("deploy"))
-    seen_pub: set[str] = set()
-    out = []
-    for n in raw_nodes:
-      nn = _normalize_node_name(str(n))
-      if nn in seen_pub: continue
-      seen_pub.add(nn)
-      if ctx.database.get_node(nn) is None:
-        out.append({"node": nn, "ok": False, "error": "node not found"})
-        continue
-      ctx.database.upsert_xout_node_token(nn, tid)
-      out.append({"node": nn, "ok": True})
-
-    deploy_results: list[dict] = []
-    if auto_deploy:
-      # Trigger per-node deploy via the same code path as the Deploy
-      # button. Each one re-renders preset.json with the freshly-assigned
-      # token list. We swallow per-node failures into the result so a
-      # single bad node doesn't 500 the publish.
-      ok_nodes = [r["node"] for r in out if r["ok"]]
-      for nn in ok_nodes:
-        try:
-          a = ctx.database.get_xout_assignment(nn)
-          if a is None:
-            deploy_results.append({"node": nn, "ok": False,
-                                    "error": "no preset assigned"})
-            continue
-          preset = ctx.database.get_xout_preset(a["preset_id"])
-          if preset is None:
-            deploy_results.append({"node": nn, "ok": False,
-                                    "error": "preset gone"})
-            continue
-          import json as _json
-          resolved_inbounds = _xout_resolve_preset(preset, node_name=nn)
-          dr = deploy_service_to_nodes(ctx, "xout", {
-            "nodes": [nn], "triggered_by": "token-publish",
-            "extra_files": {"data/preset.json": _json.dumps(resolved_inbounds, indent=2)},
-          })
-          first = ((dr or {}).get("results") or [{}])[0]
-          deploy_results.append({"node": nn, "ok": bool(first.get("ok")),
-                                  "exit_code": first.get("exit_code"),
-                                  "error": first.get("error")})
-        except Exception as exc:
-          deploy_results.append({"node": nn, "ok": False, "error": str(exc)[:200]})
-
-    return _json_response(HTTPStatus.OK, {
-      "token_id": tid,
-      "results": out,
-      "deploy_results": deploy_results,
-      "message": ("Token recorded + redeployed on selected nodes."
-                  if auto_deploy
-                  else "Token recorded on selected nodes. Deploy each from the Xout channel to bake it into preset.json."),
     })
 
   def xout_node_traffic_summary_handler(request: _Request) -> _Response:
@@ -4929,48 +6078,81 @@ def _build_router(ctx: AdminContext) -> _Router:
 
     for ib in inbounds_list:
       if not isinstance(ib, dict): continue
-      if ib.get("protocol") != "vless": continue  # skip http/socks
+      proto = (ib.get("protocol") or "").lower()
       port = ib.get("port")
-      tag = ib.get("tag") or "vless"
-      reality = ib.get("reality") or {}
-      sni = reality.get("sni", "")
-      pub = (reality.get("public_key") or reality.get("pubkey") or "")
-      sid = reality.get("short_id", "")
-      if not pub or pub.lower() == "auto":
-        # Resolved file should never have "auto" — bail on this inbound.
-        continue
-      users = ib.get("users") or []
-      for u in users:
-        if not isinstance(u, dict): continue
-        uid = (u.get("uuid") or "").strip()
-        if not uid or uid.lower() == "auto":
+      tag = ib.get("tag") or proto or "node"
+      if proto == "vless":
+        reality = ib.get("reality") or {}
+        sni = reality.get("sni", "")
+        pub = (reality.get("public_key") or reality.get("pubkey") or "")
+        sid = reality.get("short_id", "")
+        if not pub or pub.lower() == "auto":
+          # Resolved file should never have "auto" — bail on this inbound.
           continue
-        uname = u.get("name") or "user"
-        seen_users.append({"uuid": uid, "name": uname, "tag": tag, "port": port})
-        frag = _q(f"{name}-{tag}-{uname}", safe="")
-        uri = (
-          f"vless://{uid}@{host}:{port}"
-          f"?encryption=none&security=reality&type=tcp&flow="
-          f"&sni={_q(sni, safe='')}"
-          f"&pbk={_q(pub, safe='')}&sid={_q(sid, safe='')}&fp=chrome#{frag}"
-        )
+        users = ib.get("users") or []
+        for u in users:
+          if not isinstance(u, dict): continue
+          uid = (u.get("uuid") or "").strip()
+          if not uid or uid.lower() == "auto":
+            continue
+          uname = u.get("name") or "user"
+          seen_users.append({"uuid": uid, "name": uname, "tag": tag, "port": port})
+          # Display name = inbound tag verbatim. Same convention as the
+          # per-token aggregated subscription handler — keeps client-side
+          # proxy lists consistent regardless of which endpoint produced
+          # them. Multi-user-per-inbound is unusual but if it happens,
+          # the tag is still the right label (the operator named it).
+          frag = _q(tag, safe="")
+          uri = (
+            f"vless://{uid}@{host}:{port}"
+            f"?encryption=none&security=reality&type=tcp&flow="
+            f"&sni={_q(sni, safe='')}"
+            f"&pbk={_q(pub, safe='')}&sid={_q(sid, safe='')}&fp=chrome#{frag}"
+          )
+          uris.append(uri)
+          clash_lines.extend([
+            f"  - name: {_yq(tag)}",
+            f"    type: vless",
+            f"    server: {_yq(host)}",
+            f"    port: {port}",
+            f"    uuid: {_yq(uid)}",
+            f"    network: tcp",
+            f"    tls: true",
+            f"    udp: true",
+            f"    flow: \"\"",
+            f"    servername: {_yq(sni)}",
+            f"    reality-opts:",
+            f"      public-key: {_yq(pub)}",
+            f"      short-id: {_yq(sid)}",
+            f"    client-fingerprint: chrome",
+          ])
+      elif proto in ("socks", "socks5", "http", "https"):
+        # Each socks/http inbound is a real client-facing endpoint —
+        # include it in the subscription so the client picks up one
+        # entry per (inbound, exit-country). The tag (e.g. "us01-香港")
+        # tells the client which exit it lands on.
+        auth = ib.get("auth") or {}
+        u = (auth.get("user") or "").strip()
+        p = (auth.get("pass") or "")
+        scheme = "socks5" if proto in ("socks", "socks5") else "http"
+        cred = (f"{_q(u, safe='')}:{_q(p, safe='')}@" if u else "")
+        frag = _q(tag, safe="")
+        uri = f"{scheme}://{cred}{host}:{port}#{frag}"
         uris.append(uri)
+        clash_type = "socks5" if scheme == "socks5" else "http"
         clash_lines.extend([
-          f"  - name: {_yq(f'{name}-{tag}-{uname}')}",
-          f"    type: vless",
+          f"  - name: {_yq(tag)}",
+          f"    type: {clash_type}",
           f"    server: {_yq(host)}",
           f"    port: {port}",
-          f"    uuid: {_yq(uid)}",
-          f"    network: tcp",
-          f"    tls: true",
-          f"    udp: true",
-          f"    flow: \"\"",
-          f"    servername: {_yq(sni)}",
-          f"    reality-opts:",
-          f"      public-key: {_yq(pub)}",
-          f"      short-id: {_yq(sid)}",
-          f"    client-fingerprint: chrome",
         ])
+        if u:
+          clash_lines.extend([
+            f"    username: {_yq(u)}",
+            f"    password: {_yq(p)}",
+          ])
+        if clash_type == "socks5":
+          clash_lines.append(f"    udp: true")
 
     plain = ("\n".join(uris) + "\n") if uris else ""
     b64 = _b64.b64encode(plain.encode("utf-8")).decode("ascii") if plain else ""
@@ -4988,11 +6170,22 @@ def _build_router(ctx: AdminContext) -> _Router:
       else:
         unknown_uuids.append({"uuid": u["uuid"], "name_in_preset": u["name"], "tag": u["tag"]})
 
+    # Tally protocol counts for the UI hint. Subscription includes
+    # vless / socks / http; anything else is silently skipped.
+    proto_counts = {"vless": 0, "socks": 0, "http": 0, "other": 0}
+    for ib in inbounds_list:
+      if not isinstance(ib, dict): continue
+      p = (ib.get("protocol") or "").lower()
+      if p == "vless": proto_counts["vless"] += 1
+      elif p in ("socks", "socks5"): proto_counts["socks"] += 1
+      elif p in ("http", "https"): proto_counts["http"] += 1
+      else: proto_counts["other"] += 1
     return _json_response(HTTPStatus.OK, {
       "node": name,
       "host": host,
-      "vless_inbounds": sum(1 for ib in inbounds_list
-                             if isinstance(ib, dict) and ib.get("protocol") == "vless"),
+      # Kept for backward-compat — the UI may still read this.
+      "vless_inbounds": proto_counts["vless"],
+      "inbound_counts": proto_counts,
       "raw": uris,
       "plain": plain,
       "base64": b64,
@@ -5097,34 +6290,17 @@ def _build_router(ctx: AdminContext) -> _Router:
                       "raw_lines": len(matches)})
     return _json_response(HTTPStatus.OK, {"results": results})
 
-  def xout_sync_tokens_handler(request: _Request) -> _Response:
-    """Reconcile token presence on each requested node by reading the
-    rendered preset on disk (``/data/preset.json.resolved``). For each
-    UUID found in any vless inbound's ``users[]``, look up the matching
-    xout_tokens row and ensure an xout_node_tokens junction exists. Then
-    rebuild + cache the per-token base64 / clash subscription strings so
-    the UI's 'Get subscription content' returns instant results.
+  def _xout_sync_tokens_on_nodes(target_names: list[str]) -> list[dict[str, Any]]:
+    """Reconcile token presence + cached subscription strings on the
+    given nodes by reading ``/data/preset.json.resolved`` over SSH.
+    Shared by the manual sync-tokens endpoint and by the post-deploy
+    auto-sync hook.
 
-    Body: {nodes: [...]} (optional — defaults to all assigned nodes).
-    Returns per-node {ok, tokens_present, tokens_linked}.
-    """
-    _require_readwrite(ctx)
-    p = request.json_body() or {}
-    raw_nodes = p.get("nodes")
-    if isinstance(raw_nodes, list) and raw_nodes:
-      seen: set[str] = set()
-      target_names = []
-      for n in raw_nodes:
-        nn = _normalize_node_name(str(n))
-        if nn not in seen:
-          seen.add(nn); target_names.append(nn)
-    else:
-      assignments = ctx.database.list_xout_assignments()
-      target_names = [a["node_name"] for a in assignments]
+    For each VLESS UUID found in the resolved preset, ensures an
+    ``xout_node_tokens`` row exists and rebuilds its
+    ``base64_subscription`` / ``clash_subscription`` cache."""
     if not target_names:
-      return _json_response(HTTPStatus.OK,
-        {"results": [], "message": "no xout nodes to sync"})
-
+      return []
     tokens_by_uuid = {t["uuid"]: t for t in ctx.database.list_xout_tokens()}
     results: list[dict[str, Any]] = []
 
@@ -5134,11 +6310,23 @@ def _build_router(ctx: AdminContext) -> _Router:
         results.append({"node": nn, "ok": False, "error": "not found"})
         continue
       try:
+        # /data is mounted INSIDE the xout container (bind-mounted from
+        # /opt/xout/data on the host). Reading via host path requires
+        # the bind mount path; reading via the container is more
+        # robust. Try host path first (faster if running), then fall
+        # back to docker exec.
         cmd = (
           "set -e; "
-          "for f in /data/preset.json.resolved /data/preset.json; do "
+          "for f in /opt/xout/data/preset.json.resolved /opt/xout/data/preset.json; do "
           "  if [ -f \"$f\" ]; then cat \"$f\"; exit 0; fi; "
-          "done; echo '{}'"
+          "done; "
+          "if command -v docker >/dev/null 2>&1; then "
+          "  for f in /data/preset.json.resolved /data/preset.json; do "
+          "    if docker exec xout test -f \"$f\" 2>/dev/null; then "
+          "      docker exec xout cat \"$f\"; exit 0; fi; "
+          "  done; "
+          "fi; "
+          "echo '{}'"
         )
         rc = nodes_mod.run_command(node, cmd, timeout=30.0,
                                     linked_keys=_ssh_credentials_for_node(ctx, nn))
@@ -5208,7 +6396,219 @@ def _build_router(ctx: AdminContext) -> _Router:
       results.append({"node": nn, "ok": True,
                       "tokens_present": len(uuids_present),
                       "tokens_linked": linked})
-    return _json_response(HTTPStatus.OK, {"results": results})
+    return results
+
+  def xout_sync_tokens_handler(request: _Request) -> _Response:
+    """Public wrapper around _xout_sync_tokens_on_nodes.
+
+    Body: ``{nodes: [...]}`` (optional — defaults to all assigned nodes).
+    Returns per-node ``{ok, tokens_present, tokens_linked}``."""
+    _require_readwrite(ctx)
+    p = request.json_body() or {}
+    raw_nodes = p.get("nodes")
+    if isinstance(raw_nodes, list) and raw_nodes:
+      seen: set[str] = set()
+      target_names: list[str] = []
+      for n in raw_nodes:
+        nn = _normalize_node_name(str(n))
+        if nn not in seen:
+          seen.add(nn); target_names.append(nn)
+    else:
+      assignments = ctx.database.list_xout_assignments()
+      target_names = [a["node_name"] for a in assignments]
+    if not target_names:
+      return _json_response(HTTPStatus.OK,
+        {"results": [], "message": "no xout nodes to sync"})
+    return _json_response(HTTPStatus.OK,
+      {"results": _xout_sync_tokens_on_nodes(target_names)})
+
+  def _xout_fetch_resolved_inbounds(node_name: str) -> list[dict[str, Any]]:
+    """SSH into ``node_name`` and read ``/data/preset.json.resolved``
+    (the file written by the xout entrypoint after Reality keys are
+    auto-generated). Returns the parsed inbound list, or [] on any
+    failure.
+
+    Used by the import-from-xout-inbound flow to capture the real
+    Reality public_key for VLESS inbounds — the database-stored
+    preset has the literal ``"auto"`` placeholder, which is useless
+    for building outbound configs."""
+    node = ctx.database.get_node(node_name)
+    if node is None:
+      return []
+    cmd = (
+      "set -e; "
+      "for f in /opt/xout/data/preset.json.resolved /opt/xout/data/preset.json; do "
+      "  if [ -f \"$f\" ]; then cat \"$f\"; exit 0; fi; "
+      "done; "
+      "if command -v docker >/dev/null 2>&1; then "
+      "  for f in /data/preset.json.resolved /data/preset.json; do "
+      "    if docker exec xout test -f \"$f\" 2>/dev/null; then "
+      "      docker exec xout cat \"$f\"; exit 0; fi; "
+      "  done; "
+      "fi; "
+      "echo '[]'"
+    )
+    try:
+      rc = nodes_mod.run_command(node, cmd, timeout=30.0,
+                                  linked_keys=_ssh_credentials_for_node(ctx, node_name))
+    except Exception:  # noqa: BLE001
+      LOGGER.exception("could not fetch resolved preset from %s", node_name)
+      return []
+    raw = (rc.stdout or "").strip() or "[]"
+    try:
+      data = json.loads(raw)
+    except Exception:  # noqa: BLE001
+      LOGGER.warning("preset.json on %s is not valid JSON (%d bytes)", node_name, len(raw))
+      return []
+    if isinstance(data, list):
+      return data
+    if isinstance(data, dict):
+      return data.get("inbounds") or []
+    return []
+
+  def import_xout_inbound_to_static_ip(request: _Request) -> _Response:
+    """Capture a deployed xout-node inbound as a row in the static_ips
+    catalog. After this, the inbound shows up alongside Decodo /
+    BrightData / IPRoyal entries in the unified outbound picker — the
+    user wanted ONE registry of upstreams, not a parallel "pick another
+    xout node" dropdown.
+
+    Body: ``{node_name, inbound_tag}``. We:
+      1. Look up the node + its xout-preset assignment.
+      2. Find the named inbound in the preset.
+      3. For VLESS, SSH to the node and read the *resolved* preset
+         file so we capture the auto-generated Reality public_key.
+      4. Insert (or upsert on ip:port:proto) a static_ips row with
+         kind='xout_inbound' and the protocol-specific fields populated.
+    """
+    _require_readwrite(ctx)
+    payload = request.json_body() or {}
+    node_name = _normalize_node_name((payload.get("node_name") or "").strip())
+    tag = (payload.get("inbound_tag") or "").strip()
+    if not node_name or not tag:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "node_name and inbound_tag are required",
+                      code="invalid_args")
+    node = ctx.database.get_node(node_name)
+    if node is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"node {node_name!r} not found",
+                      code="node_not_found")
+    assignment = ctx.database.get_xout_assignment(node_name)
+    if assignment is None:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      f"node {node_name!r} has no xout preset assigned",
+                      code="no_assignment")
+    preset = ctx.database.get_xout_preset(assignment["preset_id"])
+    if preset is None:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      f"xout preset {assignment['preset_id']} is gone",
+                      code="preset_gone")
+    target_ib = next((i for i in (preset["inbounds"] or [])
+                      if i.get("tag") == tag), None)
+    if target_ib is None:
+      raise HttpError(HTTPStatus.NOT_FOUND,
+                      f"inbound tag {tag!r} not found on {node_name}",
+                      code="inbound_not_found")
+
+    proto_in = (target_ib.get("protocol") or "").lower()
+    port = target_ib.get("port")
+    if not port or not (1 <= int(port) <= 65535):
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "inbound has no usable port",
+                      code="invalid_inbound")
+
+    static_info_extra: dict[str, Any] = {}
+    username = None
+    password = None
+    storage_proto = proto_in
+
+    if proto_in == "vless":
+      # The DB-stored preset's reality.public_key is the placeholder
+      # "auto"; the real generated key only exists on the node. We
+      # have to SSH in.
+      resolved = _xout_fetch_resolved_inbounds(node_name)
+      resolved_ib = next(
+        (i for i in resolved if isinstance(i, dict) and i.get("tag") == tag),
+        None) or target_ib
+      reality = resolved_ib.get("reality") or target_ib.get("reality") or {}
+      pub = (reality.get("public_key") or reality.get("pubkey") or "").strip()
+      if not pub or pub.lower() == "auto":
+        raise HttpError(HTTPStatus.CONFLICT,
+                        "Reality public_key not yet generated on the node — "
+                        "deploy the preset first, then retry",
+                        code="reality_pubkey_missing")
+      users = resolved_ib.get("users") or target_ib.get("users") or []
+      first_uuid = ""
+      if users and isinstance(users[0], dict):
+        first_uuid = (users[0].get("uuid") or "").strip()
+      static_info_extra["vless"] = {
+        "uuid": first_uuid,
+        "sni": reality.get("sni") or "",
+        "pubkey": pub,
+        "short_id": reality.get("short_id") or "",
+        "flow": resolved_ib.get("flow") or target_ib.get("flow") or "",
+      }
+      storage_proto = "vless"
+    elif proto_in in ("socks", "socks5"):
+      auth = target_ib.get("auth") or {}
+      username = auth.get("user") or None
+      password = auth.get("pass") or None
+      storage_proto = "socks5"  # canonical
+    elif proto_in in ("http", "https"):
+      auth = target_ib.get("auth") or {}
+      username = auth.get("user") or None
+      password = auth.get("pass") or None
+      storage_proto = "http"
+    else:
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      f"protocol {proto_in!r} is not yet supported "
+                      f"as a static-ips entry (try http/socks/vless)",
+                      code="unsupported_protocol")
+
+    # Stash the back-reference so future "Re-sync" actions know which
+    # source this row came from. The frontend can also surface this.
+    # ``last_synced_vendor`` is the baseline _refresh_xout_inbound_snapshot
+    # uses to detect operator overrides — set to node_name here so the
+    # first refresh after import is a no-op for vendor.
+    static_info_extra["xout_inbound"] = {
+      "node_name": node_name,
+      "inbound_tag": tag,
+      "preset_id": int(assignment["preset_id"]),
+      "preset_name": preset.get("name") or "",
+      "last_synced_vendor": node_name,
+    }
+
+    rec = ctx.database.insert_static_ip(
+      ip=node.host,
+      port=int(port),
+      protocol=storage_proto,
+      country=None,            # let auto-geo run on the node host
+      provider=None,
+      label=f"{node_name}/{tag}",
+      notes=f"Imported from xout inbound {node_name}/{tag}",
+      static_info=static_info_extra,
+      username=username,
+      password=password,
+      auth_mode=None,
+      kind="xout_inbound",
+      # Vendor for an xout-imported row IS the source node's name.
+      # The row is treated as a live reference: future list / get
+      # calls re-resolve host / port / auth from the live xout
+      # assignment + preset (see _refresh_xout_inbound_snapshot),
+      # so this stays in sync with what's actually deployed.
+      gateway_provider=node_name,
+    )
+    # Best-effort geo on the node's host (it's a real IP, no exit_ip
+    # complication). Don't block the insert on a slow lookup.
+    try:
+      country, provider, _geo = _maybe_autofill_geo(rec.ip, rec.country, rec.provider)
+      if country or provider:
+        ctx.database.update_static_ip(rec.id,
+          {"country": country, "provider": provider})
+    except Exception:  # noqa: BLE001
+      LOGGER.exception("geo autofill for imported xout inbound failed: id=%s", rec.id)
+    fresh = ctx.database.get_static_ip(rec.id) or rec
+    return _json_response(HTTPStatus.OK, _static_ip_to_dict(fresh))
 
   def xout_node_test_handler(request: _Request) -> _Response:
     """End-to-end proxy traffic check on the actual deployed node.
@@ -5681,6 +7081,34 @@ def _build_router(ctx: AdminContext) -> _Router:
     "SSL_SERVICE_ADMIN_TOKEN",
   }
 
+  # Allowlist of keys the admin endpoint will write back to the .env.
+  # We deliberately reject unknown keys so a compromised admin token
+  # can't inject e.g. ``LD_PRELOAD`` or ``PATH`` to escalate when the
+  # operator next launches via ``start.command``. Adding a new
+  # SSL_SERVICE_* knob? Add it here too.
+  _ENV_ALLOWED_KEYS = {
+    "SSL_SERVICE_PG_DSN",
+    "SSL_SERVICE_MODE",
+    "SSL_SERVICE_ENABLE_WEB_UI",
+    "SSL_SERVICE_ADMIN_TOKEN",
+    "SSL_SERVICE_ADMIN_BIND",
+    "SSL_SERVICE_ADMIN_PORT",
+    "SSL_SERVICE_LOG_LEVEL",
+    "SSL_SERVICE_ACME_EMAIL",
+    "SSL_SERVICE_ACME_STAGING",
+    "SSL_SERVICE_ACME_DNS_PROVIDER",
+    "SSL_SERVICE_ACME_DNS_PROPAGATION_SECONDS",
+    "SSL_SERVICE_RENEW_BEFORE_DAYS",
+    "SSL_SERVICE_POLL_INTERVAL_SECONDS",
+    "SSL_SERVICE_RETRY_BACKOFF_SECONDS",
+    "SSL_SERVICE_LOOP_ERROR_BACKOFF_SECONDS",
+    "SSL_SERVICE_STATE_DIR",
+    "SSL_SERVICE_LOG_DIR",
+    "SSL_SERVICE_CONTROLLER_LOG_PATH",
+    "SSL_SERVICE_CADDY_LOG_PATH",
+    "SSL_SERVICE_CADDY_ADMIN_URL",
+  }
+
   def _env_file_path() -> Path | None:
     raw = os.environ.get("SSL_SERVICE_ENV_FILE", "").strip()
     return Path(raw).expanduser().resolve() if raw else None
@@ -5816,11 +7244,18 @@ def _build_router(ctx: AdminContext) -> _Router:
                 for it in _parse_env_file(existing_text)
                 if it["type"] == "kv"}
     rendered_entries: list[dict] = []
+    rejected_keys: list[str] = []
     for raw in raw_entries:
       if not isinstance(raw, dict):
         continue
       key = (raw.get("key") or "").strip()
       if not key:
+        continue
+      # Allowlist check — reject anything that isn't a recognised
+      # SSL_SERVICE_* knob so a compromised admin can't inject
+      # arbitrary env vars (LD_PRELOAD, PATH, PYTHONPATH, etc.).
+      if key not in _ENV_ALLOWED_KEYS:
+        rejected_keys.append(key)
         continue
       if key in _ENV_SECRET_KEYS and raw.get("value") in (None, ""):
         # Treat empty/null as "leave existing value alone" for secrets,
@@ -5829,6 +7264,12 @@ def _build_router(ctx: AdminContext) -> _Router:
           rendered_entries.append({"key": key, "value": existing[key]})
         continue
       rendered_entries.append({"key": key, "value": raw.get("value") or ""})
+    if rejected_keys:
+      raise HttpError(
+        HTTPStatus.BAD_REQUEST,
+        "rejected unknown env keys: " + ", ".join(sorted(set(rejected_keys))),
+        code="env_key_not_allowed",
+      )
     new_body = _render_env_file(rendered_entries)
     # Atomic-ish write: rename tempfile into place so a half-written
     # file is never visible to start.command.
@@ -5946,6 +7387,12 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("GET",    "/api/admin/version", with_auth(admin_version_handler))
   router.add("GET", "/api/services/{name}/nodes", with_auth(service_nodes_handler))
   router.add("POST", "/api/services/{name}/refresh", with_auth(service_refresh_handler))
+  # New Service flow — distinct path so it doesn't collide with
+  # /api/services/{name}.
+  router.add("GET", "/api/services-new/defaults", with_auth(service_new_defaults_handler))
+  router.add("POST", "/api/services-new", with_auth(service_new_handler))
+  router.add("POST", "/api/services/{name}/push-to-github",
+             with_auth(service_push_to_github_handler))
   router.add("GET", "/api/services", with_auth(services_list_handler))
   router.add("POST", "/api/services", with_auth(service_create_handler))
   router.add("GET", "/api/services/{name}", with_auth(service_get_handler))
@@ -5958,17 +7405,18 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("GET",    "/api/xout/presets/{preset_id}",     with_auth(xout_presets_get_handler))
   router.add("PATCH",  "/api/xout/presets/{preset_id}",     with_auth(xout_presets_patch_handler))
   router.add("DELETE", "/api/xout/presets/{preset_id}",     with_auth(xout_presets_delete_handler))
+  router.add("GET",    "/api/xout/presets/{preset_id}/preview",
+             with_auth(xout_presets_preview_handler))
   router.add("GET",    "/api/xout/nodes",                   with_auth(xout_nodes_list_handler))
-  router.add("POST",   "/api/xout/nodes/{node_name}/deploy", with_auth(xout_node_deploy_handler))
   router.add("GET",    "/api/xout/outbound-targets",         with_auth(xout_outbound_targets_handler))
   router.add("GET",    "/api/xout/tokens",                   with_auth(xout_tokens_list_handler))
   router.add("POST",   "/api/xout/tokens",                   with_auth(xout_tokens_create_handler))
   router.add("GET",    "/api/xout/tokens/{id}",              with_auth(xout_tokens_get_handler))
   router.add("PATCH",  "/api/xout/tokens/{id}",              with_auth(xout_tokens_patch_handler))
   router.add("DELETE", "/api/xout/tokens/{id}",              with_auth(xout_tokens_delete_handler))
-  router.add("PUT",    "/api/xout/tokens/{id}/default",      with_auth(xout_tokens_set_default_handler))
+  router.add("POST",   "/api/xout/tokens/{id}/regenerate-token-value",
+             with_auth(xout_tokens_regenerate_value_handler))
   router.add("GET",    "/api/xout/tokens/{id}/subscription", with_auth(xout_tokens_subscription_handler))
-  router.add("POST",   "/api/xout/tokens/{id}/publish",      with_auth(xout_tokens_publish_handler))
   router.add("POST",   "/api/xout/sync-traffic",             with_auth(xout_sync_traffic_handler))
   router.add("POST",   "/api/xout/sync-tokens",              with_auth(xout_sync_tokens_handler))
   router.add("GET",    "/api/xout/nodes/{name}/traffic-summary",
@@ -5985,7 +7433,15 @@ def _build_router(ctx: AdminContext) -> _Router:
   # Static IP endpoints ---------------------------------------------
   def static_ips_list_handler(request: _Request) -> _Response:
     sort = request.query_str("sort", "country") or "country"
-    return _json_response(HTTPStatus.OK, {"static_ips": list_static_ips(ctx, sort=sort)})
+    # Auto-resync xout_inbound rows from their source xout assignments
+    # before returning. Operators expect xout-imported rows to track
+    # the source live (port changes, auth rotation, preset re-assigns
+    # all flow through). Fast path — one batched DB read for nodes /
+    # assignments / presets, then per-row diff + best-effort PATCH.
+    rows = ctx.database.list_static_ips(sort=sort)
+    rows = _refresh_xout_inbound_rows(rows)
+    return _json_response(HTTPStatus.OK,
+      {"static_ips": [_static_ip_to_dict(r) for r in rows]})
 
   def static_ips_create_handler(request: _Request) -> _Response:
     return _json_response(HTTPStatus.CREATED, create_static_ip(ctx, request.json_body()))
@@ -5997,8 +7453,23 @@ def _build_router(ctx: AdminContext) -> _Router:
     return _json_response(HTTPStatus.OK, run_ip_test_all(ctx))
 
   def static_ip_get_handler(request: _Request) -> _Response:
+    # Same auto-resync logic as the list handler — single-row variant.
+    # The detail page is the highest-stakes read because the operator
+    # is reading the row to make a decision; can't afford stale auth.
+    ip_id = int(request.path_params["id"])
+    rec = ctx.database.get_static_ip(ip_id)
+    if rec is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, f"static ip not found: {ip_id}",
+                      code="ip_not_found")
+    if (rec.kind or "static") == "xout_inbound":
+      try:
+        rec = _refresh_xout_inbound_snapshot(rec)
+      except Exception:  # noqa: BLE001
+        LOGGER.exception("xout_inbound resync at GET failed for id=%s", ip_id)
+    # get_static_ip_detail() does its own get_static_ip() so it picks
+    # up the refreshed row from the DB transparently.
     return _json_response(
-      HTTPStatus.OK, get_static_ip_detail(ctx, int(request.path_params["id"]))
+      HTTPStatus.OK, get_static_ip_detail(ctx, ip_id)
     )
 
   def static_ip_patch_handler(request: _Request) -> _Response:
@@ -6024,6 +7495,67 @@ def _build_router(ctx: AdminContext) -> _Router:
       HTTPStatus.OK, run_ip_static_probe(ctx, int(request.path_params["id"]))
     )
 
+  def static_ip_speedtest_handler(request: _Request) -> _Response:
+    """POST /api/static-ips/{id}/speedtest with optional body
+    ``{include_latency, include_bandwidth, include_app_rtt}`` — all
+    default true. The unified Test modal sends these flags to skip
+    expensive components when the operator only wants latency."""
+    body = {}
+    try:
+      body = request.json_body() or {}
+    except Exception:
+      body = {}
+    return _json_response(HTTPStatus.OK, run_ip_speed_test(
+      ctx, int(request.path_params["id"]),
+      include_latency=bool(body.get("include_latency", True)),
+      include_bandwidth=bool(body.get("include_bandwidth", True)),
+      include_app_rtt=bool(body.get("include_app_rtt", True)),
+    ))
+
+  def static_ip_quality_handler(request: _Request) -> _Response:
+    """POST /api/static-ips/{id}/quality with optional body
+    ``{include_streaming}`` — default true. Lets the unified Test
+    modal skip the 16-service streaming probe (~6s) when the operator
+    only cares about geo / fraud / RDAP fields."""
+    body = {}
+    try:
+      body = request.json_body() or {}
+    except Exception:
+      body = {}
+    rec = ctx.database.get_static_ip(int(request.path_params["id"]))
+    if rec is None:
+      raise HttpError(HTTPStatus.NOT_FOUND, "static ip not found", code="ip_not_found")
+    include_streaming = bool(body.get("include_streaming", True))
+    result = static_ip_quality_mod.run_quality_report(rec, include_streaming=include_streaming)
+    try:
+      ok = bool((result.get("ip_api") or {}).get("country"))
+      ctx.database.insert_ip_test_result(
+        ip_id=rec.id, test_kind="quality",
+        success=ok, latency_ms=None, error=None, raw=result,
+      )
+    except Exception:  # noqa: BLE001
+      LOGGER.exception("failed to persist quality result for ip_id=%s", rec.id)
+    result["cached_at"] = datetime.now(UTC).isoformat()
+    try:
+      base = dict(rec.static_info or {})
+      base["quality"] = result
+      ctx.database.update_static_ip(rec.id, {"static_info": base})
+    except Exception:  # noqa: BLE001
+      LOGGER.exception("failed to cache quality into static_info for %s", rec.id)
+    return _json_response(HTTPStatus.OK, {"id": rec.id, "ip": rec.ip, "result": result})
+
+  def static_ips_lookup_geo_handler(request: _Request) -> _Response:
+    """GET /api/static-ips/lookup-geo?ip=X.X.X.X — used by the edit
+    modal so the operator can backfill country/provider for legacy
+    rows without re-running the heavier full Probe."""
+    raw_ip = ""
+    if "ip" in request.query:
+      raw_ip = (request.query["ip"][0] or "").strip()
+    if not raw_ip:
+      raise HttpError(HTTPStatus.BAD_REQUEST, "ip query param is required",
+                      code="ip_required")
+    return _json_response(HTTPStatus.OK, lookup_static_ip_geo(ctx, raw_ip))
+
   def static_ip_results_handler(request: _Request) -> _Response:
     limit = max(1, min(request.query_int("limit", 50), 500))
     return _json_response(
@@ -6048,6 +7580,113 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("GET", "/api/system-config", with_auth(system_config_list_handler))
   router.add("GET", "/api/system-config/{key}", with_auth(system_config_get_handler))
   router.add("PUT", "/api/system-config/{key}", with_auth(system_config_put_handler))
+
+  def settings_schema_handler(_req: _Request) -> _Response:
+    """Return the SETTINGS_REGISTRY data so the SPA can render every
+    Settings card from one declaration. Each entry already includes
+    field definitions + status messages — no per-card JS needed.
+    """
+    return _json_response(HTTPStatus.OK, {"cards": SETTINGS_REGISTRY})
+
+  router.add("GET", "/api/settings-schema", with_auth(settings_schema_handler))
+
+  # ---------- user-service proxy ----------
+  # Forwards admin-side requests to the user-service. The Users and
+  # Products pages in the admin UI hit /api/user-service/<sub> here;
+  # we attach the configured X-Admin-Service-Token and call the
+  # upstream. Keeping the proxy in-process means the operator never
+  # needs a separate browser session against user.develop.cc.
+
+  def _proxy_to_user_service(request: _Request, sub_path: str) -> _Response:
+    base = (ctx.database.get_system_config("user_service.base_url") or {}).get("url", "").strip()
+    token = (ctx.database.get_system_config("user_service.admin_token") or {}).get("token", "").strip()
+    if not base:
+      raise HttpError(HTTPStatus.SERVICE_UNAVAILABLE,
+                      "user_service.base_url is not configured (Settings → User Service)",
+                      code="user_service_not_configured")
+    if not token:
+      raise HttpError(HTTPStatus.SERVICE_UNAVAILABLE,
+                      "user_service.admin_token is not configured (Settings → User Service)",
+                      code="user_service_not_configured")
+    # request.query is dict[str, list[str]] — flatten back to query string.
+    import urllib.parse
+    flat: list[tuple[str, str]] = []
+    for k, vs in (request.query or {}).items():
+      for v in vs:
+        flat.append((k, v))
+    qs = urllib.parse.urlencode(flat) if flat else ""
+    upstream_path = "/api/admin/" + sub_path + (("?" + qs) if qs else "")
+    upstream_url = base.rstrip("/") + upstream_path
+    body = request.body or b""
+    headers = {
+      "X-Admin-Service-Token": token,
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+    }
+    import urllib.request, urllib.error, json as _json
+    req = urllib.request.Request(upstream_url, method=request.method,
+                                 data=body if body else None,
+                                 headers=headers)
+    try:
+      with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+        try:
+          return _json_response(resp.status, _json.loads(raw or b"null"))
+        except Exception:  # noqa: BLE001
+          return _Response(resp.status, raw,
+                           {"Content-Type": resp.headers.get("Content-Type", "application/json")})
+    except urllib.error.HTTPError as e:
+      raw = e.read()
+      try:
+        payload = _json.loads(raw or b"null")
+      except Exception:  # noqa: BLE001
+        payload = {"error": {"code": "user_service_error", "message": str(e)}}
+      return _json_response(e.code, payload)
+    except urllib.error.URLError as e:
+      raise HttpError(HTTPStatus.BAD_GATEWAY,
+                      f"user-service unreachable: {e.reason}",
+                      code="user_service_unreachable")
+
+  # Concrete per-shape registrations — the router only supports
+  # single-segment {param} captures, so we list each path explicitly.
+  # User-service proxy routes — single table.
+  # Each tuple = (METHOD, /api/user-service path, sub_path template).
+  # The sub_path may use {param} which gets populated from path_params.
+  # Adding a new endpoint = appending one tuple. No bespoke handler.
+  USER_SERVICE_PROXY_ROUTES: list[tuple[str, str, str]] = [
+    # User CRUD + admin
+    ("GET",    "/api/user-service/users",                                "users"),
+    ("POST",   "/api/user-service/users",                                "users"),
+    ("GET",    "/api/user-service/users/{user_id}",                      "users/{user_id}"),
+    ("POST",   "/api/user-service/users/{user_id}/grant",                "users/{user_id}/grant"),
+    ("POST",   "/api/user-service/users/{user_id}/revoke",               "users/{user_id}/revoke"),
+    ("POST",   "/api/user-service/users/{user_id}/admin",                "users/{user_id}/admin"),
+    ("GET",    "/api/user-service/users/{user_id}/quotas",               "users/{user_id}/quotas"),
+    ("POST",   "/api/user-service/users/{user_id}/quota",                "users/{user_id}/quota"),
+    ("DELETE", "/api/user-service/users/{user_id}/quota/{product_code}", "users/{user_id}/quota/{product_code}"),
+    # Generic products
+    ("GET",    "/api/user-service/products",                             "products"),
+    ("POST",   "/api/user-service/products",                             "products"),
+    ("PATCH",  "/api/user-service/products/{product_id}",                "products/{product_id}"),
+    # xout-flavoured product layer
+    ("GET",    "/api/user-service/xout/inbounds",                        "xout/inbounds"),
+    ("GET",    "/api/user-service/xout/products",                        "xout/products"),
+    ("POST",   "/api/user-service/xout/products",                        "xout/products"),
+    ("PATCH",  "/api/user-service/xout/products/{product_id}",           "xout/products/{product_id}"),
+    ("DELETE", "/api/user-service/xout/products/{product_id}",           "xout/products/{product_id}"),
+    # Operator maintenance
+    ("POST",   "/api/user-service/admin/auth/cleanup-tokens",            "auth/cleanup-tokens"),
+  ]
+
+  def _make_proxy_handler(sub_template: str):
+    def _h(req: _Request) -> _Response:
+      sub = sub_template.format(**req.path_params)
+      return _proxy_to_user_service(req, sub)
+    _h.__name__ = "us_proxy_" + sub_template.replace("/", "_").replace("{", "").replace("}", "")
+    return _h
+
+  for method, route_path, sub_template in USER_SERVICE_PROXY_ROUTES:
+    router.add(method, route_path, with_auth(_make_proxy_handler(sub_template)))
 
   # SSH key endpoints ------------------------------------------------
   def ssh_keys_list_handler(_request: _Request) -> _Response:
@@ -6208,12 +7847,19 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("GET", "/api/static-ips", with_auth(static_ips_list_handler))
   router.add("POST", "/api/static-ips", with_auth(static_ips_create_handler))
   router.add("POST", "/api/static-ips/parse", with_auth(static_ips_parse_handler))
+  router.add("POST", "/api/static-ips/from-xout-inbound", with_auth(import_xout_inbound_to_static_ip))
   router.add("POST", "/api/static-ips/test-all", with_auth(static_ips_test_all_handler))
+  # Order matters: the literal /lookup-geo must register BEFORE the
+  # /{id} path-param route, otherwise "lookup-geo" would be parsed as
+  # an id and rejected with 400 by int().
+  router.add("GET", "/api/static-ips/lookup-geo", with_auth(static_ips_lookup_geo_handler))
   router.add("GET", "/api/static-ips/{id}", with_auth(static_ip_get_handler))
   router.add("PATCH", "/api/static-ips/{id}", with_auth(static_ip_patch_handler))
   router.add("DELETE", "/api/static-ips/{id}", with_auth(static_ip_delete_handler))
   router.add("POST", "/api/static-ips/{id}/test", with_auth(static_ip_test_handler))
   router.add("POST", "/api/static-ips/{id}/probe", with_auth(static_ip_probe_handler))
+  router.add("POST", "/api/static-ips/{id}/speedtest", with_auth(static_ip_speedtest_handler))
+  router.add("POST", "/api/static-ips/{id}/quality", with_auth(static_ip_quality_handler))
   router.add("GET", "/api/static-ips/{id}/results", with_auth(static_ip_results_handler))
 
   return router

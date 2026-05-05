@@ -1,0 +1,1377 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>User Service</title>
+  <style>
+    :root {
+      --bg: #faf8f5;
+      --surface: #ffffff;
+      --border: #e8e4dd;
+      --text: #2a2520;
+      --muted: #8a7f73;
+      --primary: #b34a25;
+      --primary-hover: #9c3e1f;
+      --primary-bg: #fdf2ec;
+      --success: #2d7d32;
+      --error: #c62828;
+      --error-bg: #fdecea;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+                   "Microsoft YaHei", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .brand {
+      font-weight: 600;
+      font-size: 18px;
+      letter-spacing: -0.01em;
+    }
+    .brand-sub { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 6px; }
+    .lang-toggle {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .lang-toggle:hover { color: var(--text); border-color: var(--text); }
+    main {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 20px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 28px;
+      width: 100%;
+      max-width: 380px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+    }
+    .card h1 {
+      margin: 0 0 6px 0;
+      font-size: 22px;
+      font-weight: 600;
+    }
+    .card .subtitle {
+      color: var(--muted);
+      font-size: 13px;
+      margin: 0 0 20px 0;
+    }
+    .field { margin-bottom: 14px; }
+    .field label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 4px;
+      font-weight: 500;
+    }
+    .field input, .field select {
+      width: 100%;
+      padding: 9px 11px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 14px;
+      background: var(--surface);
+      color: var(--text);
+      font-family: inherit;
+    }
+    .field input:focus, .field select:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px var(--primary-bg);
+    }
+    .btn {
+      width: 100%;
+      padding: 10px 14px;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .btn-primary { background: var(--primary); color: white; }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+    .btn-ghost {
+      background: transparent;
+      color: var(--muted);
+      width: auto;
+      padding: 6px 10px;
+      font-size: 13px;
+    }
+    .btn-ghost:hover { color: var(--text); }
+    .switch-mode {
+      text-align: center;
+      margin-top: 16px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .switch-mode a { color: var(--primary); text-decoration: none; cursor: pointer; }
+    .switch-mode a:hover { text-decoration: underline; }
+    .alert {
+      border-radius: 6px;
+      padding: 9px 12px;
+      font-size: 13px;
+      margin-bottom: 14px;
+    }
+    .alert-error { background: var(--error-bg); color: var(--error); }
+    .alert-success { background: #e8f5e9; color: var(--success); }
+    .row { display: flex; gap: 12px; align-items: center; }
+    .me-card { max-width: 480px; }
+    .me-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .me-row:last-of-type { border-bottom: none; }
+    .me-label { color: var(--muted); font-size: 13px; }
+    .me-value { font-size: 14px; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 500;
+      background: var(--primary-bg);
+      color: var(--primary);
+    }
+    .pill-admin { background: #e8eef9; color: #1f4994; }
+    .subs-section {
+      margin-top: 22px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border);
+    }
+    .subs-section h2 {
+      font-size: 14px;
+      font-weight: 600;
+      margin: 0 0 10px 0;
+    }
+    .sub-item {
+      padding: 10px;
+      background: var(--bg);
+      border-radius: 6px;
+      margin-bottom: 6px;
+      font-size: 13px;
+    }
+    .empty {
+      color: var(--muted);
+      font-size: 13px;
+      font-style: italic;
+    }
+    footer {
+      text-align: center;
+      padding: 20px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <span class="brand">User Service</span>
+      <span class="brand-sub" id="brand-sub">— BitsFactor 平台账号</span>
+    </div>
+    <button class="lang-toggle" id="lang-btn">EN</button>
+  </header>
+
+  <main>
+    <!-- ============ Login form ============ -->
+    <section id="login-card" class="card hidden">
+      <h1 data-i18n="login.title">登录</h1>
+      <p class="subtitle" data-i18n="login.subtitle">登录到你的账号以访问已订阅的服务。</p>
+      <div id="login-error" class="alert alert-error hidden"></div>
+      <form id="login-form" autocomplete="on">
+        <div class="field">
+          <label data-i18n="field.email">邮箱</label>
+          <input type="email" name="email" required autocomplete="email"
+                 placeholder="you@example.com">
+        </div>
+        <div class="field">
+          <label data-i18n="field.password">密码</label>
+          <input type="password" name="password" required autocomplete="current-password"
+                 minlength="8">
+        </div>
+        <button type="submit" class="btn btn-primary" id="login-btn"
+                data-i18n="login.submit">登录</button>
+      </form>
+      <div class="switch-mode">
+        <span data-i18n="login.no_account">还没有账号?</span>
+        <a id="goto-signup" data-i18n="login.signup_link">立即注册</a>
+      </div>
+      <div class="switch-mode" style="margin-top: 6px">
+        <a id="goto-forgot" data-i18n="login.forgot_link">忘记密码?</a>
+      </div>
+      <div id="oauth-buttons-login" class="oauth-buttons" style="margin-top: 14px"></div>
+    </section>
+
+    <!-- ============ Forgot password ============ -->
+    <section id="forgot-card" class="card hidden">
+      <h1 data-i18n="forgot.title">重置密码</h1>
+      <p class="subtitle" data-i18n="forgot.subtitle">输入注册时的邮箱,我们会发送重置链接。</p>
+      <div id="forgot-success" class="alert alert-success hidden"></div>
+      <form id="forgot-form" autocomplete="on">
+        <div class="field">
+          <label data-i18n="field.email">邮箱</label>
+          <input type="email" name="email" required autocomplete="email"
+                 placeholder="you@example.com">
+        </div>
+        <button type="submit" class="btn btn-primary"
+                data-i18n="forgot.submit">发送重置链接</button>
+      </form>
+      <div class="switch-mode">
+        <a id="goto-login-from-forgot" data-i18n="forgot.back">返回登录</a>
+      </div>
+    </section>
+
+    <!-- ============ Reset password (linked from email) ============ -->
+    <section id="reset-card" class="card hidden">
+      <h1 data-i18n="reset.title">设置新密码</h1>
+      <p class="subtitle" data-i18n="reset.subtitle">输入新的密码,登录使用。</p>
+      <div id="reset-error" class="alert alert-error hidden"></div>
+      <form id="reset-form" autocomplete="on">
+        <div class="field">
+          <label data-i18n="field.password">新密码</label>
+          <input type="password" name="new_password" required minlength="8"
+                 autocomplete="new-password">
+        </div>
+        <button type="submit" class="btn btn-primary"
+                data-i18n="reset.submit">设置新密码</button>
+      </form>
+    </section>
+
+    <!-- ============ Signup form ============ -->
+    <section id="signup-card" class="card hidden">
+      <h1 data-i18n="signup.title">注册</h1>
+      <p class="subtitle" data-i18n="signup.subtitle">创建一个账号以使用 BitsFactor 平台的所有服务。</p>
+      <div id="signup-error" class="alert alert-error hidden"></div>
+      <form id="signup-form" autocomplete="on">
+        <div class="field">
+          <label data-i18n="field.email">邮箱</label>
+          <input type="email" name="email" required autocomplete="email"
+                 placeholder="you@example.com">
+        </div>
+        <div class="field">
+          <label data-i18n="field.password">密码 <span class="brand-sub" data-i18n="signup.pw_hint">(至少 8 位)</span></label>
+          <input type="password" name="password" required autocomplete="new-password"
+                 minlength="8">
+        </div>
+        <button type="submit" class="btn btn-primary" id="signup-btn"
+                data-i18n="signup.submit">创建账号</button>
+      </form>
+      <div class="switch-mode">
+        <span data-i18n="signup.has_account">已有账号?</span>
+        <a id="goto-login" data-i18n="signup.login_link">前往登录</a>
+      </div>
+      <div id="oauth-buttons-signup" class="oauth-buttons" style="margin-top: 14px"></div>
+    </section>
+
+    <!-- ============ Account / "Me" view ============ -->
+    <section id="me-card" class="card me-card hidden">
+      <h1 data-i18n="me.title">我的账号</h1>
+      <p class="subtitle" data-i18n="me.subtitle">账号详情和已订阅服务。</p>
+      <div id="me-success" class="alert alert-success hidden"></div>
+      <div id="verify-banner" class="alert alert-warn hidden" style="background: #fdf2ec; color: #b34a25"></div>
+      <div class="me-row">
+        <span class="me-label" data-i18n="field.email">邮箱</span>
+        <span class="me-value" id="me-email">—</span>
+      </div>
+      <div class="me-row">
+        <span class="me-label" data-i18n="me.display_name">显示名</span>
+        <span class="me-value" id="me-name">—</span>
+      </div>
+      <div class="me-row">
+        <span class="me-label" data-i18n="me.locale">语言</span>
+        <select class="me-value" id="me-locale" style="width: auto; padding: 4px 8px;">
+          <option value="zh-CN">zh-CN</option>
+          <option value="en-US">en-US</option>
+        </select>
+      </div>
+      <div class="me-row">
+        <span class="me-label" data-i18n="me.role">角色</span>
+        <span id="me-role">—</span>
+      </div>
+      <div class="me-row">
+        <span class="me-label" data-i18n="me.user_id">用户 ID</span>
+        <span class="me-value" id="me-id" style="font-size: 11px;">—</span>
+      </div>
+
+      <div class="subs-section">
+        <h2 data-i18n="me.subs">已订阅服务</h2>
+        <div id="me-subs"></div>
+      </div>
+
+      <div class="subs-section">
+        <h2 data-i18n="me.usage">本期用量</h2>
+        <div id="me-quotas"></div>
+      </div>
+
+      <div class="subs-section" id="xout-section" hidden>
+        <h2 data-i18n="me.xout">Xout 服务</h2>
+        <div id="me-xout"></div>
+      </div>
+
+      <div class="subs-section">
+        <h2 data-i18n="me.catalog">服务目录</h2>
+        <div id="me-catalog"></div>
+      </div>
+
+      <div class="subs-section">
+        <h2 data-i18n="me.oauth_links">第三方登录</h2>
+        <div id="me-oauth"></div>
+      </div>
+
+      <div class="subs-section">
+        <h2 data-i18n="me.sessions">活跃会话</h2>
+        <div id="me-sessions"></div>
+      </div>
+
+      <div class="row" style="margin-top: 20px; justify-content: space-between;">
+        <button class="btn btn-ghost" id="logout-btn" data-i18n="me.logout">退出登录</button>
+        <button class="btn btn-primary" id="save-btn" style="width: auto"
+                data-i18n="me.save">保存修改</button>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span id="footer-text">user.develop.cc · v1</span>
+  </footer>
+
+<script>
+(() => {
+  // ----- i18n catalog -----
+  const I18N = {
+    "zh-CN": {
+      "brand.sub": "— BitsFactor 平台账号",
+      "login.title": "登录",
+      "login.subtitle": "登录到你的账号以访问已订阅的服务。",
+      "login.submit": "登录",
+      "login.no_account": "还没有账号?",
+      "login.signup_link": "立即注册",
+      "signup.title": "注册",
+      "signup.subtitle": "创建一个账号以使用 BitsFactor 平台的所有服务。",
+      "signup.submit": "创建账号",
+      "signup.has_account": "已有账号?",
+      "signup.login_link": "前往登录",
+      "signup.pw_hint": "(至少 8 位)",
+      "field.email": "邮箱",
+      "field.password": "密码",
+      "me.title": "我的账号",
+      "me.subtitle": "账号详情和已订阅服务。",
+      "me.display_name": "显示名",
+      "me.locale": "语言",
+      "me.role": "角色",
+      "me.user_id": "用户 ID",
+      "me.subs": "已订阅服务",
+      "me.logout": "退出登录",
+      "me.save": "保存修改",
+      "me.empty_subs": "暂无订阅。",
+      "me.empty_name": "(未设置)",
+      "me.role_admin": "管理员",
+      "me.role_user": "普通用户",
+      "me.saved": "已保存",
+      "me.expires": "到期",
+      "me.usage": "本期用量",
+      "me.empty_quotas": "暂无配额限制。",
+      "me.no_limit": "无上限",
+      "me.period_from": "本期始于",
+      "me.xout": "Xout 服务",
+      "me.xout_node": "节点",
+      "me.xout_uuid": "VLESS UUID",
+      "me.xout_provisioned": "下发时间",
+      "me.xout_no_nodes": "暂未在任何节点下发。",
+      "me.xout_token": "订阅 token",
+      "me.copy": "复制",
+      "me.copied": "已复制",
+      "me.show_qr": "显示二维码",
+      "me.hide_qr": "隐藏二维码",
+      "me.xout_inbounds_count": "条线路",
+      "me.xout_show_inbounds": "查看线路列表",
+      "me.catalog": "服务目录",
+      "me.catalog_empty": "暂无可用服务。",
+      "me.buy": "购买",
+      "me.subscribed": "已订阅",
+      "me.free": "免费",
+      "me.oauth_links": "第三方登录",
+      "me.oauth_link_google": "关联 Google",
+      "me.oauth_unlink": "解绑",
+      "me.oauth_none": "暂未关联第三方账号。",
+      "auth.signin_google": "使用 Google 登录",
+      "login.forgot_link": "忘记密码?",
+      "forgot.title": "重置密码",
+      "forgot.subtitle": "输入注册时的邮箱,我们会发送重置链接。",
+      "forgot.submit": "发送重置链接",
+      "forgot.back": "返回登录",
+      "forgot.sent": "如该邮箱已注册,我们已发送重置链接。请检查邮箱。",
+      "reset.title": "设置新密码",
+      "reset.subtitle": "输入新的密码,登录使用。",
+      "reset.submit": "设置新密码",
+      "reset.done": "密码已更新,请重新登录。",
+      "verify.banner": "你的邮箱还没验证。",
+      "verify.resend": "重新发送验证邮件",
+      "verify.sent": "验证邮件已发送,请检查收件箱。",
+      "verify.success": "邮箱已验证!",
+      "me.sessions": "活跃会话",
+      "me.session_current": "当前会话",
+      "me.session_revoke": "终止",
+      "me.session_revoke_all": "终止其他所有会话",
+      "me.session_no_others": "暂无其他活跃会话。",
+      "me.session_last_used": "最近活动",
+      "err.network": "网络错误,请重试。",
+      "err.unknown": "未知错误。",
+    },
+    "en-US": {
+      "brand.sub": "— BitsFactor platform account",
+      "login.title": "Sign in",
+      "login.subtitle": "Sign in to access services you've subscribed to.",
+      "login.submit": "Sign in",
+      "login.no_account": "Don't have an account?",
+      "login.signup_link": "Create one",
+      "signup.title": "Sign up",
+      "signup.subtitle": "Create an account to use any service on the BitsFactor platform.",
+      "signup.submit": "Create account",
+      "signup.has_account": "Already have an account?",
+      "signup.login_link": "Sign in",
+      "signup.pw_hint": "(at least 8 chars)",
+      "field.email": "Email",
+      "field.password": "Password",
+      "me.title": "My account",
+      "me.subtitle": "Account details and active subscriptions.",
+      "me.display_name": "Display name",
+      "me.locale": "Locale",
+      "me.role": "Role",
+      "me.user_id": "User ID",
+      "me.subs": "Active subscriptions",
+      "me.logout": "Sign out",
+      "me.save": "Save",
+      "me.empty_subs": "No subscriptions yet.",
+      "me.empty_name": "(not set)",
+      "me.role_admin": "Admin",
+      "me.role_user": "User",
+      "me.saved": "Saved",
+      "me.expires": "expires",
+      "me.usage": "Current period usage",
+      "me.empty_quotas": "No quota limits configured.",
+      "me.no_limit": "no limit",
+      "me.period_from": "Period from",
+      "me.xout": "Xout proxy",
+      "me.xout_node": "Node",
+      "me.xout_uuid": "VLESS UUID",
+      "me.xout_provisioned": "Provisioned",
+      "me.xout_no_nodes": "Not yet provisioned on any node.",
+      "me.xout_token": "Subscription token",
+      "me.copy": "Copy",
+      "me.copied": "Copied",
+      "me.show_qr": "Show QR code",
+      "me.hide_qr": "Hide QR code",
+      "me.xout_inbounds_count": "endpoints",
+      "me.xout_show_inbounds": "Show endpoint list",
+      "me.catalog": "Service catalog",
+      "me.catalog_empty": "No products available right now.",
+      "me.buy": "Buy",
+      "me.subscribed": "Subscribed",
+      "me.free": "free",
+      "me.oauth_links": "Linked accounts",
+      "me.oauth_link_google": "Link Google",
+      "me.oauth_unlink": "Unlink",
+      "me.oauth_none": "No third-party accounts linked yet.",
+      "auth.signin_google": "Sign in with Google",
+      "login.forgot_link": "Forgot password?",
+      "forgot.title": "Reset password",
+      "forgot.subtitle": "Enter the email you signed up with — we'll send a reset link.",
+      "forgot.submit": "Send reset link",
+      "forgot.back": "Back to sign in",
+      "forgot.sent": "If that email is registered, a reset link has been sent.",
+      "reset.title": "Set new password",
+      "reset.subtitle": "Choose a new password to log in with.",
+      "reset.submit": "Set new password",
+      "reset.done": "Password updated. Please sign in.",
+      "verify.banner": "Your email isn't verified yet.",
+      "verify.resend": "Resend verification email",
+      "verify.sent": "Verification email sent — check your inbox.",
+      "verify.success": "Email verified!",
+      "me.sessions": "Active sessions",
+      "me.session_current": "Current session",
+      "me.session_revoke": "Revoke",
+      "me.session_revoke_all": "Revoke all other sessions",
+      "me.session_no_others": "No other active sessions.",
+      "me.session_last_used": "Last activity",
+      "err.network": "Network error. Please try again.",
+      "err.unknown": "Something went wrong.",
+    },
+  };
+
+  // ----- Locale state -----
+  // Resolution order: localStorage > <html lang> > navigator.language > zh-CN
+  let LOCALE = (() => {
+    const saved = localStorage.getItem("user_service.locale");
+    if (saved && I18N[saved]) return saved;
+    const nav = (navigator.language || "").toLowerCase();
+    if (nav.startsWith("zh")) return "zh-CN";
+    if (nav.startsWith("en")) return "en-US";
+    return "zh-CN";
+  })();
+
+  function t(key) { return (I18N[LOCALE] || I18N["zh-CN"])[key] || key; }
+
+  function applyLocale() {
+    document.documentElement.lang = LOCALE;
+    document.querySelectorAll("[data-i18n]").forEach((el) => {
+      el.textContent = t(el.dataset.i18n);
+    });
+    document.getElementById("brand-sub").textContent = t("brand.sub");
+    document.getElementById("lang-btn").textContent = LOCALE === "zh-CN" ? "EN" : "中";
+  }
+
+  document.getElementById("lang-btn").addEventListener("click", () => {
+    LOCALE = LOCALE === "zh-CN" ? "en-US" : "zh-CN";
+    localStorage.setItem("user_service.locale", LOCALE);
+    applyLocale();
+  });
+
+  // ----- API helpers -----
+  async function api(method, path, body) {
+    const opts = {
+      method,
+      credentials: "include",
+      headers: { "Accept-Language": LOCALE },
+    };
+    if (body !== undefined) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
+    let resp;
+    try {
+      resp = await fetch(path, opts);
+    } catch (err) {
+      throw { detail: t("err.network") };
+    }
+    if (!resp.ok) {
+      let payload;
+      try { payload = await resp.json(); } catch (_) { payload = {}; }
+      const msg = (typeof payload.detail === "string" && payload.detail)
+                  || (payload.detail && payload.detail[0] && payload.detail[0].msg)
+                  || t("err.unknown");
+      throw { status: resp.status, detail: msg, raw: payload };
+    }
+    if (resp.status === 204) return null;
+    return resp.json();
+  }
+
+  // ----- View routing -----
+  const cards = {
+    login:  document.getElementById("login-card"),
+    signup: document.getElementById("signup-card"),
+    me:     document.getElementById("me-card"),
+    forgot: document.getElementById("forgot-card"),
+    reset:  document.getElementById("reset-card"),
+  };
+
+  function show(name) {
+    for (const [k, el] of Object.entries(cards)) el.classList.toggle("hidden", k !== name);
+    // Reset error/success banners on view switch.
+    for (const id of ["login-error", "signup-error", "me-success"]) {
+      const el = document.getElementById(id);
+      if (el) el.classList.add("hidden");
+    }
+  }
+
+  function showError(id, msg) {
+    const el = document.getElementById(id);
+    el.textContent = msg;
+    el.classList.remove("hidden");
+  }
+
+  // ----- Login -----
+  document.getElementById("login-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const btn = document.getElementById("login-btn");
+    btn.disabled = true;
+    try {
+      await api("POST", "/api/auth/login", {
+        email: fd.get("email").trim(),
+        password: fd.get("password"),
+      });
+      e.target.reset();
+      await loadMe();
+    } catch (err) {
+      showError("login-error", err.detail || t("err.unknown"));
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // ----- Signup -----
+  document.getElementById("signup-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const btn = document.getElementById("signup-btn");
+    btn.disabled = true;
+    try {
+      await api("POST", "/api/auth/signup", {
+        email: fd.get("email").trim(),
+        password: fd.get("password"),
+        locale: LOCALE,
+      });
+      e.target.reset();
+      await loadMe();
+    } catch (err) {
+      showError("signup-error", err.detail || t("err.unknown"));
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  document.getElementById("goto-signup").addEventListener("click", () => show("signup"));
+  document.getElementById("goto-login").addEventListener("click",  () => show("login"));
+  document.getElementById("goto-forgot").addEventListener("click", () => show("forgot"));
+  document.getElementById("goto-login-from-forgot").addEventListener("click", () => show("login"));
+
+  // ----- Forgot password -----
+  document.getElementById("forgot-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api("POST", "/api/auth/forgot-password", { email: fd.get("email").trim() });
+      const ok = document.getElementById("forgot-success");
+      ok.textContent = t("forgot.sent");
+      ok.classList.remove("hidden");
+      e.target.reset();
+    } catch (err) {
+      // Endpoint always returns 200, but network error possible.
+      alert(err.detail || t("err.unknown"));
+    }
+  });
+
+  // ----- Reset password -----
+  document.getElementById("reset-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const token = (window.__resetToken || "").trim();
+    if (!token) { show("login"); return; }
+    try {
+      await api("POST", "/api/auth/reset-password",
+                  { token, new_password: fd.get("new_password") });
+      alert(t("reset.done"));
+      window.history.replaceState({}, "", "/");
+      window.__resetToken = "";
+      show("login");
+    } catch (err) {
+      const e2 = document.getElementById("reset-error");
+      e2.textContent = err.detail || t("err.unknown");
+      e2.classList.remove("hidden");
+    }
+  });
+
+  // ----- Logout -----
+  document.getElementById("logout-btn").addEventListener("click", async () => {
+    try { await api("POST", "/api/auth/logout"); } catch (_) {}
+    // Wipe rendered DOM before showing the login form so the next
+    // user (or a quick-glance bystander) doesn't see the previous
+    // user's email / quotas / xout config.
+    for (const id of ["me-subs", "me-quotas", "me-xout"]) {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = "";
+    }
+    document.getElementById("xout-section").hidden = true;
+    show("login");
+  });
+
+  // ----- Save (locale) -----
+  document.getElementById("save-btn").addEventListener("click", async () => {
+    const newLocale = document.getElementById("me-locale").value;
+    try {
+      const r = await api("PATCH", "/api/me", { locale: newLocale });
+      // Sync the UI to the user's stored preference too.
+      LOCALE = newLocale;
+      localStorage.setItem("user_service.locale", LOCALE);
+      applyLocale();
+      const ok = document.getElementById("me-success");
+      ok.textContent = t("me.saved");
+      ok.classList.remove("hidden");
+      renderMe(r.user, null);
+    } catch (err) {
+      alert(err.detail || t("err.unknown"));
+    }
+  });
+
+  // ----- "Me" rendering -----
+  function renderMe(user, subs) {
+    document.getElementById("me-email").textContent = user.email || "—";
+    document.getElementById("me-name").textContent  = user.display_name || t("me.empty_name");
+    document.getElementById("me-locale").value      = user.locale || "zh-CN";
+    document.getElementById("me-id").textContent    = user.id;
+    const roleEl = document.getElementById("me-role");
+    roleEl.innerHTML = "";
+    const pill = document.createElement("span");
+    pill.className = "pill" + (user.is_admin ? " pill-admin" : "");
+    pill.textContent = user.is_admin ? t("me.role_admin") : t("me.role_user");
+    roleEl.appendChild(pill);
+
+    if (subs !== null) {
+      const wrap = document.getElementById("me-subs");
+      wrap.innerHTML = "";
+      if (!subs || subs.length === 0) {
+        const e = document.createElement("div");
+        e.className = "empty";
+        e.textContent = t("me.empty_subs");
+        wrap.appendChild(e);
+      } else {
+        for (const s of subs) {
+          const item = document.createElement("div");
+          item.className = "sub-item";
+          const code = document.createElement("strong");
+          code.textContent = s.product_code;
+          item.appendChild(code);
+          // product_name comes from products.name JSONB (locale-keyed).
+          // Pick the user's locale, fall back to zh-CN, then drop the
+          // span entirely — never render the raw object.
+          const localized = (s.product_name && typeof s.product_name === "object")
+            ? (s.product_name[LOCALE] || s.product_name["zh-CN"] || s.product_name["en-US"])
+            : (typeof s.product_name === "string" ? s.product_name : null);
+          if (localized) {
+            const sep = document.createElement("span");
+            sep.style.color = "var(--muted)";
+            sep.textContent = " · " + localized;
+            item.appendChild(sep);
+          }
+          if (s.expires_at) {
+            const exp = document.createElement("div");
+            exp.style.color = "var(--muted)";
+            exp.style.fontSize = "11px";
+            exp.style.marginTop = "4px";
+            const d = new Date(s.expires_at);
+            exp.textContent = t("me.expires") + ": " + d.toLocaleString(LOCALE);
+            item.appendChild(exp);
+          }
+          wrap.appendChild(item);
+        }
+      }
+    }
+  }
+
+  function renderQuotas(quotas) {
+    const wrap = document.getElementById("me-quotas");
+    wrap.innerHTML = "";
+    if (!quotas || quotas.length === 0) {
+      const e = document.createElement("div");
+      e.className = "empty";
+      e.textContent = t("me.empty_quotas");
+      wrap.appendChild(e);
+      return;
+    }
+    for (const q of quotas) {
+      const item = document.createElement("div");
+      item.className = "sub-item";
+
+      const head = document.createElement("div");
+      head.style.display = "flex";
+      head.style.justifyContent = "space-between";
+      head.style.fontSize = "13px";
+      const left = document.createElement("strong");
+      // Same localization treatment as subscriptions — product_name is
+      // JSONB keyed by locale; fall back to product_code.
+      let label = q.product_code;
+      if (q.product_name && typeof q.product_name === "object") {
+        label = q.product_name[LOCALE] || q.product_name["zh-CN"]
+                || q.product_name["en-US"] || q.product_code;
+      }
+      left.textContent = label;
+      head.appendChild(left);
+      const right = document.createElement("span");
+      right.style.fontFamily = "ui-monospace, monospace";
+      const consumed = Number(q.current_period_consumed || 0).toFixed(2);
+      const limit = (q.limit_qty && Number(q.limit_qty) > 0)
+                    ? Number(q.limit_qty).toFixed(0)
+                    : t("me.no_limit");
+      right.textContent = consumed + " / " + limit;
+      head.appendChild(right);
+      item.appendChild(head);
+
+      // Progress bar — only when there's a real limit (limit > 0).
+      if (q.limit_qty && Number(q.limit_qty) > 0) {
+        const pct = Math.min(100, 100 * Number(q.current_period_consumed || 0) / Number(q.limit_qty));
+        const bar = document.createElement("div");
+        bar.style.height = "4px";
+        bar.style.background = "var(--border)";
+        bar.style.borderRadius = "2px";
+        bar.style.marginTop = "6px";
+        bar.style.overflow = "hidden";
+        const fill = document.createElement("div");
+        fill.style.height = "100%";
+        fill.style.width = pct + "%";
+        fill.style.background = pct > 90 ? "var(--error)" : "var(--primary)";
+        fill.style.transition = "width 0.3s";
+        bar.appendChild(fill);
+        item.appendChild(bar);
+      }
+
+      if (q.current_period_start) {
+        const sub = document.createElement("div");
+        sub.style.color = "var(--muted)";
+        sub.style.fontSize = "11px";
+        sub.style.marginTop = "4px";
+        // Format in UTC so the server's "1st of the month" boundary
+        // doesn't shift to the previous day for users in TZ < UTC
+        // (and likewise to the next day for TZ > UTC).
+        sub.textContent = t("me.period_from") + " " +
+          new Date(q.current_period_start).toLocaleDateString(LOCALE,
+                                                                { timeZone: "UTC" }) +
+          " · " + (q.reset_kind || "");
+        item.appendChild(sub);
+      }
+      wrap.appendChild(item);
+    }
+  }
+
+  function renderXout(xout) {
+    const section = document.getElementById("xout-section");
+    const wrap = document.getElementById("me-xout");
+    if (!xout || (xout.subscriptions || []).length === 0) {
+      section.hidden = true;
+      wrap.innerHTML = "";
+      return;
+    }
+    section.hidden = false;
+    wrap.innerHTML = "";
+
+    // Render one card per active xout subscription. Each card shows
+    // the subscription URL with a copy button + a QR code (rendered
+    // inline as SVG, no external dep).
+    for (const sub of (xout.subscriptions || [])) {
+      const card = document.createElement("div");
+      card.className = "sub-item";
+      card.style.padding = "14px";
+
+      // Header: product name + uri count
+      const head = document.createElement("div");
+      head.style.display = "flex";
+      head.style.justifyContent = "space-between";
+      head.style.alignItems = "baseline";
+      const name = document.createElement("strong");
+      name.textContent = (sub.product_name && sub.product_name[LOCALE])
+                         || (sub.product_name && sub.product_name["zh-CN"])
+                         || sub.product_code;
+      head.appendChild(name);
+      const meta = document.createElement("span");
+      meta.style.color = "var(--muted)";
+      meta.style.fontSize = "11px";
+      meta.textContent = sub.uri_count + " " + t("me.xout_inbounds_count");
+      head.appendChild(meta);
+      card.appendChild(head);
+
+      // Subscription URL block: label + copy + QR
+      if (sub.subscription_url) {
+        const urlRow = document.createElement("div");
+        urlRow.style.marginTop = "10px";
+        urlRow.style.padding = "8px 10px";
+        urlRow.style.background = "var(--bg)";
+        urlRow.style.borderRadius = "5px";
+        urlRow.style.display = "flex";
+        urlRow.style.gap = "8px";
+        urlRow.style.alignItems = "center";
+        const urlInput = document.createElement("input");
+        urlInput.type = "text";
+        urlInput.readOnly = true;
+        urlInput.value = sub.subscription_url;
+        urlInput.style.flex = "1";
+        urlInput.style.fontSize = "11px";
+        urlInput.style.fontFamily = "ui-monospace, monospace";
+        urlInput.style.background = "transparent";
+        urlInput.style.border = "none";
+        urlInput.style.color = "var(--text)";
+        urlInput.addEventListener("focus", () => urlInput.select());
+        urlRow.appendChild(urlInput);
+        const copyBtn = document.createElement("button");
+        copyBtn.className = "btn btn-ghost";
+        copyBtn.style.padding = "4px 10px";
+        copyBtn.textContent = t("me.copy");
+        copyBtn.addEventListener("click", () => {
+          navigator.clipboard.writeText(sub.subscription_url);
+          copyBtn.textContent = t("me.copied");
+          setTimeout(() => { copyBtn.textContent = t("me.copy"); }, 1200);
+        });
+        urlRow.appendChild(copyBtn);
+        card.appendChild(urlRow);
+
+        // QR code (collapsible — shown on toggle).
+        const qrWrap = document.createElement("div");
+        qrWrap.style.marginTop = "10px";
+        qrWrap.style.textAlign = "center";
+        const qrToggle = document.createElement("a");
+        qrToggle.href = "#";
+        qrToggle.textContent = t("me.show_qr");
+        qrToggle.style.fontSize = "12px";
+        qrToggle.style.color = "var(--primary)";
+        qrToggle.style.textDecoration = "none";
+        let qrShown = false;
+        qrToggle.addEventListener("click", (e) => {
+          e.preventDefault();
+          qrShown = !qrShown;
+          if (qrShown) {
+            qrWrap.innerHTML = "";
+            const svg = renderQRCodeSVG(sub.subscription_url, 196);
+            qrWrap.appendChild(svg);
+            const hide = document.createElement("a");
+            hide.href = "#"; hide.textContent = t("me.hide_qr");
+            hide.style.display = "block"; hide.style.marginTop = "6px";
+            hide.style.fontSize = "12px"; hide.style.color = "var(--muted)";
+            hide.addEventListener("click", (ev) => { ev.preventDefault(); qrShown = false; qrWrap.innerHTML = ""; qrWrap.appendChild(qrToggle); });
+            qrWrap.appendChild(hide);
+          } else {
+            qrWrap.innerHTML = "";
+            qrWrap.appendChild(qrToggle);
+          }
+        });
+        qrWrap.appendChild(qrToggle);
+        card.appendChild(qrWrap);
+      }
+
+      // Inbound list: collapsible.
+      const inbounds = sub.inbounds || [];
+      if (inbounds.length > 0) {
+        const ibBlock = document.createElement("div");
+        ibBlock.style.marginTop = "10px";
+        ibBlock.style.fontSize = "11px";
+        ibBlock.style.color = "var(--muted)";
+        const summary = document.createElement("div");
+        summary.style.cursor = "pointer";
+        summary.textContent = "▸ " + t("me.xout_show_inbounds") + " (" + inbounds.length + ")";
+        const detail = document.createElement("div");
+        detail.style.display = "none";
+        detail.style.marginTop = "6px";
+        for (const ib of inbounds) {
+          const row = document.createElement("div");
+          row.style.display = "flex";
+          row.style.justifyContent = "space-between";
+          row.style.padding = "2px 0";
+          const left = document.createElement("span");
+          left.textContent = (ib.node_name || "") + " · " + (ib.tag || "");
+          const right = document.createElement("span");
+          right.style.fontFamily = "ui-monospace, monospace";
+          right.textContent = (ib.node_host || "") + ":" + (ib.port || "?");
+          row.appendChild(left);
+          row.appendChild(right);
+          detail.appendChild(row);
+        }
+        summary.addEventListener("click", () => {
+          const open = detail.style.display === "block";
+          detail.style.display = open ? "none" : "block";
+          summary.textContent = (open ? "▸ " : "▾ ") + t("me.xout_show_inbounds") + " (" + inbounds.length + ")";
+        });
+        ibBlock.appendChild(summary);
+        ibBlock.appendChild(detail);
+        card.appendChild(ibBlock);
+      }
+
+      wrap.appendChild(card);
+    }
+  }
+
+  // QR code — server-rendered SVG via /sub-qr/{token}.svg. Avoiding a
+  // client-side QR encoder keeps the page small and dependency-free.
+  function renderQRCodeSVG(text, size) {
+    // Extract the token from the URL — the QR endpoint renders the
+    // same string we'd encode here.
+    const m = /\/sub\/([^?]+)/.exec(text);
+    const img = document.createElement("img");
+    img.alt = "subscription QR code";
+    img.style.width = size + "px";
+    img.style.height = size + "px";
+    img.style.background = "#fff";
+    img.style.padding = "8px";
+    img.style.borderRadius = "6px";
+    if (m && m[1]) {
+      img.src = "/sub-qr/" + m[1] + ".svg?size=" + size;
+    } else {
+      // Fallback: shouldn't happen, but render a placeholder.
+      img.alt = text;
+    }
+    return img;
+  }
+
+  // ----- Initial load -----
+  async function loadCatalog(currentSubs) {
+    const wrap = document.getElementById("me-catalog");
+    wrap.innerHTML = "";
+    try {
+      const r = await api("GET", "/api/products");
+      const products = r.products || [];
+      if (products.length === 0) {
+        const e = document.createElement("div");
+        e.className = "empty";
+        e.textContent = t("me.catalog_empty");
+        wrap.appendChild(e);
+        return;
+      }
+      const subscribedCodes = new Set((currentSubs || []).map((s) => s.product_code));
+      for (const p of products) {
+        const item = document.createElement("div");
+        item.className = "sub-item";
+        item.style.display = "flex";
+        item.style.justifyContent = "space-between";
+        item.style.alignItems = "center";
+        const left = document.createElement("div");
+        const name = document.createElement("strong");
+        name.textContent = p.name || p.code;
+        left.appendChild(name);
+        const meta = document.createElement("div");
+        meta.style.color = "var(--muted)";
+        meta.style.fontSize = "12px";
+        meta.style.marginTop = "2px";
+        const priceLbl = (p.price_cents > 0)
+          ? `${(p.price_cents / 100).toFixed(2)} ${p.currency || "USD"}`
+          : t("me.free");
+        const periodLbl = (p.kind === "period" && p.period_days) ? ` · ${p.period_days}d` : "";
+        meta.textContent = `${p.code} · ${priceLbl}${periodLbl}`;
+        left.appendChild(meta);
+        if (p.description) {
+          const desc = document.createElement("div");
+          desc.style.color = "var(--muted)";
+          desc.style.fontSize = "11px";
+          desc.style.marginTop = "2px";
+          desc.textContent = p.description;
+          left.appendChild(desc);
+        }
+        item.appendChild(left);
+        const right = document.createElement("div");
+        if (subscribedCodes.has(p.code)) {
+          const pill = document.createElement("span");
+          pill.className = "pill pill-ok";
+          pill.textContent = t("me.subscribed");
+          right.appendChild(pill);
+        } else if (p.price_cents > 0) {
+          const buy = document.createElement("button");
+          buy.className = "btn btn-primary";
+          buy.style.padding = "6px 14px";
+          buy.style.width = "auto";
+          buy.textContent = t("me.buy");
+          buy.addEventListener("click", async () => {
+            buy.disabled = true;
+            try {
+              const r = await api("POST", "/api/checkout/create-session",
+                                    { product_code: p.code });
+              if (r.url) window.location.href = r.url;
+            } catch (err) {
+              alert(err.detail || t("err.unknown"));
+            } finally { buy.disabled = false; }
+          });
+          right.appendChild(buy);
+        } else {
+          const muted = document.createElement("span");
+          muted.style.color = "var(--muted)";
+          muted.style.fontSize = "12px";
+          muted.textContent = t("me.free");
+          right.appendChild(muted);
+        }
+        item.appendChild(right);
+        wrap.appendChild(item);
+      }
+    } catch (err) {
+      const e = document.createElement("div");
+      e.className = "empty";
+      e.textContent = err.detail || String(err);
+      wrap.appendChild(e);
+    }
+  }
+
+  async function loadSessions() {
+    const wrap = document.getElementById("me-sessions");
+    wrap.innerHTML = "";
+    try {
+      const r = await api("GET", "/api/me/sessions");
+      const sessions = r.sessions || [];
+      const others = sessions.filter((s) => !s.current);
+      // Show current first, then others.
+      const sorted = [...sessions.filter((s) => s.current), ...others];
+      for (const s of sorted) {
+        const item = document.createElement("div");
+        item.className = "sub-item";
+        item.style.display = "flex";
+        item.style.justifyContent = "space-between";
+        item.style.alignItems = "center";
+        const left = document.createElement("div");
+        const head = document.createElement("strong");
+        head.textContent = s.current ? "★ " + t("me.session_current") : (s.ip || "—");
+        left.appendChild(head);
+        const ua = document.createElement("div");
+        ua.style.color = "var(--muted)";
+        ua.style.fontSize = "11px";
+        ua.style.marginTop = "2px";
+        ua.style.maxWidth = "320px";
+        ua.style.overflow = "hidden";
+        ua.style.textOverflow = "ellipsis";
+        ua.style.whiteSpace = "nowrap";
+        ua.textContent = (s.user_agent || "—");
+        left.appendChild(ua);
+        const last = document.createElement("div");
+        last.style.color = "var(--muted)";
+        last.style.fontSize = "11px";
+        last.textContent = t("me.session_last_used") + ": " +
+          new Date(s.last_used_at).toLocaleString(LOCALE);
+        left.appendChild(last);
+        item.appendChild(left);
+        if (!s.current) {
+          const btn = document.createElement("button");
+          btn.className = "btn btn-ghost";
+          btn.textContent = t("me.session_revoke");
+          btn.addEventListener("click", async () => {
+            try {
+              await api("DELETE", `/api/me/sessions/${s.id}`);
+              loadSessions();
+            } catch (err) { alert(err.detail || t("err.unknown")); }
+          });
+          item.appendChild(btn);
+        }
+        wrap.appendChild(item);
+      }
+      if (others.length > 0) {
+        const all = document.createElement("button");
+        all.className = "btn btn-ghost";
+        all.style.marginTop = "8px";
+        all.textContent = t("me.session_revoke_all");
+        all.addEventListener("click", async () => {
+          if (!confirm(t("me.session_revoke_all") + "?")) return;
+          try {
+            await api("DELETE", "/api/me/sessions");
+            loadSessions();
+          } catch (err) { alert(err.detail || t("err.unknown")); }
+        });
+        wrap.appendChild(all);
+      } else if (sessions.length === 1) {
+        const e = document.createElement("div");
+        e.className = "empty";
+        e.style.marginTop = "8px";
+        e.textContent = t("me.session_no_others");
+        wrap.appendChild(e);
+      }
+    } catch (err) {
+      const e = document.createElement("div");
+      e.className = "empty";
+      e.textContent = err.detail || String(err);
+      wrap.appendChild(e);
+    }
+  }
+
+  function renderVerifyBanner(user) {
+    const banner = document.getElementById("verify-banner");
+    if (!banner) return;
+    if (user.email_verified) {
+      banner.classList.add("hidden");
+      banner.innerHTML = "";
+      return;
+    }
+    banner.innerHTML = "";
+    banner.appendChild(document.createTextNode(t("verify.banner") + " "));
+    const a = document.createElement("a");
+    a.href = "#"; a.textContent = t("verify.resend");
+    a.style.fontWeight = "500";
+    a.addEventListener("click", async (e) => {
+      e.preventDefault();
+      try {
+        await api("POST", "/api/auth/verify-email/send");
+        banner.textContent = t("verify.sent");
+      } catch (err) { alert(err.detail || t("err.unknown")); }
+    });
+    banner.appendChild(a);
+    banner.classList.remove("hidden");
+  }
+
+  async function loadOAuthLinks() {
+    const wrap = document.getElementById("me-oauth");
+    wrap.innerHTML = "";
+    try {
+      const [linksRes, providersRes] = await Promise.all([
+        api("GET", "/api/me/oauth-links"),
+        api("GET", "/api/auth/providers"),
+      ]);
+      const links = linksRes.links || [];
+      const providers = providersRes.providers || [];
+      const linked = new Set(links.map((l) => l.provider));
+      if (links.length === 0 && providers.length === 0) {
+        wrap.appendChild(h("div", { class: "empty" }, t("me.oauth_none")));
+        return;
+      }
+      for (const l of links) {
+        const row = document.createElement("div");
+        row.className = "sub-item";
+        row.style.display = "flex";
+        row.style.justifyContent = "space-between";
+        row.style.alignItems = "center";
+        const left = document.createElement("div");
+        left.innerHTML = "";
+        const name = document.createElement("strong");
+        name.textContent = l.provider.charAt(0).toUpperCase() + l.provider.slice(1);
+        left.appendChild(name);
+        if (l.email) {
+          const sub = document.createElement("div");
+          sub.style.color = "var(--muted)";
+          sub.style.fontSize = "12px";
+          sub.textContent = l.email;
+          left.appendChild(sub);
+        }
+        row.appendChild(left);
+        const unlink = document.createElement("button");
+        unlink.className = "btn btn-ghost";
+        unlink.textContent = t("me.oauth_unlink");
+        unlink.addEventListener("click", async () => {
+          if (!confirm(`Unlink ${l.provider}?`)) return;
+          try {
+            await api("DELETE", `/api/me/oauth-links/${l.provider}`);
+            loadOAuthLinks();
+          } catch (err) {
+            alert(err.detail || t("err.unknown"));
+          }
+        });
+        row.appendChild(unlink);
+        wrap.appendChild(row);
+      }
+      for (const p of providers) {
+        if (linked.has(p)) continue;
+        const row = document.createElement("div");
+        row.className = "sub-item";
+        row.style.textAlign = "center";
+        const linkBtn = document.createElement("a");
+        linkBtn.href = `/api/auth/oauth/${p}/start`;
+        linkBtn.className = "btn btn-ghost";
+        linkBtn.textContent = t(`me.oauth_link_${p}`) || `Link ${p}`;
+        row.appendChild(linkBtn);
+        wrap.appendChild(row);
+      }
+    } catch (err) {
+      wrap.appendChild(h("div", { class: "empty" }, err.detail || String(err)));
+    }
+  }
+
+  async function loadOAuthButtonsForLogin() {
+    try {
+      const r = await api("GET", "/api/auth/providers");
+      const providers = r.providers || [];
+      for (const containerId of ["oauth-buttons-login", "oauth-buttons-signup"]) {
+        const c = document.getElementById(containerId);
+        if (!c) continue;
+        c.innerHTML = "";
+        if (providers.length === 0) continue;
+        const sep = document.createElement("div");
+        sep.style.textAlign = "center";
+        sep.style.fontSize = "11px";
+        sep.style.color = "var(--muted)";
+        sep.style.margin = "10px 0";
+        sep.textContent = "—  or  —";
+        c.appendChild(sep);
+        for (const p of providers) {
+          const a = document.createElement("a");
+          a.href = `/api/auth/oauth/${p}/start`;
+          a.className = "btn";
+          a.style.display = "block";
+          a.style.textAlign = "center";
+          a.style.background = "var(--surface)";
+          a.style.border = "1px solid var(--border)";
+          a.style.color = "var(--text)";
+          a.style.textDecoration = "none";
+          a.style.padding = "9px 14px";
+          a.textContent = t(`auth.signin_${p}`) || `Sign in with ${p}`;
+          c.appendChild(a);
+        }
+      }
+    } catch (_) {}
+  }
+
+  async function loadMe() {
+    try {
+      const r = await api("GET", "/api/me");
+      renderMe(r.user, r.subscriptions || []);
+      renderQuotas(r.quotas || []);
+      renderXout(r.xout || null);
+      renderVerifyBanner(r.user || {});
+      // Lazy — these don't block the main view rendering.
+      loadCatalog(r.subscriptions || []);
+      loadOAuthLinks();
+      loadSessions();
+      // If the server has a stored locale preference, honor it for the UI.
+      if (r.user.locale && I18N[r.user.locale] && r.user.locale !== LOCALE) {
+        LOCALE = r.user.locale;
+        localStorage.setItem("user_service.locale", LOCALE);
+        applyLocale();
+      }
+      show("me");
+    } catch (err) {
+      if (err.status === 401) {
+        show("login");
+      } else {
+        // Show login on any error so the user has a path forward; don't
+        // strand them on a blank screen because /api/me hiccupped.
+        show("login");
+      }
+    }
+  }
+
+  // ----- URL token detection -----
+  // ?verify=TOK — auto-redeem on landing
+  // ?reset=TOK  — show reset form
+  async function handleUrlTokens() {
+    const url = new URL(window.location.href);
+    const verifyTok = url.searchParams.get("verify");
+    const resetTok = url.searchParams.get("reset");
+    if (verifyTok) {
+      try {
+        await api("POST", "/api/auth/verify-email", { token: verifyTok });
+        alert(t("verify.success"));
+      } catch (err) {
+        alert(err.detail || t("err.unknown"));
+      }
+      url.searchParams.delete("verify");
+      window.history.replaceState({}, "", url.pathname + (url.searchParams.toString() ? "?" + url.searchParams : ""));
+    }
+    if (resetTok) {
+      window.__resetToken = resetTok;
+      url.searchParams.delete("reset");
+      window.history.replaceState({}, "", url.pathname + (url.searchParams.toString() ? "?" + url.searchParams : ""));
+      // Don't auto-load /api/me — go straight to reset form.
+      show("reset");
+      return true;
+    }
+    return false;
+  }
+
+  // Boot.
+  applyLocale();
+  loadOAuthButtonsForLogin();
+  (async () => {
+    if (await handleUrlTokens()) return;
+    loadMe();
+  })();
+})();
+</script>
+</body>
+</html>

@@ -3,12 +3,15 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from .db import CertificateRecord, RouteRecord
+
+LOGGER = logging.getLogger("ssl_proxy_controller.caddy")
 
 DOCKER_HOST_GATEWAY_NAME = "host.docker.internal"
 
@@ -61,15 +64,36 @@ def validate_upstream_target(upstream_target: str) -> str:
   return f"{host}:{port}"
 
 
-def canonicalize_upstream_target_for_container(upstream_target: str) -> str:
-  normalized = validate_upstream_target(upstream_target)
-  if normalized.startswith("[::1]:"):
-    return f"{DOCKER_HOST_GATEWAY_NAME}:{normalized.rsplit(':', 1)[1]}"
+def canonicalize_upstream_for_container(host: str, port: int) -> tuple[str, int]:
+  """Loopback rewrite, structured form. Caddy runs in a container; when an
+  operator points an upstream at the host's loopback (127.0.0.1, localhost,
+  [::1]) we silently rewrite to ``host.docker.internal`` so the connection
+  actually reaches the host instead of the container's own loopback.
 
-  host, port_text = normalized.rsplit(":", 1)
-  if host in {"127.0.0.1", "localhost"}:
-    return f"{DOCKER_HOST_GATEWAY_NAME}:{port_text}"
-  return normalized
+  Returns a (host, port) pair so the caller can render IPv6 brackets the
+  way it prefers.
+  """
+  if host in {"127.0.0.1", "localhost", "::1", "[::1]"}:
+    return DOCKER_HOST_GATEWAY_NAME, port
+  return host, port
+
+
+def canonicalize_upstream_target_for_container(upstream_target: str) -> str:
+  """Legacy string-based wrapper around :func:`canonicalize_upstream_for_container`.
+  Kept for callers that still hand us a "host:port" string."""
+  normalized = validate_upstream_target(upstream_target)
+  if normalized.startswith("["):
+    # IPv6 bracketed form. partition("]:") strips the close bracket; we
+    # add it back so the host string we hand to canonicalize_* still
+    # has both brackets — the rewrite rule looks for the literal "[::1]".
+    bracketed_host, _, port_text = normalized.partition("]:")
+    host = bracketed_host + "]"
+    port = int(port_text)
+  else:
+    host, _, port_text = normalized.rpartition(":")
+    port = int(port_text)
+  new_host, new_port = canonicalize_upstream_for_container(host, port)
+  return f"{new_host}:{new_port}"
 
 
 def render_caddyfile(
@@ -128,11 +152,16 @@ def render_caddyfile(
     # only that field.
     targets: list[str] = []
     if route.upstreams:
-      targets = [
-        canonicalize_upstream_target_for_container(up.target)
-        for up in route.upstreams
-      ]
+      # Structured path: read target_host / target_port directly off
+      # each UpstreamRecord and apply the loopback rewrite without
+      # round-tripping through a string.
+      for up in route.upstreams:
+        new_host, new_port = canonicalize_upstream_for_container(
+          up.target_host, up.target_port,
+        )
+        targets.append(f"{new_host}:{new_port}")
     elif route.upstream_target is not None:
+      # Legacy fallback for routes that pre-date route_upstreams.
       targets = [canonicalize_upstream_target_for_container(route.upstream_target)]
 
     if not targets:
@@ -165,10 +194,34 @@ def render_caddyfile(
   return RenderResult(path=output_path, sha256=hashlib.sha256(content.encode("utf-8")).hexdigest())
 
 
-def reload_caddy(reload_command: list[str]) -> None:
+def reload_caddy(reload_command: list[str], *, timeout: float = 30.0) -> None:
   if not reload_command:
     raise ValueError("caddy reload_command must not be empty")
-  subprocess.run(reload_command, check=True)
+  # Capture output so a failed reload produces a useful log line — the
+  # default subprocess.run inherits stdout/stderr, which means under a
+  # systemd unit the operator only sees the exit code, not the parse
+  # error. We also set a hard timeout so a hung Caddy admin endpoint
+  # doesn't block the controller's main loop.
+  try:
+    result = subprocess.run(
+      reload_command,
+      check=False,
+      capture_output=True,
+      text=True,
+      timeout=timeout,
+    )
+  except subprocess.TimeoutExpired as exc:
+    raise RuntimeError(
+      f"caddy reload timed out after {timeout}s: {' '.join(reload_command)}"
+    ) from exc
+  if result.returncode != 0:
+    details = (result.stderr or result.stdout or "").strip()
+    LOGGER.error("caddy reload failed (exit %d): %s",
+                 result.returncode, details or "<no output>")
+    raise subprocess.CalledProcessError(
+      result.returncode, reload_command,
+      output=result.stdout, stderr=result.stderr,
+    )
 
 
 def state_payload(caddy_sha256: str, route_versions: list[dict[str, str]], cert_versions: list[dict[str, str]]) -> str:

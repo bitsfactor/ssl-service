@@ -345,22 +345,36 @@ def render_deploy_script(
   env_file_content: str,
   install_dir: str | None = None,
   extra_files: dict[str, str] | None = None,
+  source_mode: str = "git",
 ) -> str:
   """Build the bash script the platform runs on the target node.
 
   The script:
-    1. Clones / fetches the repo to install_dir
-    2. Checks out the requested revision (sha / tag / branch)
-    3. Writes `.env` from env_file_content
-    4. Creates volume directories
-    5. Runs `pre_deploy.sh` (if present)
-    6. Runs `docker compose up -d --build`
-    7. (Healthcheck is verified separately by the platform — not in
+    1. Brings the source code into install_dir (per ``source_mode``)
+    2. Writes `.env` from env_file_content
+    3. Creates volume directories
+    4. Runs `pre_deploy.sh` (if present)
+    5. Runs `docker compose up -d --build`
+    6. (Healthcheck is verified separately by the platform — not in
        this script — so the platform can capture detailed status.)
+
+  ``source_mode`` selects how step 1 happens:
+
+  - ``"git"`` (default) — clone / fetch ``service_repo_url`` into
+    install_dir, check out the revision. Used when the service has
+    a GitHub repo configured.
+  - ``"local"`` — assume install_dir already contains the rendered
+    source (the platform pushes a tarball over SSH **before** running
+    this script). The script skips git entirely and reports a
+    pseudo-revision based on a local tarball hash if the platform
+    set ``LOCAL_REVISION`` in the env, otherwise a placeholder.
 
   No post-deploy hook / no rollback in this script: the platform calls
   another script for that AFTER the healthcheck verdict is in.
   """
+  if source_mode not in ("git", "local"):
+    raise ValueError(f"unsupported source_mode: {source_mode!r}")
+
   install = install_dir or manifest.install_dir()
   rev = (revision or service_branch or "main").strip() or "main"
   compose = manifest.compose_file or "docker-compose.yml"
@@ -391,36 +405,28 @@ def render_deploy_script(
   extra_files_block = ""
   if extra_files:
     parts: list[str] = ["echo '--- writing extra deploy files ---'"]
-    for raw_path, content in extra_files.items():
+    # Use a per-file index in the heredoc marker rather than hash(path) —
+    # Python's hash is randomized per process, and different paths can
+    # collide modulo any small bound. A plain counter is monotonic and
+    # collision-proof for the lifetime of this script.
+    for idx, (raw_path, content) in enumerate(extra_files.items()):
       safe_path = raw_path.lstrip("/")
-      file_marker = f"SSLSVC_FILE_{abs(hash(safe_path)) % 100000}"
+      file_marker = f"SSLSVC_FILE_{idx}_E0F"
       parts.append(f"mkdir -p \"$(dirname {shlex.quote(safe_path)})\"")
       parts.append(f"cat > {shlex.quote(safe_path)} <<'{file_marker}'")
       parts.append(content.rstrip("\n"))
       parts.append(file_marker)
     extra_files_block = "\n".join(parts) + "\n"
 
-  return f"""#!/usr/bin/env bash
-set -euo pipefail
-INSTALL_DIR={shlex.quote(install)}
-REPO_URL={shlex.quote(service_repo_url)}
-REVISION={shlex.quote(rev)}
-SERVICE={shlex.quote(manifest.service)}
-COMPOSE_FILE={shlex.quote(compose)}
-
-echo "==> Service: ${{SERVICE}}"
-echo "==> Install dir: ${{INSTALL_DIR}}"
-echo "==> Revision target: ${{REVISION}}"
-
-mkdir -p "${{INSTALL_DIR}}"
+  # The source-sync block is the only thing that varies between modes.
+  if source_mode == "git":
+    source_block = f"""mkdir -p "${{INSTALL_DIR}}"
 if [[ ! -d "${{INSTALL_DIR}}/.git" ]]; then
   git clone "${{REPO_URL}}" "${{INSTALL_DIR}}"
 fi
 cd "${{INSTALL_DIR}}"
 
 git fetch --all --tags --prune
-# Resolve REVISION: if it's a sha, use it directly; if a branch/tag,
-# checkout via origin/<branch> when applicable.
 if git rev-parse --verify "${{REVISION}}" >/dev/null 2>&1; then
   git checkout --detach "${{REVISION}}"
 elif git rev-parse --verify "origin/${{REVISION}}" >/dev/null 2>&1; then
@@ -430,6 +436,34 @@ else
   exit 2
 fi
 DEPLOYED_SHA="$(git rev-parse HEAD)"
+"""
+  else:  # local
+    # Source files were pushed by the platform into install_dir before
+    # this script ran. Don't touch them. DEPLOYED_SHA is whatever the
+    # platform stamped (or a placeholder if it didn't).
+    source_block = """if [[ ! -d "${INSTALL_DIR}" ]]; then
+  echo "ERROR: ${INSTALL_DIR} missing — local-deploy must push source first" >&2
+  exit 2
+fi
+cd "${INSTALL_DIR}"
+DEPLOYED_SHA="${LOCAL_REVISION:-local-unknown}"
+"""
+
+  return f"""#!/usr/bin/env bash
+set -euo pipefail
+INSTALL_DIR={shlex.quote(install)}
+REPO_URL={shlex.quote(service_repo_url)}
+REVISION={shlex.quote(rev)}
+SERVICE={shlex.quote(manifest.service)}
+COMPOSE_FILE={shlex.quote(compose)}
+SOURCE_MODE={shlex.quote(source_mode)}
+
+echo "==> Service: ${{SERVICE}}"
+echo "==> Install dir: ${{INSTALL_DIR}}"
+echo "==> Source mode: ${{SOURCE_MODE}}"
+echo "==> Revision target: ${{REVISION}}"
+
+{source_block}
 echo "==> Resolved SHA: ${{DEPLOYED_SHA}}"
 
 cat > .env <<'{marker}'

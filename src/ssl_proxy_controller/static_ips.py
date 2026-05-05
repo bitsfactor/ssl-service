@@ -50,6 +50,15 @@ _IPV6_BRACKET_RE = re.compile(r"\[([0-9A-Fa-f:]+)\](?::(\d{1,5}))?")
 _IPV6_RE = re.compile(r"\b(?:[A-Fa-f0-9]{1,4}:){2,7}(?::|[A-Fa-f0-9]{1,4})\b")
 _IPV6_DOUBLECOLON_RE = re.compile(r"\b[A-Fa-f0-9:]*::[A-Fa-f0-9:]*[A-Fa-f0-9]\b")
 _PORT_RE = re.compile(r":(\d{1,5})(?:\b|$)")
+# DNS hostname followed by ``:port``. Used for gateway-style URIs
+# where the connection target is a domain (Decodo / BrightData /
+# Oxylabs / etc.). Requires at least one dot so single-label hostnames
+# like ``localhost`` don't false-match. Anchored at start because we
+# only call this against the post-credential portion.
+_HOST_PORT_RE = re.compile(
+  r"^([A-Za-z0-9](?:[A-Za-z0-9\-_]*[A-Za-z0-9])?"
+  r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-_]*[A-Za-z0-9])?)+):(\d{1,5})\b"
+)
 
 # Lowercase keyword → canonical country.
 _COUNTRY_KEYWORDS = {
@@ -163,52 +172,368 @@ def _detect_protocol(text: str) -> str:
   return "tcp"
 
 
+def _split_userpass_at_host(line: str) -> tuple[str | None, str | None, str]:
+  """Split a line like ``user:pass@host:port`` into
+  ``(username, password, host_part)``.
+
+  Tolerates a leading ``scheme://`` (handled by the caller) and is
+  conservative — only fires when:
+
+  * a single ``@`` precedes the host
+  * the part before ``@`` contains exactly one ``:`` separator
+  * the part after ``@`` starts with something that looks like a
+    host — either an IP address or a DNS name. We accept DNS names
+    so gateway formats (``user:pass@isp.decodo.com:10001``) are
+    captured; the false-positive risk for "@" inside an email is
+    handled by also requiring a port to follow.
+
+  Returns ``(None, None, line)`` if the prefix isn't recognised, so
+  the existing IP-only parsing keeps working for plain lists.
+  """
+  at_idx = line.find("@")
+  if at_idx <= 0:
+    return None, None, line
+  creds = line[:at_idx]
+  rest = line[at_idx + 1:]
+  # Use rfind/find here? We want the FIRST colon — the one separating
+  # username from password. If user encodes ":" inside the username
+  # (Decodo doesn't, but some providers might), this still works
+  # because we don't try to interpret the username's content.
+  colon_idx = creds.find(":")
+  if not (0 < colon_idx < len(creds) - 1):
+    return None, None, line
+  # Reject if creds contains whitespace — this isn't a user:pass form.
+  if any(c.isspace() for c in creds):
+    return None, None, line
+  # The host part must look like ``host:port``. Accepts:
+  #   - IPv4 address followed by ``:port``
+  #   - bracketed IPv6 with optional port
+  #   - bare IPv6 (last-resort)
+  #   - DNS hostname (one or more dot-separated labels) followed
+  #     by ``:port`` — for gateway-style URIs.
+  has_ip_form = bool(_IP_RE.search(rest)
+                     or _IPV6_BRACKET_RE.search(rest)
+                     or _IPV6_DOUBLECOLON_RE.search(rest))
+  has_host_port_form = bool(re.match(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9\-_.]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-_]*[A-Za-z0-9])?)+:\d{1,5}\b",
+    rest))
+  if not (has_ip_form or has_host_port_form):
+    return None, None, line
+  return creds[:colon_idx], creds[colon_idx + 1:], rest
+
+
+# Provider gateway domains. Operators paste lines like
+#   socks5h://user-...-ip-A.B.C.D:secret@isp.decodo.com:10001
+# and we need to (a) detect that this is a "gateway" row, not a
+# "static" one, and (b) name the provider so the UI can render a
+# badge. Match by domain suffix — exact host varies (Bright Data uses
+# ``brd.superproxy.io``, Oxylabs has ``pr.oxylabs.io`` for residential
+# and ``dc.oxylabs.io`` for datacenter, etc.).
+_GATEWAY_PROVIDER_DOMAINS: tuple[tuple[str, str], ...] = (
+  # (host substring, canonical provider id)
+  ("decodo.com",        "decodo"),
+  ("smartproxy.com",    "smartproxy"),
+  ("smartproxy.io",     "smartproxy"),
+  ("oxylabs.io",        "oxylabs"),
+  ("oxylabs.com",       "oxylabs"),
+  ("brightdata.com",    "brightdata"),
+  ("luminati.io",       "brightdata"),     # legacy
+  ("superproxy.io",     "brightdata"),     # ``brd.superproxy.io``
+  ("iproyal.com",       "iproyal"),
+  ("webshare.io",       "webshare"),
+  ("netnut.io",         "netnut"),
+  ("rayobyte.com",      "rayobyte"),
+  ("packetstream.io",   "packetstream"),
+  ("nodemaven.com",     "nodemaven"),
+  ("soax.com",          "soax"),
+  ("proxy-cheap.com",   "proxy-cheap"),
+  ("proxycheap.com",    "proxy-cheap"),
+)
+
+
+# Match a single IPv6 address. We don't try to be RFC-perfect — accept
+# any sequence of hex groups separated by colons, with optional ``::``
+# zero-compression. False-positives like ``2:3:4:5:6:7:8`` are tolerable
+# since they only show up where we *expect* an IP address (after a
+# ``=>`` separator or in an exit-IP slot). Two-or-more-colons threshold
+# distinguishes from ``host:port:user:pass`` (max 3 colons, none of
+# which form a valid IPv6).
+_IPV6_FREE_RE = re.compile(
+  r"\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f:]{1,4}\b"
+)
+
+# Colon-quad format used by proxy-cheap and many list-broker services:
+#   ``IPv4:port:user:pass``
+# Anchored to the start of the line and trailing-whitespace-tolerant
+# so the post-line operations (=> suffix, comments) keep working.
+# Username and password may contain almost anything except whitespace
+# and colon — colons are a no-go because there's no escape mechanism
+# in this format.
+_COLON_QUAD_RE = re.compile(
+  r"^((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5}):([^:\s]+):([^:\s]+)\s*$"
+)
+
+
+def _gateway_provider_for(host: str) -> str | None:
+  """Match a host against the known-gateway-domain list. Returns the
+  canonical provider id (``'decodo'``, ``'oxylabs'``, …) or None when
+  the host doesn't look like a known gateway.
+
+  Matches at the DNS-label boundary — ``isp.decodo.com`` matches
+  ``decodo.com`` but a look-alike like ``mydecodo.com`` does NOT, even
+  though the substring is technically present. This prevents anyone
+  from social-engineering a row into "Decodo" by registering a
+  similar-sounding domain.
+  """
+  if not host:
+    return None
+  hl = host.lower().strip().rstrip(".")
+  for needle, provider in _GATEWAY_PROVIDER_DOMAINS:
+    # Match either an exact host (== needle) or a subdomain of needle
+    # (host ends with ".<needle>"). No bare-substring contains-check.
+    if hl == needle or hl.endswith("." + needle):
+      return provider
+  return None
+
+
+# Provider-specific session-string conventions. Each pattern picks an
+# IPv4 out of the username so we can populate ``exit_ip``. These are
+# best-effort; a username that doesn't match any pattern simply leaves
+# exit_ip unset (the row still works as a gateway, the operator just
+# doesn't get geo / quality on the exit IP).
+_USERNAME_EXIT_IP_PATTERNS: tuple[str, ...] = (
+  # Decodo, Smartproxy, IPRoyal, NetNut all use ``-ip-A.B.C.D`` token.
+  r"-ip-(\d{1,3}(?:\.\d{1,3}){3})\b",
+  # Bright Data sometimes embeds the exit as ``-ip-A.B.C.D`` after
+  # the zone name (same regex as above).
+  # Oxylabs supports ``-sessid-X`` (no IP) plus an IP-locked variant
+  # encoded as ``-ip-A.B.C.D`` — same regex covers it.
+)
+
+
+def _extract_exit_ip_from_username(username: str | None) -> str | None:
+  """Best-effort exit-IP extraction from a gateway-style username.
+
+  Provider conventions vary, but ``-ip-<IPv4>`` is the de-facto
+  cross-provider standard. Returns the IPv4 string or None."""
+  if not username:
+    return None
+  for pat in _USERNAME_EXIT_IP_PATTERNS:
+    m = re.search(pat, username)
+    if m:
+      return m.group(1)
+  # Fallback: any bare IPv4 inside the username (handles the rare
+  # ``customer-...-A.B.C.D-...`` schema some providers use).
+  m = _IP_RE.search(username)
+  return m.group(0) if m else None
+
+
 def regex_parse_lines(text: str) -> list[dict[str, Any]]:
   """Pure-regex fallback that splits on lines and pulls out each row's
-  IP, port, protocol, country and provider hints.
+  IP, port, protocol, country, provider, and (when the ``user:pass@``
+  prefix is present) username + password.
+
+  Supported line shapes:
+    1. ``IPv4:port``                                — plain static
+    2. ``user:pass@host:port`` (with or without scheme)  — RFC URI form
+    3. ``IPv4:port:user:pass``                     — colon-quad list
+       format (proxy-cheap, many list brokers); user/pass cannot contain
+       colons or whitespace.
+    4. Any of the above with a trailing ``=> <exit_ip>`` (or ``->``)
+       suffix, where ``<exit_ip>`` may be IPv4 or IPv6. When present we
+       record the row as ``kind='gateway'`` with that exit IP — handy
+       for proxy-cheap-style entries where you connect via IPv4 but the
+       exit address is IPv6.
   """
   out: list[dict[str, Any]] = []
   for raw in text.splitlines():
     line = raw.strip()
     if not line or line.startswith("#"):
       continue
+
+    # ----- Step 0: pull off optional "@<provider>" suffix.
+    # Operators paste this when they want a specific gateway provider
+    # tag without it being detectable from the connect host. Order is
+    # parsed first so it's tolerated alongside the "=> exit_ip" suffix.
+    explicit_provider: str | None = None
+    prov_match = re.search(r"\s+@\s*([A-Za-z][A-Za-z0-9_.\-]*)\s*$", line)
+    if prov_match:
+      explicit_provider = prov_match.group(1).strip().lower()
+      line = line[:prov_match.start()].rstrip()
+
+    # ----- Step 0.1: pull off an optional "=> exit_ip" suffix.
+    # Operators paste this when the connect address differs from the
+    # exit address (proxy-cheap IPv6 exits, BrightData zone-by-IP, etc.).
+    # We accept "=>", "->", or " exit " as separators.
+    explicit_exit: str | None = None
+    suffix_match = re.search(
+      r"\s*(?:=>|->|\bexit[:= ]+)\s*([^\s]+)\s*$", line)
+    if suffix_match:
+      candidate = suffix_match.group(1).strip()
+      # Validate it actually looks like an IP (v4 or v6) — we don't
+      # want to slurp arbitrary trailing text.
+      if (_IP_RE.fullmatch(candidate)
+          or _IPV6_FREE_RE.fullmatch(candidate)
+          or candidate.startswith("[") and candidate.endswith("]")):
+        explicit_exit = candidate.strip("[]")
+        line = line[:suffix_match.start()].rstrip()
+
+    # ----- Step 0.5: try the colon-quad ``host:port:user:pass`` form
+    # before any scheme-stripping, since this format never has a scheme.
+    quad_match = _COLON_QUAD_RE.match(line)
+    if quad_match:
+      qhost = quad_match.group(1)
+      qport = int(quad_match.group(2))
+      quser = quad_match.group(3)
+      qpass = quad_match.group(4)
+      # Reshape into the canonical ``user:pass@host:port`` form so the
+      # rest of the parser can stay shape-agnostic. Default protocol
+      # for credential-bearing lines is socks5 (residential convention).
+      line = f"{quser}:{qpass}@{qhost}:{qport}"
+
+    # Strip a "scheme://" prefix if present and remember it as a
+    # protocol hint that beats keyword detection later.
+    scheme_proto_hint: str | None = None
+    scheme_match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*)://(.*)$", line)
+    body = scheme_match.group(2) if scheme_match else line
+    if scheme_match:
+      scheme_proto_hint = scheme_match.group(1).lower()
+
+    # Extract optional user:pass@ prefix. Falls through cleanly when
+    # the line is a plain "host:port".
+    username, password, line_for_ip = _split_userpass_at_host(body)
+
     ip: str | None = None
     port: int | None = None
-    after: str = line
-    # Try bracketed IPv6 first.
-    bracket = _IPV6_BRACKET_RE.search(line)
-    if bracket:
-      ip = bracket.group(1)
-      port = int(bracket.group(2)) if bracket.group(2) else None
-      after = line[bracket.end() :]
+    after: str = line_for_ip
+    # Detect whether this is a "gateway" URI — the host part is a DNS
+    # name belonging to a known proxy provider (Decodo, BrightData,
+    # Oxylabs, etc.). When detected, we record the hostname as ``ip``
+    # (the connection target) and pull the per-session exit IP out of
+    # the username for ``exit_ip``.
+    kind = "static"
+    exit_ip: str | None = None
+    gateway_provider: str | None = None
+    host_match = _HOST_PORT_RE.match(line_for_ip)
+    if host_match:
+      candidate_host = host_match.group(1)
+      candidate_port = int(host_match.group(2))
+      provider_id = _gateway_provider_for(candidate_host)
+      if provider_id:
+        ip = candidate_host
+        port = candidate_port
+        after = line_for_ip[host_match.end():]
+        kind = "gateway"
+        gateway_provider = provider_id
+        exit_ip = _extract_exit_ip_from_username(username)
+
+    # Bracketed IPv6 — only attempted when we haven't already matched
+    # a gateway hostname.
+    if ip is None:
+      bracket = _IPV6_BRACKET_RE.search(line_for_ip)
+      if bracket:
+        ip = bracket.group(1)
+        port = int(bracket.group(2)) if bracket.group(2) else None
+        after = line_for_ip[bracket.end():]
     if ip is None:
       # IPv4 takes precedence over plain IPv6 since the latter often
       # appears as a literal address with embedded ports we'd miss.
-      v4 = _IP_RE.search(line)
-      v6 = _IPV6_DOUBLECOLON_RE.search(line) if not v4 else None
-      ip_match = v4 or v6 or _IPV6_RE.search(line)
+      v4 = _IP_RE.search(line_for_ip)
+      v6 = _IPV6_DOUBLECOLON_RE.search(line_for_ip) if not v4 else None
+      ip_match = v4 or v6 or _IPV6_RE.search(line_for_ip)
       if not ip_match:
-        continue
-      ip = ip_match.group(0)
-      after = line[ip_match.end() :]
-      port_match = _PORT_RE.match(after) or _PORT_RE.search(after)
-      if port_match:
-        try:
-          port = int(port_match.group(1))
-        except ValueError:
-          port = None
+        # Last resort: a hostname:port without a provider match. We
+        # still accept it as a "gateway" row (operator can fix the
+        # provider field by hand if needed) — the alternative is
+        # silently dropping the line, which is worse.
+        if host_match:
+          ip = host_match.group(1)
+          port = int(host_match.group(2))
+          after = line_for_ip[host_match.end():]
+          kind = "gateway"
+          # No known provider — leave gateway_provider unset; the UI
+          # will render it as "(custom gateway)".
+          exit_ip = _extract_exit_ip_from_username(username)
+        else:
+          continue
+      else:
+        ip = ip_match.group(0)
+        after = line_for_ip[ip_match.end():]
+        port_match = _PORT_RE.match(after) or _PORT_RE.search(after)
+        if port_match:
+          try:
+            port = int(port_match.group(1))
+          except ValueError:
+            port = None
     if port is not None and not (0 < port < 65536):
       port = None
-    protocol = _detect_protocol(line)
-    country = _detect_country(line)
-    provider = _detect_provider(line)
+
+    # Protocol resolution priority:
+    #   1. Explicit scheme:// prefix (most authoritative)
+    #   2. Keyword in the line ("trojan", "shadowsocks", etc.)
+    #   3. Default: socks5 when user:pass@ was present (residential
+    #      proxy convention), tcp otherwise.
+    # ``_detect_protocol`` collapses (2) and (3) by always returning
+    # "tcp" on no match; do the keyword scan inline so we can tell the
+    # difference between "operator typed tcp" and "no hint at all".
+    protocol: str | None = scheme_proto_hint
+    if protocol is None:
+      for token in re.split(r"[\s,;|]+", line.lower()):
+        cand = _scrub_proto(token)
+        if cand:
+          protocol = cand
+          break
+    if protocol is None:
+      protocol = "socks5" if (username or password) else "tcp"
+
+    # An explicit ``=> exit_ip`` suffix on the input line forces the
+    # row to be a gateway, regardless of how we'd otherwise classify
+    # it. Connect address stays the parsed ``ip``; exit address is
+    # whatever the operator pinned. This is the proxy-cheap pattern:
+    # IPv4 connection, IPv6 exit, neither side encoded in the username.
+    if explicit_exit:
+      kind = "gateway"
+      exit_ip = explicit_exit
+    if explicit_provider:
+      # Promote to gateway too — providing a provider name without
+      # otherwise being a gateway is meaningful by itself (operators
+      # mark their proxy-cheap entries this way).
+      kind = "gateway"
+      gateway_provider = explicit_provider
+
+    # Country/provider keyword detection. For gateway rows we SKIP
+    # this entirely — keyword scanning over ``isp.decodo.com`` would
+    # misfire ("de" -> Germany, "do" -> DigitalOcean) and produce
+    # gateway-location data instead of exit-IP-location data. The
+    # bulk-import autofill step will run a real geo lookup against
+    # ``exit_ip`` later in the pipeline.
+    if kind == "gateway":
+      country, provider = None, None
+    else:
+      # Static rows: keyword scan ``line_for_ip`` (the host:port part),
+      # not the full raw line, so substrings inside a credential like
+      # "info0ecxd" don't false-match country aliases like "in" -> India.
+      country = _detect_country(line_for_ip)
+      provider = _detect_provider(line_for_ip)
+    # ``socks5h`` (SOCKS5 with remote DNS) is treated as plain
+    # ``socks5`` for storage — they're functionally identical at the
+    # protocol level, and our SOCKS5 implementation already sends
+    # destination as a hostname when the caller passes one.
+    if protocol == "socks5h":
+      protocol = "socks5"
+
     out.append({
       "ip": ip,
       "port": port,
       "protocol": protocol,
       "country": country,
       "provider": provider,
+      "username": username,
+      "password": password,
       "label": None,
+      "kind": kind,
+      "exit_ip": exit_ip,
+      "gateway_provider": gateway_provider,
       "raw": line,
     })
   return out
@@ -226,12 +551,17 @@ _AI_SYSTEM_PROMPT = (
   "JSON array. Extract every IP. For each IP, return: {ip (string), "
   "port (integer or null), protocol (string, lowercase), country "
   "(string or null), provider (string or null), label (string or "
-  "null)}. The user's text may contain country names in any language "
+  "null), username (string or null), password (string or null)}. "
+  "The user's text may contain country names in any language "
   "(English, Chinese, etc.) — translate to canonical English country "
   "names. Protocols include tcp, udp, http, https, ssh, socks5, "
   "shadowsocks, trojan, vmess, vless, wireguard, openvpn, hysteria2, "
-  "icmp. Default protocol to 'tcp' when unknown. Respond with ONLY the "
-  "JSON array, no prose, no code fence."
+  "icmp. When a line is in 'user:pass@host:port' or "
+  "'scheme://user:pass@host:port' form, extract username and password "
+  "from the credentials portion. If the line has 'user:pass@' but no "
+  "scheme, default protocol to 'socks5' (residential proxy convention) "
+  "rather than 'tcp'. Respond with ONLY the JSON array, no prose, no "
+  "code fence."
 )
 
 
@@ -328,6 +658,44 @@ def _ai_parse_anthropic(text: str, *, api_key: str, model: str) -> list[dict[str
   return parsed
 
 
+def _gateway_pre_pass(text: str) -> tuple[list[dict[str, Any]], str]:
+  """Pull gateway-URI lines out of ``text`` and parse them via the
+  deterministic regex parser. Returns ``(gateway_records, leftover_text)``.
+
+  Why a pre-pass: AI parsers (OpenAI / Anthropic) consistently
+  misinterpret residential-proxy gateway URIs like
+  ``socks5h://user-...-ip-A.B.C.D:pass@isp.decodo.com:10001`` —
+  they pull ``A.B.C.D`` out of the username and present it as the
+  host, which is the OPPOSITE of correct (the connection target is
+  the gateway domain, the exit IP lives in the username). The regex
+  parser, in contrast, has explicit gateway-domain detection and
+  gets these right every time.
+
+  Implementation: run the regex parser line-by-line; any line whose
+  regex output says ``kind == 'gateway'`` is considered AI-unsafe and
+  pulled out. This is stricter than the previous ``substring contains
+  decodo.com`` check (which false-matched on comment lines and
+  unrelated mentions), and it avoids re-implementing host-suffix
+  matching in two places.
+  """
+  gateway_lines: list[str] = []
+  other_lines: list[str] = []
+  for raw in text.splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+      other_lines.append(raw)
+      continue
+    parsed = regex_parse_lines(raw)
+    if parsed and (parsed[0].get("kind") == "gateway"):
+      gateway_lines.append(raw)
+    else:
+      other_lines.append(raw)
+  if not gateway_lines:
+    return [], text
+  records = regex_parse_lines("\n".join(gateway_lines))
+  return records, "\n".join(other_lines)
+
+
 def parse_bulk_input(
   text: str,
   *,
@@ -357,12 +725,21 @@ def parse_bulk_input(
   if not text or not text.strip():
     return [], "regex"
 
-  if len(text) > _AI_MAX_INPUT_CHARS:
+  # Pre-pass: pull gateway URIs out and parse them with regex. The AI
+  # parser misinterprets these consistently, so we never let it touch
+  # them. ``leftover_text`` is what (if anything) goes to the AI.
+  gateway_records, leftover_text = _gateway_pre_pass(text)
+
+  if not leftover_text.strip() and gateway_records:
+    # All lines were gateway URIs — skip the AI call entirely.
+    return gateway_records, "regex"
+
+  if len(leftover_text) > _AI_MAX_INPUT_CHARS:
     LOGGER.warning(
       "bulk parse input is %d chars, truncating to %d for AI request",
-      len(text), _AI_MAX_INPUT_CHARS,
+      len(leftover_text), _AI_MAX_INPUT_CHARS,
     )
-  ai_text = text[:_AI_MAX_INPUT_CHARS]
+  ai_text = leftover_text[:_AI_MAX_INPUT_CHARS]
 
   def _normalize(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
@@ -374,7 +751,28 @@ def parse_bulk_input(
         # Defensive: drop rows the model returned without an IP.
         continue
       out.append(rec)
-    return out
+    # AI models inconsistently follow the prompt for username/password
+    # extraction, even when the input is the deterministic
+    # ``user:pass@host:port`` form. Run the regex parser on the same
+    # input and fill in missing creds keyed by IP — regex is exact
+    # for this format and never drops creds the AI happened to ignore.
+    try:
+      regex_rows = regex_parse_lines(leftover_text)
+    except Exception:  # noqa: BLE001
+      regex_rows = []
+    if regex_rows:
+      by_ip = {r.get("ip"): r for r in regex_rows if r.get("ip")}
+      for rec in out:
+        ref = by_ip.get(rec.get("ip"))
+        if not ref:
+          continue
+        if not rec.get("username") and ref.get("username"):
+          rec["username"] = ref["username"]
+        if not rec.get("password") and ref.get("password"):
+          rec["password"] = ref["password"]
+    # Prepend the gateway records that the AI never saw — they
+    # already came from the deterministic regex parser.
+    return gateway_records + out
 
   cfg = config or {}
   oai = cfg.get("openai") or {}
@@ -430,7 +828,9 @@ def parse_bulk_input(
     except OSError as exc:
       LOGGER.warning("anthropic network error: %s — falling back", exc)
 
-  return regex_parse_lines(text), "regex"
+  # AI unavailable / failed. Run the regex parser on the leftover
+  # (non-gateway) text and merge with the gateway pre-pass output.
+  return gateway_records + regex_parse_lines(leftover_text), "regex"
 
 
 _AI_FIELD_MAX_LEN = 200
@@ -474,9 +874,38 @@ def _normalize_ai_record(rec: dict[str, Any]) -> dict[str, Any]:
     port = None
   protocol = _coerce_ai_string(rec.get("protocol")) or "tcp"
   protocol = protocol.lower()
+  if protocol == "socks5h":
+    # Treat socks5h as socks5 in storage; functionally identical.
+    protocol = "socks5"
   country = _coerce_ai_string(rec.get("country"))
   provider = _coerce_ai_string(rec.get("provider"))
   label = _coerce_ai_string(rec.get("label"))
+  username = _coerce_ai_string(rec.get("username"))
+  password = _coerce_ai_string(rec.get("password"))
+  # Auto-detect gateway from the host. Two heuristics, in priority order:
+  #   1. Host matches a known provider domain → kind=gateway with that
+  #      provider id baked in.
+  #   2. Host looks like a DNS name (letters present, not pure IPv4) →
+  #      kind=gateway with provider unset. Without this, AI-returned
+  #      rows like ``ip="my-proxy.local"`` would persist as kind=static
+  #      and break every code path that assumes static-row IPs are
+  #      IPv4 literals.
+  gateway_provider = _gateway_provider_for(ip) if ip else None
+  ai_kind = (_coerce_ai_string(rec.get("kind")) or "").lower()
+  if ai_kind in ("static", "gateway"):
+    kind = ai_kind
+  elif gateway_provider:
+    kind = "gateway"
+  elif ip and not _IP_RE.fullmatch(ip):
+    # Hostname-shaped: any character outside the IPv4 grammar.
+    # Conservative — IPv6 literals would fall here too, but those
+    # don't currently flow through the AI path (regex catches them).
+    kind = "gateway"
+  else:
+    kind = "static"
+  exit_ip = _coerce_ai_string(rec.get("exit_ip"))
+  if kind == "gateway" and not exit_ip:
+    exit_ip = _extract_exit_ip_from_username(username)
   return {
     "ip": ip,
     "port": port,
@@ -484,6 +913,11 @@ def _normalize_ai_record(rec: dict[str, Any]) -> dict[str, Any]:
     "country": country,
     "provider": provider,
     "label": label,
+    "username": username,
+    "password": password,
+    "kind": kind,
+    "exit_ip": exit_ip,
+    "gateway_provider": gateway_provider,
   }
 
 
@@ -635,9 +1069,14 @@ def _check_disney() -> dict[str, Any]:
 
 
 def _geo_lookup(ip: str) -> dict[str, Any]:
+  # Primary: ip-api.com with EXTENDED fields. Free + no-key returns
+  # ``mobile / proxy / hosting`` boolean flags in addition to geo —
+  # those flags drive the ISP-type tagging in the Quality report.
+  # The ``fields`` query param uses a bitmask documented at
+  # https://ip-api.com/docs/api:json. 66846719 = all useful fields.
   for url in (
+    f"http://ip-api.com/json/{ip}?fields=66846719",
     f"https://ipapi.co/{ip}/json/",
-    f"http://ip-api.com/json/{ip}",
   ):
     try:
       status, _, body = _http_get(url, timeout=6.0)
@@ -646,6 +1085,8 @@ def _geo_lookup(ip: str) -> dict[str, Any]:
       data = json.loads(body)
       if "error" in data and data.get("error"):
         continue
+      if data.get("status") == "fail":  # ip-api error path
+        continue
       return {
         "ip": ip,
         "country": data.get("country_name") or data.get("country"),
@@ -653,14 +1094,60 @@ def _geo_lookup(ip: str) -> dict[str, Any]:
         "region": data.get("region") or data.get("regionName"),
         "city": data.get("city"),
         "org": data.get("org") or data.get("isp"),
+        "isp": data.get("isp"),
         "asn": data.get("asn") or data.get("as"),
+        "asname": data.get("asname"),
         "lat": data.get("latitude") or data.get("lat"),
         "lon": data.get("longitude") or data.get("lon"),
+        # Boolean ISP-type hints — only ip-api.com's extended fields
+        # provide these on the free tier. ipapi.co requires a paid
+        # plan for equivalent flags.
+        "mobile": data.get("mobile"),
+        "proxy": data.get("proxy"),
+        "hosting": data.get("hosting"),
+        "reverse": data.get("reverse"),
         "raw_source": url,
       }
     except Exception:
       continue
   return {"ip": ip, "error": "geo lookup unavailable"}
+
+
+def lookup_geo_basics(ip: str, *, timeout: float = 4.0) -> dict[str, Any] | None:
+  """Lightweight geo-only lookup used to auto-populate ``country`` /
+  ``provider`` when a static_ip row is created.
+
+  Distinct from ``probe_static_info`` in two ways:
+
+  * No streaming-unlock checks (those add ~6 s of wall time and aren't
+    needed when the operator is just typing in an IP).
+  * Hard-bounded total wall time via ``timeout`` so a slow / flaky
+    geo provider doesn't block the create endpoint perceptibly.
+
+  Returns ``None`` on any failure — caller should treat geo as
+  best-effort and never block on it.
+  """
+  try:
+    geo = _geo_lookup(ip)
+  except Exception as exc:  # noqa: BLE001
+    LOGGER.info("lookup_geo_basics failed for %s: %s", ip, exc)
+    return None
+  if not geo or geo.get("error"):
+    return None
+  return {
+    "country": geo.get("country"),
+    "country_code": geo.get("country_code"),
+    "city": geo.get("city"),
+    "org": geo.get("org"),
+    "isp": geo.get("isp"),
+    "asn": geo.get("asn"),
+    "asname": geo.get("asname"),
+    "mobile": geo.get("mobile"),
+    "proxy": geo.get("proxy"),
+    "hosting": geo.get("hosting"),
+    "reverse": geo.get("reverse"),
+    "raw_source": geo.get("raw_source"),
+  }
 
 
 def probe_static_info(ip: str) -> dict[str, Any]:
@@ -698,4 +1185,5 @@ __all__ = [
   "regex_parse_lines",
   "test_connectivity",
   "probe_static_info",
+  "lookup_geo_basics",
 ]

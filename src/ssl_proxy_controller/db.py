@@ -23,10 +23,86 @@ LOGGER = logging.getLogger("ssl_proxy_controller.db")
 LB_POLICIES = ("random", "round_robin", "ip_hash", "uri_hash")
 
 
-@dataclass(slots=True)
 class UpstreamRecord:
-  target: str
-  weight: int = 1
+  """One upstream pointing at ``host:port``.
+
+  Storage is structured: ``target_host`` and ``target_port`` are the
+  canonical fields. The composed ``target`` string ("host:port") is
+  exposed as a read-only property so existing callers that do
+  ``up.target`` keep working.
+
+  Constructors accept either form:
+
+      UpstreamRecord(target_host="1.2.3.4", target_port=8104)
+      UpstreamRecord(target="1.2.3.4:8104")          # legacy
+
+  Mixing both forms raises ``TypeError``. The string form is parsed
+  with ``rpartition(":")`` so IPv6 ``[::1]:80`` works.
+  """
+  __slots__ = ("target_host", "target_port", "weight")
+
+  def __init__(
+    self,
+    target: str | None = None,
+    *,
+    target_host: str | None = None,
+    target_port: int | None = None,
+    weight: int = 1,
+  ) -> None:
+    if target is not None:
+      if target_host is not None or target_port is not None:
+        raise TypeError(
+          "UpstreamRecord: pass either target='host:port' OR "
+          "target_host/target_port, not both"
+        )
+      host, sep, port = (target or "").rpartition(":")
+      if not sep:
+        raise ValueError(f"UpstreamRecord target missing ':' separator: {target!r}")
+      try:
+        port_int = int(port)
+      except ValueError as exc:
+        raise ValueError(f"UpstreamRecord target port not numeric: {target!r}") from exc
+      self.target_host = host
+      self.target_port = port_int
+    else:
+      if target_host is None or target_port is None:
+        raise TypeError(
+          "UpstreamRecord: must pass target='host:port' OR "
+          "(target_host=..., target_port=...)"
+        )
+      self.target_host = target_host
+      self.target_port = int(target_port)
+    # Both construction paths land here: enforce a non-empty host so the
+    # "host:port" string we render into Caddy never starts with ":".
+    if not (self.target_host or "").strip():
+      raise ValueError(
+        f"UpstreamRecord: target_host must be non-empty (got {self.target_host!r})"
+      )
+    if not (0 < self.target_port < 65536):
+      raise ValueError(
+        f"UpstreamRecord: target_port must be 1..65535 (got {self.target_port!r})"
+      )
+    self.weight = int(weight)
+
+  @property
+  def target(self) -> str:
+    """Composed "host:port" string. Always derived from the structured
+    fields; legacy callers and Caddy rendering still see the same shape."""
+    return f"{self.target_host}:{self.target_port}"
+
+  def __repr__(self) -> str:
+    return (f"UpstreamRecord(target_host={self.target_host!r}, "
+            f"target_port={self.target_port}, weight={self.weight})")
+
+  def __eq__(self, other: object) -> bool:
+    if not isinstance(other, UpstreamRecord):
+      return NotImplemented
+    return (self.target_host == other.target_host
+            and self.target_port == other.target_port
+            and self.weight == other.weight)
+
+  def __hash__(self) -> int:
+    return hash((self.target_host, self.target_port, self.weight))
 
 
 @dataclass(slots=True)
@@ -42,12 +118,16 @@ class RouteRecord:
     if self.upstreams is None:
       # Backward compat: a legacy record created without explicit
       # upstreams (tests, seed data, older callers) gets a single-item
-      # list derived from upstream_target.
-      self.upstreams = (
-        [UpstreamRecord(target=self.upstream_target, weight=1)]
-        if self.upstream_target
-        else []
-      )
+      # list derived from upstream_target. Malformed legacy strings
+      # degrade to "no upstreams" rather than crashing record build.
+      self.upstreams = []
+      if self.upstream_target:
+        try:
+          self.upstreams = [
+            UpstreamRecord(target=self.upstream_target, weight=1)
+          ]
+        except (ValueError, TypeError):
+          self.upstreams = []
     if self.lb_policy not in LB_POLICIES:
       raise ValueError(f"invalid lb_policy: {self.lb_policy}")
 
@@ -150,6 +230,19 @@ class ServiceRecord:
   # entries that the admin renders as a per-(service, node) form. Empty list
   # means "this service has no per-instance config" and the form is hidden.
   config_schema: list[dict] = None  # type: ignore[assignment]
+  # New Service flow fields. ``assigned_port`` is the host port allocated
+  # at create time (unique across all services); ``local_repo_dir`` is the
+  # absolute path on the operator's machine where the template was rendered;
+  # ``default_node_name`` is the node the service was first deployed to;
+  # ``status`` is 'active' | 'draft' | 'retired'; ``product_yaml`` caches
+  # the .product.yaml content; ``product_enabled`` controls public catalog
+  # visibility.
+  assigned_port: int | None = None
+  local_repo_dir: str | None = None
+  default_node_name: str | None = None
+  status: str = "active"
+  product_yaml: str | None = None
+  product_enabled: bool = False
 
   def __post_init__(self) -> None:
     if self.required_env is None:
@@ -276,6 +369,43 @@ class StaticIpRecord:
   last_probe_at: datetime | None
   created_at: datetime
   updated_at: datetime
+  # Standard ``user:pass`` credential pair, matching the industry
+  # convention for residential / datacenter proxy providers (Bright
+  # Data, Oxylabs, Smartproxy, etc.). Either or both may be empty —
+  # some providers use IP whitelist auth instead, and ssh-with-key
+  # rows have no password. The URI builder produces the right form
+  # for whatever combination is set.
+  username: str | None = None
+  password: str | None = None
+  # NULL  -> "auto-detect from creds" (default for paid proxies)
+  # 'anonymous' -> open proxy; "missing" badge would be a lie
+  # 'whitelist' -> provider validates by source IP (no creds in URI)
+  auth_mode: str | None = None
+  # 'static'  -> ``ip`` is the address we connect to AND the address
+  #              whose location/risk matters (default; preserves
+  #              existing rows).
+  # 'gateway' -> ``ip`` is a provider gateway hostname (Decodo,
+  #              Bright Data, Oxylabs, etc.); the actual exit IP is
+  #              encoded in the username and stored separately in
+  #              ``exit_ip`` for geo / quality lookups.
+  kind: str = "static"
+  # Set only when kind='gateway' — the upstream-bound exit IP. Geo,
+  # quality, and country/type/risk display all use this when present.
+  # The connection target stays ``ip`` (the gateway).
+  exit_ip: str | None = None
+  # Vendor / where the operator bought this proxy from. Universal
+  # field — applies to every row, not just kind=gateway. Examples:
+  # ``decodo`` / ``proxy-cheap`` / ``brightdata`` / ``rapidseedbox`` /
+  # ``personal-server`` / etc. Was originally named ``gateway_provider``
+  # back when only gateway rows had a vendor; we kept the column name
+  # for back-compat (no migration needed) but the meaning is now
+  # "vendor" universally. Used by the UI as the "Vendor" badge in the
+  # row's IP cell + the Edit modal's "Purchased from" field.
+  gateway_provider: str | None = None
+  # When the lease / subscription for this entry expires. Operator-set;
+  # the row's "Expires" cell shows a relative-date indicator and
+  # color-codes <7d / <30d / ok. NULL = no expiry tracked.
+  expires_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -561,7 +691,7 @@ class Database:
       return {}
     cursor.execute(
       """
-      SELECT domain, target, weight
+      SELECT domain, target_host, target_port, weight
       FROM route_upstreams
       WHERE domain = ANY(%s)
       ORDER BY domain ASC, id ASC
@@ -570,9 +700,23 @@ class Database:
     )
     grouped: dict[str, list[UpstreamRecord]] = {}
     for row in cursor.fetchall():
-      grouped.setdefault(row["domain"], []).append(
-        UpstreamRecord(target=row["target"], weight=int(row["weight"]))
-      )
+      # UpstreamRecord enforces non-empty host + valid port. If a stray
+      # row has bad data (shouldn't happen post-migration, but Caddy
+      # rendering shouldn't be hostage to one bad row in the table),
+      # log + skip rather than crash list_routes.
+      try:
+        rec = UpstreamRecord(
+          target_host=row["target_host"],
+          target_port=int(row["target_port"]),
+          weight=int(row["weight"]),
+        )
+      except (ValueError, TypeError) as exc:
+        LOGGER.warning(
+          "route_upstreams row %s has invalid host/port (%r:%r): %s",
+          row.get("domain"), row.get("target_host"), row.get("target_port"), exc,
+        )
+        continue
+      grouped.setdefault(row["domain"], []).append(rec)
     return grouped
 
   def _build_route_records(
@@ -587,19 +731,24 @@ class Database:
       # first one (the canonical "primary"). Otherwise fall back to the
       # legacy column so old-shape routes still read cleanly.
       primary = ups[0].target if ups else row["upstream_target"]
+      # Legacy fallback: route_upstreams empty but routes.upstream_target
+      # has a string. Try to parse it; if malformed (no colon, bad port,
+      # empty host), skip rather than crash the whole list. The operator
+      # will see the bad row in the admin UI as "no upstreams".
+      legacy_ups: list[UpstreamRecord] = []
+      if not ups and row["upstream_target"]:
+        try:
+          legacy_ups = [UpstreamRecord(target=row["upstream_target"], weight=1)]
+        except (ValueError, TypeError) as exc:
+          LOGGER.warning("route %s: malformed upstream_target %r: %s",
+                         row["domain"], row["upstream_target"], exc)
       records.append(
         RouteRecord(
           domain=row["domain"],
           upstream_target=primary,
           enabled=row["enabled"],
           updated_at=row["updated_at"],
-          upstreams=list(ups)
-          if ups
-          else (
-            [UpstreamRecord(target=row["upstream_target"], weight=1)]
-            if row["upstream_target"]
-            else []
-          ),
+          upstreams=list(ups) if ups else legacy_ups,
           lb_policy=row["lb_policy"] or "random",
         )
       )
@@ -680,12 +829,14 @@ class Database:
         for up in effective_upstreams:
           cursor.execute(
             """
-            INSERT INTO route_upstreams (domain, target, weight, updated_at)
-            VALUES (%s, %s, %s, NOW())
-            ON CONFLICT (domain, target) DO UPDATE
-              SET weight = EXCLUDED.weight, updated_at = NOW()
+            INSERT INTO route_upstreams
+              (domain, target_host, target_port, weight, updated_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (domain, target_host, target_port) DO UPDATE
+              SET weight = EXCLUDED.weight,
+                  updated_at = NOW()
             """,
-            (domain, up.target, up.weight),
+            (domain, up.target_host, up.target_port, up.weight),
           )
       connection.commit()
 
@@ -735,10 +886,11 @@ class Database:
         for up in upstreams:
           cursor.execute(
             """
-            INSERT INTO route_upstreams (domain, target, weight, updated_at)
-            VALUES (%s, %s, %s, NOW())
+            INSERT INTO route_upstreams
+              (domain, target_host, target_port, weight, updated_at)
+            VALUES (%s, %s, %s, %s, NOW())
             """,
-            (domain, up.target, up.weight),
+            (domain, up.target_host, up.target_port, up.weight),
           )
       connection.commit()
       return True
@@ -772,6 +924,24 @@ class Database:
           RETURNING domain
           """,
           (enabled, domain),
+        )
+        row = cursor.fetchone()
+      connection.commit()
+      return row is not None
+
+  def set_route_service(self, domain: str, service_name: str | None) -> bool:
+    """Tag a route with the service that owns it. Used by the New
+    Service flow to record the route ↔ service back-pointer."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          """
+          UPDATE routes
+          SET service_name = %s, updated_at = NOW()
+          WHERE domain = %s
+          RETURNING domain
+          """,
+          (service_name, domain),
         )
         row = cursor.fetchone()
       connection.commit()
@@ -1295,7 +1465,13 @@ class Database:
     "COALESCE(depends_on, ARRAY[]::TEXT[]) AS depends_on, "
     "COALESCE(exposed_ports, ARRAY[]::INTEGER[]) AS exposed_ports, "
     "deploy_yaml, deploy_yaml_fetched_at, "
-    "COALESCE(config_schema, '[]'::jsonb) AS config_schema"
+    "COALESCE(config_schema, '[]'::jsonb) AS config_schema, "
+    # New Service flow columns. COALESCE on status / product_enabled keeps
+    # legacy rows that pre-date these columns reading as sane defaults.
+    "assigned_port, local_repo_dir, default_node_name, "
+    "COALESCE(status, 'active') AS status, "
+    "product_yaml, "
+    "COALESCE(product_enabled, FALSE) AS product_enabled"
   )
 
   @staticmethod
@@ -1327,6 +1503,12 @@ class Database:
       deploy_yaml=row.get("deploy_yaml"),
       deploy_yaml_fetched_at=row.get("deploy_yaml_fetched_at"),
       config_schema=list(row.get("config_schema") or []),
+      assigned_port=row.get("assigned_port"),
+      local_repo_dir=row.get("local_repo_dir"),
+      default_node_name=row.get("default_node_name"),
+      status=(row.get("status") or "active"),
+      product_yaml=row.get("product_yaml"),
+      product_enabled=bool(row.get("product_enabled") or False),
     )
 
   def list_services(self) -> list[ServiceRecord]:
@@ -1355,11 +1537,15 @@ class Database:
             default_branch, compose_file, install_dir_template,
             default_env, pre_deploy_command, post_deploy_command,
             compose_template, config_files,
+            assigned_port, local_repo_dir, default_node_name,
+            status, product_yaml, product_enabled,
             created_at, updated_at)
           VALUES (%(name)s, %(display_name)s, %(description)s, %(github_repo_url)s,
             %(default_branch)s, %(compose_file)s, %(install_dir_template)s,
             %(default_env)s::jsonb, %(pre_deploy_command)s, %(post_deploy_command)s,
             %(compose_template)s, %(config_files)s::jsonb,
+            %(assigned_port)s, %(local_repo_dir)s, %(default_node_name)s,
+            %(status)s, %(product_yaml)s, %(product_enabled)s,
             NOW(), NOW())
           RETURNING {self._SERVICE_COLUMNS}
           """,
@@ -1376,6 +1562,12 @@ class Database:
             "post_deploy_command": service.post_deploy_command,
             "compose_template": service.compose_template,
             "config_files": _json.dumps(service.config_files or {}),
+            "assigned_port": service.assigned_port,
+            "local_repo_dir": service.local_repo_dir,
+            "default_node_name": service.default_node_name,
+            "status": service.status or "active",
+            "product_yaml": service.product_yaml,
+            "product_enabled": bool(service.product_enabled),
           },
         )
         row = cursor.fetchone()
@@ -1383,6 +1575,161 @@ class Database:
     if row is None:
       raise RuntimeError(f"insert did not return service: {service.name}")
     return self._row_to_service(row)
+
+  def create_service_and_route_atomic(
+    self,
+    service: ServiceRecord,
+    *,
+    manifest_fields: dict,
+    route_domain: str,
+    route_upstreams: list[UpstreamRecord],
+    route_lb_policy: str = "random",
+  ) -> tuple[ServiceRecord, RouteRecord]:
+    """Run service insert + manifest backfill + route insert + route↔service
+    link in a single Postgres transaction.
+
+    Used by the New Service flow so we never end up with a service row
+    without its route or vice versa. If anything in this method raises,
+    the surrounding ``with self.connect()`` block exits without
+    committing, Postgres rolls everything back, and the caller sees
+    one exception.
+
+    SQL is duplicated from ``insert_service`` / ``update_service`` /
+    ``insert_route`` / ``set_route_service`` rather than nested calls
+    because each of those wants its own connection + commit. Keeping
+    the SQL inline here is uglier but it's the smallest, lowest-risk
+    way to get atomicity without overhauling the Database class.
+    """
+    import json as _json
+    if route_lb_policy not in LB_POLICIES:
+      raise ValueError(f"invalid lb_policy: {route_lb_policy}")
+    primary_target = route_upstreams[0].target if route_upstreams else None
+
+    # Filter manifest_fields to the same allowlist as update_service so
+    # callers can't smuggle extra columns through this entry point.
+    allowed_manifest = {
+      "exposed_ports", "required_env", "healthcheck", "depends_on",
+      "config_schema", "deploy_yaml", "deploy_yaml_fetched_at",
+    }
+    safe_manifest = {k: v for k, v in (manifest_fields or {}).items() if k in allowed_manifest}
+
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        # 1. Insert services row.
+        cursor.execute(
+          f"""
+          INSERT INTO services (name, display_name, description, github_repo_url,
+            default_branch, compose_file, install_dir_template,
+            default_env, pre_deploy_command, post_deploy_command,
+            compose_template, config_files,
+            assigned_port, local_repo_dir, default_node_name,
+            status, product_yaml, product_enabled,
+            created_at, updated_at)
+          VALUES (%(name)s, %(display_name)s, %(description)s, %(github_repo_url)s,
+            %(default_branch)s, %(compose_file)s, %(install_dir_template)s,
+            %(default_env)s::jsonb, %(pre_deploy_command)s, %(post_deploy_command)s,
+            %(compose_template)s, %(config_files)s::jsonb,
+            %(assigned_port)s, %(local_repo_dir)s, %(default_node_name)s,
+            %(status)s, %(product_yaml)s, %(product_enabled)s,
+            NOW(), NOW())
+          RETURNING {self._SERVICE_COLUMNS}
+          """,
+          {
+            "name": service.name,
+            "display_name": service.display_name,
+            "description": service.description,
+            "github_repo_url": service.github_repo_url,
+            "default_branch": service.default_branch,
+            "compose_file": service.compose_file,
+            "install_dir_template": service.install_dir_template,
+            "default_env": _json.dumps(service.default_env or {}),
+            "pre_deploy_command": service.pre_deploy_command,
+            "post_deploy_command": service.post_deploy_command,
+            "compose_template": service.compose_template,
+            "config_files": _json.dumps(service.config_files or {}),
+            "assigned_port": service.assigned_port,
+            "local_repo_dir": service.local_repo_dir,
+            "default_node_name": service.default_node_name,
+            "status": service.status or "active",
+            "product_yaml": service.product_yaml,
+            "product_enabled": bool(service.product_enabled),
+          },
+        )
+        service_row = cursor.fetchone()
+        if service_row is None:
+          raise RuntimeError(f"service insert returned no row: {service.name}")
+
+        # 2. Backfill manifest fields. We do this as a second statement
+        # rather than inlining into INSERT because the SQL columns / types
+        # are shaped for arrays and JSONB and we want the same coercion
+        # path as update_service (kept simple here — only allowlisted keys
+        # made it past the filter above).
+        if safe_manifest:
+          sets = []
+          params: dict = {"name": service.name}
+          for k, v in safe_manifest.items():
+            if k == "healthcheck":
+              sets.append(f"{k} = %({k})s::jsonb")
+              params[k] = _json.dumps(v or {})
+            elif k == "config_schema":
+              sets.append(f"{k} = %({k})s::jsonb")
+              params[k] = _json.dumps(v or [])
+            elif k in ("required_env", "depends_on"):
+              sets.append(f"{k} = %({k})s")
+              params[k] = list(v or [])
+            elif k == "exposed_ports":
+              sets.append(f"{k} = %({k})s")
+              params[k] = [int(p) for p in (v or [])]
+            else:
+              sets.append(f"{k} = %({k})s")
+              params[k] = v
+          sets.append("updated_at = NOW()")
+          cursor.execute(
+            f"UPDATE services SET {', '.join(sets)} WHERE name = %(name)s "
+            f"RETURNING {self._SERVICE_COLUMNS}",
+            params,
+          )
+          service_row = cursor.fetchone() or service_row
+
+        # 3. Insert routes row.
+        cursor.execute(
+          """
+          INSERT INTO routes (domain, upstream_target, enabled, updated_at,
+                              lb_policy, service_name)
+          VALUES (%s, %s, %s, NOW(), %s, %s)
+          RETURNING domain
+          """,
+          (route_domain, primary_target, True, route_lb_policy, service.name),
+        )
+        if cursor.fetchone() is None:
+          raise RuntimeError(f"route insert returned no row: {route_domain}")
+
+        # 4. Insert route_upstreams rows.
+        for up in route_upstreams:
+          cursor.execute(
+            """
+            INSERT INTO route_upstreams
+              (domain, target_host, target_port, weight, updated_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (domain, target_host, target_port) DO UPDATE
+              SET weight = EXCLUDED.weight,
+                  updated_at = NOW()
+            """,
+            (route_domain, up.target_host, up.target_port, up.weight),
+          )
+      connection.commit()
+
+    # 5. Re-read both rows through the normal accessors so the caller
+    # gets fully-hydrated records (with upstream lists joined in) without
+    # this method having to know about _hydrate_upstreams etc.
+    service_record = self.get_service(service.name)
+    route_record = self.get_route(route_domain)
+    if service_record is None or route_record is None:
+      raise RuntimeError(
+        f"atomic create disappeared after commit: "
+        f"service={service.name} route={route_domain}"
+      )
+    return service_record, route_record
 
   def update_service(self, name: str, fields: dict) -> ServiceRecord | None:
     import json as _json
@@ -1393,7 +1740,10 @@ class Database:
                # Manifest fields written by the deploy machinery.
                "required_env", "healthcheck", "depends_on", "exposed_ports",
                "deploy_yaml", "deploy_yaml_fetched_at",
-               "config_schema"}
+               "config_schema",
+               # New Service flow fields.
+               "assigned_port", "local_repo_dir", "default_node_name",
+               "status", "product_yaml", "product_enabled"}
     sets = []
     params: dict = {"name": name}
     for k, v in fields.items():
@@ -1557,7 +1907,8 @@ class Database:
     COALESCE(static_info, '{}'::jsonb) AS static_info,
     loop_test_seconds, last_test_at, last_test_success,
     last_test_latency_ms, last_test_error, last_probe_at,
-    created_at, updated_at
+    created_at, updated_at, username, password, auth_mode,
+    kind, exit_ip, gateway_provider, expires_at
   """
 
   def _row_to_static_ip(self, row: dict) -> StaticIpRecord:
@@ -1592,6 +1943,13 @@ class Database:
       last_probe_at=row["last_probe_at"],
       created_at=row["created_at"],
       updated_at=row["updated_at"],
+      username=row.get("username"),
+      password=row.get("password"),
+      auth_mode=row.get("auth_mode"),
+      kind=row.get("kind") or "static",
+      exit_ip=row.get("exit_ip"),
+      gateway_provider=row.get("gateway_provider"),
+      expires_at=row.get("expires_at"),
     )
 
   def list_static_ips(
@@ -1602,6 +1960,13 @@ class Database:
     sort_clauses = {
       "country": "country NULLS LAST, provider NULLS LAST, ip ASC",
       "provider": "provider NULLS LAST, country NULLS LAST, ip ASC",
+      # Vendor / "purchased from" — groups rows by where they came from
+      # (decodo / proxy-cheap / personal-server / etc.). Country is
+      # the secondary key so each vendor's rows are still geo-grouped.
+      "vendor": "gateway_provider NULLS LAST, country NULLS LAST, ip ASC",
+      # Expires (soonest first) — useful when the operator wants to
+      # see what's about to lapse. NULL goes to the end.
+      "expires": "expires_at NULLS LAST, ip ASC",
       "ip": "ip ASC",
       "created": "created_at DESC",
     }
@@ -1635,26 +2000,55 @@ class Database:
     notes: str | None = None,
     static_info: dict | None = None,
     loop_test_seconds: int | None = None,
+    username: str | None = None,
+    password: str | None = None,
+    auth_mode: str | None = None,
+    kind: str | None = None,
+    exit_ip: str | None = None,
+    gateway_provider: str | None = None,
+    expires_at: datetime | None = None,
   ) -> StaticIpRecord:
     import json as _json
     info = _json.dumps(static_info or {})
+    # Default kind=static. Anything else must be a recognized literal —
+    # caller's responsibility to pass 'gateway' explicitly when this is
+    # a Decodo / BrightData / Oxylabs-style upstream.
+    kind_val = (kind or "static").strip() or "static"
     with self.connect() as connection:
       with connection.cursor() as cursor:
         cursor.execute(
           f"""
           INSERT INTO static_ips
             (ip, port, protocol, country, provider, label, notes,
-             static_info, loop_test_seconds)
-          VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+             static_info, loop_test_seconds, username, password, auth_mode,
+             kind, exit_ip, gateway_provider, expires_at)
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s,
+                  %s, %s, %s, %s)
           ON CONFLICT (ip, COALESCE(port, 0), protocol) DO UPDATE SET
             country = COALESCE(EXCLUDED.country, static_ips.country),
             provider = COALESCE(EXCLUDED.provider, static_ips.provider),
             label = COALESCE(EXCLUDED.label, static_ips.label),
             notes = COALESCE(EXCLUDED.notes, static_ips.notes),
+            username = COALESCE(EXCLUDED.username, static_ips.username),
+            password = COALESCE(EXCLUDED.password, static_ips.password),
+            auth_mode = COALESCE(EXCLUDED.auth_mode, static_ips.auth_mode),
+            kind = EXCLUDED.kind,
+            -- exit_ip is gateway-specific (only meaningful when kind=
+            -- 'gateway'); on a transition to 'static' we null it.
+            exit_ip = CASE WHEN EXCLUDED.kind = 'gateway'
+                           THEN COALESCE(EXCLUDED.exit_ip, static_ips.exit_ip)
+                           ELSE NULL END,
+            -- gateway_provider is now UNIVERSAL (the row's vendor /
+            -- "purchased from"). It applies regardless of kind, so we
+            -- preserve via COALESCE — never null on kind change.
+            gateway_provider = COALESCE(EXCLUDED.gateway_provider, static_ips.gateway_provider),
+            expires_at = COALESCE(EXCLUDED.expires_at, static_ips.expires_at),
             updated_at = NOW()
           RETURNING {self._STATIC_IP_COLUMNS}
           """,
-          (ip, port, protocol, country, provider, label, notes, info, loop_test_seconds),
+          (ip, port, protocol, country, provider, label, notes, info,
+           loop_test_seconds, username, password, auth_mode,
+           kind_val, exit_ip, gateway_provider, expires_at),
         )
         row = cursor.fetchone()
       connection.commit()
@@ -1669,6 +2063,8 @@ class Database:
     "static_info", "loop_test_seconds",
     "last_test_at", "last_test_success", "last_test_latency_ms",
     "last_test_error", "last_probe_at",
+    "username", "password", "auth_mode",
+    "kind", "exit_ip", "gateway_provider", "expires_at",
   })
 
   def bulk_insert_static_ips(
@@ -1709,8 +2105,17 @@ class Database:
       notes = rec.get("notes") or None
       info = _json.dumps(rec.get("static_info") or {})
       loop_seconds = rec.get("loop_test_seconds")
+      username = rec.get("username") or None
+      password = rec.get("password") or None
+      auth_mode = rec.get("auth_mode") or None
+      kind = (rec.get("kind") or "static").strip() or "static"
+      exit_ip = rec.get("exit_ip") or None
+      gw_provider = rec.get("gateway_provider") or None
+      expires_at = rec.get("expires_at") or None
       valid.append((
-        ip, port, protocol, country, provider, label, notes, info, loop_seconds,
+        ip, port, protocol, country, provider, label, notes, info,
+        loop_seconds, username, password, auth_mode,
+        kind, exit_ip, gw_provider, expires_at,
       ))
       raw_for_index.append(rec)
 
@@ -1718,12 +2123,13 @@ class Database:
       return [], pre_errors
 
     placeholders = ",\n          ".join(
-      ["(%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)"] * len(valid)
+      ["(%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s)"] * len(valid)
     )
     sql = f"""
       INSERT INTO static_ips
         (ip, port, protocol, country, provider, label, notes,
-         static_info, loop_test_seconds)
+         static_info, loop_test_seconds, username, password, auth_mode,
+         kind, exit_ip, gateway_provider, expires_at)
       VALUES
         {placeholders}
       ON CONFLICT (ip, COALESCE(port, 0), protocol) DO UPDATE SET
@@ -1731,6 +2137,18 @@ class Database:
         provider = COALESCE(EXCLUDED.provider, static_ips.provider),
         label = COALESCE(EXCLUDED.label, static_ips.label),
         notes = COALESCE(EXCLUDED.notes, static_ips.notes),
+        username = COALESCE(EXCLUDED.username, static_ips.username),
+        password = COALESCE(EXCLUDED.password, static_ips.password),
+        auth_mode = COALESCE(EXCLUDED.auth_mode, static_ips.auth_mode),
+        kind = EXCLUDED.kind,
+        -- exit_ip remains kind-aware (only meaningful for gateway).
+        exit_ip = CASE WHEN EXCLUDED.kind = 'gateway'
+                       THEN COALESCE(EXCLUDED.exit_ip, static_ips.exit_ip)
+                       ELSE NULL END,
+        -- gateway_provider is now UNIVERSAL (universal vendor field),
+        -- preserved across kind changes via plain COALESCE.
+        gateway_provider = COALESCE(EXCLUDED.gateway_provider, static_ips.gateway_provider),
+        expires_at = COALESCE(EXCLUDED.expires_at, static_ips.expires_at),
         updated_at = NOW()
       RETURNING {self._STATIC_IP_COLUMNS}
     """
@@ -1771,6 +2189,16 @@ class Database:
         params.append(value)
     if not sets:
       return self.get_static_ip(ip_id)
+    # Kind-aware nulling for ``exit_ip`` only — when the PATCH flips
+    # the row to ``kind='static'`` and doesn't pass an explicit
+    # exit_ip, we null it (a static row has no meaningful exit IP).
+    # ``gateway_provider`` is now UNIVERSAL (the operator's "vendor"
+    # field, applies to every row regardless of kind) so we never
+    # null it on a kind transition.
+    new_kind = fields.get("kind")
+    if isinstance(new_kind, str) and new_kind.strip().lower() == "static":
+      if "exit_ip" not in fields:
+        sets.append("exit_ip = NULL")
     params.append(int(ip_id))
     sql = (
       f"UPDATE static_ips SET {', '.join(sets)} "
@@ -2687,12 +3115,15 @@ class Database:
       "updated_at": row.get("updated_at"),
     }
 
+  _XOUT_PRESET_COLS = (
+    "id, name, description, inbounds, created_at, updated_at"
+  )
+
   def list_xout_presets(self) -> list[dict]:
     with self.connect() as connection:
       with connection.cursor() as cursor:
         cursor.execute(
-          "SELECT id, name, description, inbounds, created_at, updated_at "
-          "FROM xout_presets ORDER BY name ASC"
+          f"SELECT {self._XOUT_PRESET_COLS} FROM xout_presets ORDER BY name ASC"
         )
         return [self._row_to_xout_preset(r) for r in cursor.fetchall()]
 
@@ -2700,8 +3131,7 @@ class Database:
     with self.connect() as connection:
       with connection.cursor() as cursor:
         cursor.execute(
-          "SELECT id, name, description, inbounds, created_at, updated_at "
-          "FROM xout_presets WHERE id = %s",
+          f"SELECT {self._XOUT_PRESET_COLS} FROM xout_presets WHERE id = %s",
           (int(preset_id),),
         )
         row = cursor.fetchone()
@@ -2714,10 +3144,10 @@ class Database:
     with self.connect() as connection:
       with connection.cursor() as cursor:
         cursor.execute(
-          """
+          f"""
           INSERT INTO xout_presets (name, description, inbounds, created_at, updated_at)
           VALUES (%s, %s, %s::jsonb, NOW(), NOW())
-          RETURNING id, name, description, inbounds, created_at, updated_at
+          RETURNING {self._XOUT_PRESET_COLS}
           """,
           (name, description, _json.dumps(inbounds or [])),
         )
@@ -2746,7 +3176,7 @@ class Database:
         cursor.execute(
           f"""UPDATE xout_presets SET {', '.join(sets)}, updated_at = NOW()
               WHERE id = %(id)s
-              RETURNING id, name, description, inbounds, created_at, updated_at""",
+              RETURNING {self._XOUT_PRESET_COLS}""",
           params,
         )
         row = cursor.fetchone()
@@ -2834,13 +3264,23 @@ class Database:
   # ---------- xout tokens (= users) ----------
 
   @staticmethod
+  def _generate_token_value() -> str:
+    """24 alphanumeric chars (~144 bits of entropy). Used as the public
+    URL slug for token-scoped endpoints. Long enough to make brute-force
+    enumeration impractical; short enough to fit comfortably in a URL."""
+    import secrets
+    import string
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(24))
+
+  @staticmethod
   def _row_to_xout_token(row: dict) -> dict:
     return {
       "id": int(row["id"]),
       "name": row["name"],
       "uuid": row["uuid"],
+      "token_value": row["token_value"],
       "password": row.get("password"),
-      "is_default": bool(row.get("is_default")),
       "monthly_quota_gb": int(row.get("monthly_quota_gb") or 1000),
       "monthly_reset_day": int(row.get("monthly_reset_day") or 1),
       "notes": row.get("notes"),
@@ -2849,7 +3289,7 @@ class Database:
     }
 
   _XOUT_TOKEN_COLS = (
-    "id, name, uuid, password, is_default, monthly_quota_gb, "
+    "id, name, uuid, token_value, password, monthly_quota_gb, "
     "monthly_reset_day, notes, created_at, updated_at"
   )
 
@@ -2871,37 +3311,45 @@ class Database:
         row = cursor.fetchone()
         return None if row is None else self._row_to_xout_token(row)
 
-  def get_default_xout_token(self) -> dict | None:
-    with self.connect() as connection:
-      with connection.cursor() as cursor:
-        cursor.execute(
-          f"SELECT {self._XOUT_TOKEN_COLS} FROM xout_tokens WHERE is_default LIMIT 1"
-        )
-        row = cursor.fetchone()
-        return None if row is None else self._row_to_xout_token(row)
-
   def insert_xout_token(
     self, *, name: str, uuid: str, password: str | None = None,
     monthly_quota_gb: int = 1000, monthly_reset_day: int = 1,
     notes: str | None = None,
   ) -> dict:
-    with self.connect() as connection:
-      with connection.cursor() as cursor:
-        cursor.execute(
-          f"""
-          INSERT INTO xout_tokens (name, uuid, password, monthly_quota_gb,
-            monthly_reset_day, notes, created_at, updated_at)
-          VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
-          RETURNING {self._XOUT_TOKEN_COLS}
-          """,
-          (name, uuid, password, int(monthly_quota_gb),
-           int(monthly_reset_day), notes),
-        )
-        row = cursor.fetchone()
-      connection.commit()
-    return self._row_to_xout_token(row)
+    """token_value is auto-generated; the operator never picks it. Retry
+    on the (vanishingly unlikely) collision against the UNIQUE index."""
+    last_exc: Exception | None = None
+    for _attempt in range(5):
+      candidate = self._generate_token_value()
+      try:
+        with self.connect() as connection:
+          with connection.cursor() as cursor:
+            cursor.execute(
+              f"""
+              INSERT INTO xout_tokens (name, uuid, token_value, password,
+                monthly_quota_gb, monthly_reset_day, notes, created_at, updated_at)
+              VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+              RETURNING {self._XOUT_TOKEN_COLS}
+              """,
+              (name, uuid, candidate, password, int(monthly_quota_gb),
+               int(monthly_reset_day), notes),
+            )
+            row = cursor.fetchone()
+          connection.commit()
+        return self._row_to_xout_token(row)
+      except Exception as exc:  # noqa: BLE001
+        last_exc = exc
+        # Only retry on token_value collisions; surface other errors.
+        if "idx_xout_tokens_token_value" not in str(exc):
+          raise
+    raise RuntimeError(
+      "could not generate a unique token_value after 5 attempts"
+    ) from last_exc
 
   def update_xout_token(self, token_id: int, fields: dict) -> dict | None:
+    """token_value is intentionally NOT in the allow-list — callers must
+    use regenerate_xout_token_value() to roll it (forces them to think
+    about the URL invalidation that comes with it)."""
     allowed = {"name", "password", "monthly_quota_gb", "monthly_reset_day", "notes"}
     sets = []
     params: dict = {"id": int(token_id)}
@@ -2932,30 +3380,31 @@ class Database:
       connection.commit()
     return deleted > 0
 
-  def set_default_xout_token(self, token_id: int) -> dict | None:
-    """Mark exactly this row as the default; clear it on every other row.
-    Used by 'newly-deployed xout instance seeds the first user from the
-    default token' and by the operator's explicit toggle in the UI.
-
-    Two operators clicking 'Set default' on different tokens at the
-    same time would race against the partial unique index — losing
-    transaction would error. We grab a transaction-scoped advisory
-    lock first so the second caller waits instead of failing."""
-    with self.connect() as connection:
-      with connection.cursor() as cursor:
-        # Lock key chosen by hashing a stable string; same hashtext()
-        # call for every caller so they all serialize on the same lock.
-        cursor.execute("SELECT pg_advisory_xact_lock(hashtext('xout_tokens.is_default'))")
-        cursor.execute("UPDATE xout_tokens SET is_default = FALSE WHERE is_default")
-        cursor.execute(
-          f"""UPDATE xout_tokens SET is_default = TRUE, updated_at = NOW()
-              WHERE id = %s
-              RETURNING {self._XOUT_TOKEN_COLS}""",
-          (int(token_id),),
-        )
-        row = cursor.fetchone()
-      connection.commit()
-    return None if row is None else self._row_to_xout_token(row)
+  def regenerate_xout_token_value(self, token_id: int) -> dict | None:
+    """Roll the public URL slug for this token. Existing subscription
+    URLs that embed the old value stop working immediately."""
+    last_exc: Exception | None = None
+    for _attempt in range(5):
+      candidate = self._generate_token_value()
+      try:
+        with self.connect() as connection:
+          with connection.cursor() as cursor:
+            cursor.execute(
+              f"""UPDATE xout_tokens SET token_value = %s, updated_at = NOW()
+                  WHERE id = %s
+                  RETURNING {self._XOUT_TOKEN_COLS}""",
+              (candidate, int(token_id)),
+            )
+            row = cursor.fetchone()
+          connection.commit()
+        return None if row is None else self._row_to_xout_token(row)
+      except Exception as exc:  # noqa: BLE001
+        last_exc = exc
+        if "idx_xout_tokens_token_value" not in str(exc):
+          raise
+    raise RuntimeError(
+      "could not regenerate a unique token_value after 5 attempts"
+    ) from last_exc
 
   # ---- node-token junction ----
 
@@ -3020,6 +3469,48 @@ class Database:
         deleted = cursor.rowcount
       connection.commit()
     return deleted > 0
+
+  def replace_xout_node_token_set(
+    self, node_name: str, token_ids: list[int],
+  ) -> dict:
+    """Replace the set of tokens provisioned on this node with exactly
+    ``token_ids``. Rows for tokens not in the new set are deleted (and
+    their cached subscription strings with them); rows for tokens that
+    are in the new set are inserted (or left intact if already present).
+
+    Returns ``{added: [...], removed: [...], kept: [...]}`` so the
+    caller can log/announce the diff."""
+    new_set = {int(t) for t in token_ids}
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        cursor.execute(
+          "SELECT token_id FROM xout_node_tokens WHERE node_name = %s",
+          (node_name,),
+        )
+        existing = {int(r["token_id"]) for r in cursor.fetchall()}
+        to_remove = existing - new_set
+        to_add = new_set - existing
+        kept = existing & new_set
+        if to_remove:
+          cursor.execute(
+            "DELETE FROM xout_node_tokens WHERE node_name = %s "
+            "AND token_id = ANY(%s::bigint[])",
+            (node_name, list(to_remove)),
+          )
+        for tid in sorted(to_add):
+          cursor.execute(
+            """INSERT INTO xout_node_tokens
+                 (node_name, token_id, provisioned_at)
+               VALUES (%s, %s, NOW())
+               ON CONFLICT (node_name, token_id) DO NOTHING""",
+            (node_name, tid),
+          )
+      connection.commit()
+    return {
+      "added": sorted(to_add),
+      "removed": sorted(to_remove),
+      "kept": sorted(kept),
+    }
 
   # ---- traffic ----
 
@@ -3106,7 +3597,7 @@ class Database:
       with connection.cursor() as cursor:
         cursor.execute(
           """
-          SELECT t.id, t.name, t.uuid, t.password, t.is_default,
+          SELECT t.id, t.name, t.uuid, t.token_value, t.password,
                  t.monthly_quota_gb, t.monthly_reset_day, t.notes,
                  t.created_at, t.updated_at,
                  COALESCE(nt.node_count, 0) AS node_count,

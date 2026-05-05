@@ -1,0 +1,14 @@
+product:
+  enabled: false
+  visibility: private
+  slug: user
+  display_name: User Service
+  tagline: Sign-in, billing, usage tracking
+  category: Platform
+  entry_url: https://user.develop.cc/
+  status: active
+
+  auth:
+    required: false
+  pricing:
+    tier: free
