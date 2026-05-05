@@ -173,6 +173,23 @@
   }
   .input.mono, .textarea.mono { font-family: var(--mono); }
   .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  /* form-grid: label / input pairs, label flush-right, input takes the rest.
+     Used by the Xout product editor, Grant / Revoke modals, Generic Products
+     modal — anything that wants vertically-stacked rows of (label, control).
+     Children with `style="grid-column: 1/-1"` span both columns. */
+  .form-grid {
+    display: grid;
+    grid-template-columns: minmax(120px, max-content) minmax(0, 1fr);
+    gap: 10px 14px;
+    align-items: center;
+  }
+  .form-grid > label { font-weight: 500; color: var(--text-dim); justify-self: end; }
+  /* Section labels that span the whole grid row (e.g. "Visible inbounds")
+     should align to the left, not right. */
+  .form-grid > label[style*="grid-column"] {
+    justify-self: stretch; text-align: left;
+    color: var(--text); font-weight: 600;
+  }
   .form-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px; }
   .inline-checkbox { display: flex; align-items: center; gap: 8px; font-weight: 500; }
 
@@ -595,6 +612,33 @@
   document.getElementById("modal-backdrop").addEventListener("click", (e) => {
     if (e.target === e.currentTarget) Modal.close();
   });
+
+  // Higher-level helper used by the user/product/xout editors:
+  //   openModal({ title, body, onSave, saveLabel, size })
+  // Builds a Cancel + Save footer; clicking Save calls onSave() (which
+  // can throw, or be async), and only closes the modal on success.
+  // Errors surface as a toast — no half-saved state.
+  function openModal({ title, body, onSave, saveLabel, size }) {
+    const cancelBtn = h("button", { class: "btn", onclick: () => Modal.close() }, "Cancel");
+    const saveBtn = h("button", { class: "btn btn-primary" }, saveLabel || "Save");
+    saveBtn.addEventListener("click", async () => {
+      saveBtn.disabled = true;
+      const original = saveBtn.textContent;
+      saveBtn.textContent = "Saving…";
+      try {
+        if (onSave) await onSave();
+        Modal.close();
+      } catch (err) {
+        toast("error", "Save failed", err && err.message ? err.message : String(err));
+      } finally {
+        saveBtn.disabled = false;
+        saveBtn.textContent = original;
+      }
+    });
+    const footer = h("div", { class: "row", style: "gap: 8px; justify-content: flex-end" },
+      cancelBtn, saveBtn);
+    Modal.open({ title, body, footer, size });
+  }
 
   // ---------------------------------------------------------------------------
   // Views
