@@ -3590,34 +3590,10 @@
       databases = r.entries || r.databases || [];
     } catch (_) { databases = []; }
 
-    // xout deploy is per-architecture different — instead of an env
-    // table, the operator picks a token set + preset. Pre-load them
-    // here so the modal renders synchronously below.
-    const isXout = service.name === "xout";
-    let xoutTokens = [];
-    let xoutPresets = [];
-    if (isXout) {
-      try {
-        const tr = await api("GET", "/api/xout/tokens");
-        xoutTokens = tr.tokens || [];
-      } catch (err) {
-        toast("error", "Could not load xout tokens", err.message); return;
-      }
-      try {
-        const pr = await api("GET", "/api/xout/presets");
-        xoutPresets = pr.presets || [];
-      } catch (err) {
-        toast("error", "Could not load xout presets", err.message); return;
-      }
-      if (!xoutTokens.length) {
-        toast("error", "No tokens",
-          "Create at least one token in the Xout tab first."); return;
-      }
-      if (!xoutPresets.length) {
-        toast("error", "No presets",
-          "Create at least one preset in the Xout tab first."); return;
-      }
-    }
+    // (xout used to need its own legacy token/preset selector here. After
+    //  the xout-merge refactor it's a plain env-driven service like every
+    //  other one — XOUT_DATABASE_URL flows in through the standard env
+    //  table + secrets:database:active resolver.)
 
     const form = h("form");
     form.appendChild(h("p", { class: "muted" },
@@ -3634,75 +3610,8 @@
       h("input", { id: "svc-revision", class: "input mono",
         placeholder: service.default_branch || "main", value: "" })));
 
-    // xout-specific picker block — replaces the env table since xout's
-    // deploy isn't driven by env overrides but by a (tokens, preset)
-    // selection that the platform persists per-node.
-    const xoutTokenChecks = [];   // <input> refs (only populated when isXout)
-    let xoutSelectedPresetId = null;
-    if (isXout) {
-      const xoutWrap = h("div", { class: "field" });
-      // Tokens picker — multi-select, default all checked.
-      xoutWrap.appendChild(h("label", null, "Tokens",
-        h("span", { class: "hint" },
-          " — every checked token's user (UUID) is baked into preset.json on each target node. Default: all selected.")));
-      const tokenList = h("div", {
-        style: "max-height: 200px; overflow-y: auto; border: 1px solid var(--border); "
-          + "border-radius: 6px; padding: 6px; background: var(--surface);" });
-      const headRow = h("div", { class: "row", style: "gap: 6px; margin-bottom: 6px;" },
-        h("button", { type: "button", class: "btn btn-sm",
-          onclick: (e) => { e.preventDefault();
-            xoutTokenChecks.forEach(cb => cb.checked = true); } }, "Select all"),
-        h("button", { type: "button", class: "btn btn-sm",
-          onclick: (e) => { e.preventDefault();
-            xoutTokenChecks.forEach(cb => cb.checked = false); } }, "Clear"));
-      xoutWrap.appendChild(headRow);
-      for (const t of xoutTokens) {
-        const cb = h("input", { type: "checkbox", checked: true });
-        cb.dataset.tokenId = String(t.id);
-        xoutTokenChecks.push(cb);
-        tokenList.appendChild(h("label", { class: "row",
-          style: "gap: 8px; padding: 4px 6px; cursor: pointer; align-items: center;" },
-          cb,
-          h("span", { class: "mono" }, t.name),
-          h("span", { class: "muted", style: "font-size: 11px;" },
-            t.uuid.slice(0, 8) + "…"),
-          h("span", { class: "muted", style: "margin-left: auto; font-size: 11px;" },
-            `${t.node_count || 0} nodes`)));
-      }
-      xoutWrap.appendChild(tokenList);
-      form.appendChild(xoutWrap);
-
-      // Preset picker — single select via radio.
-      const presetWrap = h("div", { class: "field" });
-      presetWrap.appendChild(h("label", null, "Preset",
-        h("span", { class: "hint" },
-          " — exactly one. The preset's inbounds are rendered into preset.json on every selected node.")));
-      xoutSelectedPresetId = xoutPresets[0].id;
-      const presetList = h("div", {
-        style: "border: 1px solid var(--border); border-radius: 6px; "
-          + "padding: 6px; background: var(--surface);" });
-      for (const p of xoutPresets) {
-        const radio = h("input", { type: "radio", name: "xout-preset",
-          checked: p.id === xoutSelectedPresetId });
-        radio.dataset.presetId = String(p.id);
-        radio.addEventListener("change", () => {
-          if (radio.checked) xoutSelectedPresetId = p.id;
-        });
-        presetList.appendChild(h("label", { class: "row",
-          style: "gap: 8px; padding: 4px 6px; cursor: pointer; align-items: center;" },
-          radio,
-          h("span", { class: "mono" }, p.name),
-          h("span", { class: "muted", style: "font-size: 11px;" },
-            `${(p.inbounds || []).length} inbound`),
-          p.description ? h("span", { class: "muted", style: "font-size: 11px;" },
-            p.description.slice(0, 80)) : null));
-      }
-      presetWrap.appendChild(presetList);
-      form.appendChild(presetWrap);
-    }
-
-    // Env overrides — non-xout services. Show defaults + required highlighted.
-    const envWrap = isXout ? null : h("div", { class: "field" },
+    // Env overrides. Required fields highlighted, defaults pre-filled.
+    const envWrap = h("div", { class: "field" },
       h("label", null, "Environment ", h("span", { class: "hint" },
         " — required fields in red MUST be filled; others use the default")));
     const envTable = h("table", { class: "data", style: "width: 100%; font-size: 12.5px;" });
@@ -3729,7 +3638,12 @@
       const displayDefault = savedValue || manifestDefault;
 
       let valueCell;
-      if (key === "SSL_SERVICE_PG_DSN" && databases.length) {
+      // Database-DSN keys get a friendly picker so the operator doesn't
+      // paste the full DSN. ssl-service uses SSL_SERVICE_PG_DSN; xout
+      // uses XOUT_DATABASE_URL — both consume the same `database:<id>`
+      // resolver token at deploy time.
+      const isDsnKey = (key === "SSL_SERVICE_PG_DSN" || key === "XOUT_DATABASE_URL");
+      if (isDsnKey && databases.length) {
         // Friendly picker — pre-select whatever the operator saved in
         // Edit. The visible label shows the database name + redacted
         // DSN so the operator can see at a glance which DB they're
@@ -3784,14 +3698,12 @@
       );
       envBody.appendChild(tr);
     }
-    if (!isXout) {
-      envTable.appendChild(envBody);
-      const envWrapInner = h("div", { class: "table-wrap",
-        style: "max-height: 240px; overflow-y: auto;" });
-      envWrapInner.appendChild(envTable);
-      envWrap.appendChild(envWrapInner);
-      form.appendChild(envWrap);
-    }
+    envTable.appendChild(envBody);
+    const envWrapInner = h("div", { class: "table-wrap",
+      style: "max-height: 240px; overflow-y: auto;" });
+    envWrapInner.appendChild(envTable);
+    envWrap.appendChild(envWrapInner);
+    form.appendChild(envWrap);
 
     // Node multi-select
     const listWrap = h("div", { class: "field" },
@@ -3849,30 +3761,12 @@
         triggered_by: "admin",
       };
 
-      if (isXout) {
-        const tokenIds = xoutTokenChecks.filter(cb => cb.checked)
-          .map(cb => parseInt(cb.dataset.tokenId, 10));
-        if (!tokenIds.length) {
-          toast("error", "Pick at least one token");
-          return;
-        }
-        if (!xoutSelectedPresetId) {
-          toast("error", "Pick a preset");
-          return;
-        }
-        payload.tokens = tokenIds;
-        payload.preset_id = xoutSelectedPresetId;
-        // env stays empty — xout's deploy is driven by tokens + preset,
-        // not env overrides.
-        payload.env = {};
-      } else {
-        const env = {};
-        for (const [k, getter] of Object.entries(envInputs)) {
-          const v = (getter() || "").trim();
-          if (v) env[k] = v;
-        }
-        payload.env = env;
+      const env = {};
+      for (const [k, getter] of Object.entries(envInputs)) {
+        const v = (getter() || "").trim();
+        if (v) env[k] = v;
       }
+      payload.env = env;
       if (!confirm(`Deploy ${service.name} (${payload.revision || service.default_branch || 'main'}) to ${nodes.length} node(s)?`))
         return;
 
@@ -4710,7 +4604,11 @@
 
     const buildRow = (key, manifestDefault, savedValue, isRequired) => {
       let valueCell;
-      if (key === "SSL_SERVICE_PG_DSN" && databases.length) {
+      // ssl-service uses SSL_SERVICE_PG_DSN; xout uses XOUT_DATABASE_URL.
+      // Both are database DSNs and resolve via the same `database:<id>`
+      // token, so they share the picker UI.
+      const isDsnKey = (key === "SSL_SERVICE_PG_DSN" || key === "XOUT_DATABASE_URL");
+      if (isDsnKey && databases.length) {
         // Pick from the Databases registry. We store `database:<id>`
         // (a resolver token) instead of the cleartext DSN — that way
         // the actual DSN never round-trips through the browser, and
