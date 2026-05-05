@@ -8235,9 +8235,25 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
           added++;
         }
         closePicker();
-        toast("success", "Inbounds added",
-              added + " inbound" + (added === 1 ? "" : "s")
-              + " · tag template " + JSON.stringify("{node_name}-<country-zh>"));
+        // After picker closes, the new rows live in the editor's
+        // in-memory inbounds[] but are NOT in the DB yet — the modal
+        // Save button persists them. The earlier toast just said
+        // "Inbounds added" which read like a save confirmation; the
+        // wording is intentionally explicit now.
+        toast("success",
+              `Added ${added} inbound${added === 1 ? "" : "s"} — click Save to persist`,
+              "Tag template: {node_name}-<country-zh>");
+        // Scroll the inbound table into view so the operator sees the
+        // new rows appear instead of just the picker disappearing.
+        try {
+          const tbl = document.getElementById("ib-table-wrap");
+          if (tbl) tbl.scrollIntoView({ behavior: "smooth", block: "center" });
+        } catch (_) { /* old browser */ }
+        // Highlight the newly-added rows for ~3s so they stand out
+        // visually against the existing rows.
+        try {
+          if (typeof opts.highlightLastN === "function") opts.highlightLastN(added);
+        } catch (_) { /* defensive */ }
       } }, "Add inbounds"),
     );
 
@@ -11159,6 +11175,7 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
     function _commitEdit() {
       // Real-time mutation already happened during typing — exit and rerender.
       editing = null;
+      dirty = true; _refreshUnsavedBadge();
       renderTableView();
     }
     function _cancelEdit() {
@@ -11224,12 +11241,45 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
       // format prefers "socks".
       if ((fresh.protocol || "").toLowerCase() === "socks5") fresh.protocol = "socks";
       inbounds.push(fresh);
+      dirty = true;
+      _refreshUnsavedBadge();
       if (viewMode === "table") renderTableView();
+    }
+
+    // Track whether the in-memory inbounds[] has diverged from what's
+    // on disk. The "Unsaved" badge nudges the operator that a "Save"
+    // click is still needed — without it, Batch-from-Static-IPs felt
+    // like it persisted as soon as the picker said "Inbounds added".
+    let dirty = false;
+    const unsavedBadge = h("span", {
+      class: "badge warn",
+      style: "display: none; font-size: 11px;",
+      id: "ib-unsaved-badge",
+    }, "Unsaved");
+    function _refreshUnsavedBadge() {
+      unsavedBadge.style.display = dirty ? "" : "none";
+    }
+    // After a batch picker run, briefly highlight the last N rows so
+    // the operator can see the newly-added entries pop in.
+    function highlightLastN(n) {
+      // Defer one tick so renderTableView() has flushed the new rows.
+      setTimeout(() => {
+        const rows = tableWrap.querySelectorAll("table tbody tr");
+        const start = Math.max(0, rows.length - n);
+        for (let i = start; i < rows.length; i++) {
+          const tr = rows[i];
+          tr.style.transition = "background 1.4s ease-out";
+          tr.style.background = "var(--accent-bg, #fef3c7)";
+          setTimeout(() => { tr.style.background = ""; }, 50);
+        }
+      }, 50);
     }
 
     const inboundsHeader = h("div", { class: "row",
       style: "align-items: center; gap: 8px; margin: 8px 0;" },
-      h("h3", { style: "margin: 0; flex: 1;" }, "Inbounds"),
+      h("h3", { style: "margin: 0;" }, "Inbounds"),
+      unsavedBadge,
+      h("span", { style: "flex: 1;" }),
       toggleBtn,
       h("button", { class: "btn btn-sm",
         title: "Pick multiple Static IPs and auto-generate one VLESS+Reality "
@@ -11239,6 +11289,7 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
           nextPort: nextInboundPort,
           addInbound,
           inlineSlot: batchPickerSlot,
+          highlightLastN,
           defaultSni: (() => {
             for (const ib of inbounds) {
               if ((ib.protocol || "").toLowerCase() === "vless"
@@ -11420,6 +11471,7 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
               title: "Remove this inbound",
               onclick: () => {
                 inbounds.splice(idx, 1);
+                dirty = true; _refreshUnsavedBadge();
                 if (editing) {
                   if (editing.idx === idx) editing = null;
                   else if (editing.idx > idx) editing.idx -= 1;
@@ -11611,6 +11663,7 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
               const parsed = JSON.parse(jsonTextarea.value);
               if (!Array.isArray(parsed)) throw new Error("must be a JSON array");
               inbounds = parsed;
+              dirty = true; _refreshUnsavedBadge();
               viewMode = "table";
               toggleBtn.textContent = "Edit raw JSON";
               renderTableView();
@@ -11676,6 +11729,8 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
               await api("POST", "/api/xout/presets", payload);
               toast("success", "Preset created", "");
             }
+            dirty = false;
+            _refreshUnsavedBadge();
             Modal.close();
             if (onDone) onDone();
           } catch (err) {
