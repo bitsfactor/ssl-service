@@ -4541,6 +4541,54 @@ def _build_router(ctx: AdminContext) -> _Router:
       HTTPStatus.OK, run_node_command_action(ctx, request.path_params["name"], payload)
     )
 
+  def probe_host_handler(request: _Request) -> _Response:
+    """TCP-connect probe from the admin's host to ``host:port``.
+
+    Operators use this from the Subscriptions modal to test that
+    each xout inbound port is actually reachable + measure latency
+    from their *own* network — the same path their VPN client will
+    take. We do a plain TCP handshake (no TLS), so this measures
+    everything up to the kernel ACK, which is what matters for
+    Reality (the protocol does TLS itself once the connection lands).
+
+    Body: ``{host: str, port: int, timeout_ms?: int (default 4000)}``.
+    Response: ``{ok, latency_ms, error?}``. Error cases never throw
+    HTTP errors — operators expect a row per node even when one
+    times out.
+    """
+    payload = request.json_body() if request.body else {}
+    host = (payload.get("host") or "").strip()
+    try:
+      port = int(payload.get("port") or 0)
+    except (TypeError, ValueError):
+      port = 0
+    timeout_ms = int(payload.get("timeout_ms") or 4000)
+    if not host or not (0 < port < 65536):
+      raise HttpError(HTTPStatus.BAD_REQUEST,
+                      "host and port (1..65535) are required",
+                      code="invalid_target")
+    timeout_s = max(0.1, min(30.0, timeout_ms / 1000.0))
+    import socket as _socket
+    import time as _time
+    t0 = _time.monotonic()
+    try:
+      conn = _socket.create_connection((host, port), timeout=timeout_s)
+      latency_ms = round((_time.monotonic() - t0) * 1000, 1)
+      try: conn.close()
+      except OSError: pass
+      return _json_response(HTTPStatus.OK,
+        {"ok": True, "latency_ms": latency_ms, "host": host, "port": port})
+    except (_socket.timeout, TimeoutError):
+      return _json_response(HTTPStatus.OK,
+        {"ok": False, "error": "timeout",
+         "latency_ms": round((_time.monotonic() - t0) * 1000, 1),
+         "host": host, "port": port})
+    except OSError as exc:
+      return _json_response(HTTPStatus.OK,
+        {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+         "latency_ms": round((_time.monotonic() - t0) * 1000, 1),
+         "host": host, "port": port})
+
   def host_ssh_keys_handler(_request: _Request) -> _Response:
     return _json_response(HTTPStatus.OK, {"keys": list_host_ssh_keys(ctx)})
 
@@ -4677,6 +4725,7 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("POST", "/api/nodes/{name}/deploy", with_auth(node_deploy_handler))
   router.add("POST", "/api/nodes/{name}/update", with_auth(node_update_handler))
   router.add("POST", "/api/nodes/{name}/run", with_auth(node_run_handler))
+  router.add("POST", "/api/probe-host", with_auth(probe_host_handler))
   router.add("POST", "/api/nodes/{name}/uninstall-services",
              with_auth(node_uninstall_services_handler))
   router.add("POST", "/api/nodes/{name}/clear",

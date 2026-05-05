@@ -256,15 +256,17 @@
   }
   .modal-backdrop.open { display: flex; }
   .modal {
-    background: var(--surface); border-radius: 14px; width: 560px; max-width: 100%;
+    background: var(--surface); border-radius: 14px; width: 900px; max-width: 100%;
     box-shadow: 0 20px 60px rgba(20, 18, 14, 0.25);
     border: 1px solid var(--border);
     overflow: hidden;
     max-height: 90vh; display: flex; flex-direction: column;
   }
-  /* Wider variants for editors with tables / many fields. The
-     fixed 560px default is fine for a confirm dialog but cramps
-     anything with a 3-column table or long DSN values. */
+  /* Width variants. Default = 900 (operators wanted more breathing
+     room for URLs / tables / multi-column forms). Narrow = original
+     560 for the few small confirm-style dialogs that genuinely don't
+     need it. xlarge for full editors with side-by-side panels. */
+  .modal--narrow { width: 560px; }
   .modal--wide   { width: 900px; }
   .modal--xlarge { width: 1100px; }
   /* On narrow viewports, fall back to the body padding (max-width 100%
@@ -587,7 +589,10 @@
   }
 
   const Modal = {
-    // size: "default" (560px) | "wide" (900px) | "xlarge" (1100px)
+    // size: "narrow" (560px) | "wide" (900px, default) | "xlarge" (1100px)
+    // Default changed from 560 → 900 — operators kept saying the small
+    // form-style modals waste space. The few callers that genuinely
+    // need the tight width can pass `size: "narrow"` to opt back in.
     open({ title, body, footer, size }) {
       document.getElementById("modal-title").textContent = title;
       const bodyEl = document.getElementById("modal-body");
@@ -598,9 +603,10 @@
       if (footer) footerEl.appendChild(footer);
       const modalEl = document.querySelector(".modal-backdrop .modal");
       if (modalEl) {
-        modalEl.classList.remove("modal--wide", "modal--xlarge");
-        if (size === "wide")   modalEl.classList.add("modal--wide");
-        if (size === "xlarge") modalEl.classList.add("modal--xlarge");
+        modalEl.classList.remove("modal--wide", "modal--xlarge", "modal--narrow");
+        if (size === "narrow") modalEl.classList.add("modal--narrow");
+        else if (size === "xlarge") modalEl.classList.add("modal--xlarge");
+        else modalEl.classList.add("modal--wide"); // default
       }
       document.getElementById("modal-backdrop").classList.add("open");
     },
@@ -9758,32 +9764,30 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
       const baseSubUrl = (baseUrl && s.subscription_token)
         ? `${baseUrl}/sub/${s.subscription_token}`
         : "";
-      // Format selector: base64 (default) or clash YAML. URL field
-      // updates live so Copy / Open / Show content all use the picked
-      // variant. ?format=base64 is the implicit default; the param is
-      // included anyway for clarity when sharing the URL.
-      const fmtSel = h("select", { class: "select",
-        style: "max-width: 110px" },
-        h("option", { value: "base64" }, "base64"),
-        h("option", { value: "clash" }, "yaml"));
+      // Active format — toggled by the [base64] [yaml] tab strip below.
+      // Single source of truth, mutated by tab clicks, read by URL +
+      // Copy + content fetch helpers.
+      let activeFmt = "base64";
       const buildUrl = () => {
         if (!baseSubUrl) return "";
-        const f = fmtSel.value;
-        return f === "base64" ? baseSubUrl : `${baseSubUrl}?format=${f}`;
+        return activeFmt === "base64" ? baseSubUrl : `${baseSubUrl}?format=${activeFmt}`;
       };
+      // URL gets its own row, full-width, plus two action buttons next
+      // to it (Copy URL / Open). Operators kept saying the truncated
+      // 12px input was unreadable.
       const urlEl = h("input", {
         class: "input mono", readonly: true, type: "text",
-        style: "font-size: 12px",
+        style: "font-size: 13px; flex: 1",
         value: baseSubUrl || "(no token — re-grant to issue one)",
         onclick: (e) => e.target.select(),
       });
-      const copyBtn = h("button", { class: "btn btn-sm",
+      const copyUrlBtn = h("button", { class: "btn btn-sm",
         disabled: !baseSubUrl,
         onclick: async () => {
           const ok = await copyTextToClipboard(buildUrl());
           toast(ok ? "success" : "error",
                 ok ? "URL copied" : "Copy failed",
-                ok ? `${productLabel} (${fmtSel.value})` : "Try selecting and Cmd+C");
+                ok ? `${productLabel} (${activeFmt})` : "Try selecting and Cmd+C");
         },
       }, "Copy URL");
       const openBtn = h("button", { class: "btn btn-sm",
@@ -9791,63 +9795,231 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
         title: "Open the URL in a new tab — preview the raw response",
         onclick: () => window.open(buildUrl(), "_blank", "noopener"),
       }, "Open");
-      // Inline content preview. Fetches /sub/{token}?format=… via CORS
-      // and shows the body in a <pre> with a Copy-content button. Keeps
-      // the operator from having to open a separate tab + view-source.
-      const previewWrap = h("div", { style: "display: none; flex-direction: column; gap: 6px" });
-      const previewMeta = h("div", { class: "muted", style: "font-size: 12px" });
-      const previewPre = h("pre", { class: "mono",
-        style: "max-height: 280px; overflow: auto; font-size: 11.5px; "
-             + "background: var(--card-bg, #faf6ee); padding: 8px; "
+      // Tab strip + content area. Each tab fetches lazily on first
+      // activation, then caches; switching tabs is instant. Fetches go
+      // straight to user-service /sub/{token} (CORS-allowed) so the
+      // operator sees exactly what the client will see.
+      const cache = {}; // { base64: {meta, body}, clash: {meta, body} }
+      const tabBar = h("div", { class: "row",
+        style: "gap: 0; border-bottom: 1px solid var(--border)" });
+      const contentMeta = h("div", { class: "muted",
+        style: "font-size: 12px; padding: 8px 0 4px" }, "—");
+      const contentPre = h("pre", { class: "mono",
+        style: "max-height: 320px; overflow: auto; font-size: 11.5px; "
+             + "background: var(--card-bg, #faf6ee); padding: 10px; "
              + "border: 1px solid var(--border, #ddd); margin: 0; "
              + "white-space: pre-wrap; word-break: break-all" });
-      const previewCopy = h("button", { class: "btn btn-sm",
+      const copyContentBtn = h("button", { class: "btn btn-sm",
+        disabled: !baseSubUrl,
         onclick: async () => {
-          const ok = await copyTextToClipboard(previewPre.textContent);
+          const text = (cache[activeFmt] && cache[activeFmt].body) || "";
+          if (!text) {
+            toast("info", "Nothing to copy", "Wait for content to load.");
+            return;
+          }
+          const ok = await copyTextToClipboard(text);
           toast(ok ? "success" : "error",
                 ok ? "Content copied" : "Copy failed",
-                ok ? `${productLabel} (${fmtSel.value})` : "");
+                ok ? `${productLabel} (${activeFmt})` : "");
         },
       }, "Copy content");
-      const previewHide = h("button", { class: "btn btn-sm",
-        onclick: () => { previewWrap.style.display = "none"; showBtn.textContent = "Show content"; }
-      }, "Hide");
-      previewWrap.appendChild(previewMeta);
-      previewWrap.appendChild(previewPre);
-      previewWrap.appendChild(h("div", { class: "row",
-        style: "gap: 6px; justify-content: flex-end" },
-        previewCopy, previewHide));
-      const showBtn = h("button", { class: "btn btn-sm",
+      const refreshBtn = h("button", { class: "btn btn-sm",
         disabled: !baseSubUrl,
-        title: "Fetch /sub/{token} content and show inline",
-        onclick: async () => {
-          const u = buildUrl();
-          previewWrap.style.display = "flex";
-          previewMeta.textContent = `Fetching ${u} …`;
-          previewPre.textContent = "";
-          showBtn.textContent = "Refresh";
-          try {
-            const r = await fetch(u, { cache: "no-store" });
-            const text = await r.text();
-            const ui = r.headers.get("Subscription-Userinfo") || "";
-            previewMeta.textContent =
-              `HTTP ${r.status} · ${(r.headers.get("content-type") || "").split(";")[0]}`
-              + ` · ${text.length} bytes`
-              + (ui ? ` · ${ui}` : "");
-            previewPre.textContent = text;
-          } catch (err) {
-            previewMeta.textContent = "Fetch failed (CORS or network)";
-            previewPre.textContent = String(err && err.message || err);
+        title: "Re-fetch ignoring the cache",
+        onclick: () => loadFmt(activeFmt, /*force*/ true),
+      }, "Refresh");
+
+      async function loadFmt(fmt, force = false) {
+        if (!baseSubUrl) return;
+        if (!force && cache[fmt]) {
+          contentMeta.textContent = cache[fmt].meta;
+          contentPre.textContent = cache[fmt].body;
+          return;
+        }
+        const u = activeFmt === "base64" ? baseSubUrl : `${baseSubUrl}?format=${fmt}`;
+        contentMeta.textContent = `Fetching ${u} …`;
+        contentPre.textContent = "";
+        try {
+          const r = await fetch(u, { cache: "no-store" });
+          const text = await r.text();
+          const ui = r.headers.get("Subscription-Userinfo") || "";
+          const meta =
+            `HTTP ${r.status} · ${(r.headers.get("content-type") || "").split(";")[0]}`
+            + ` · ${text.length} bytes`
+            + (ui ? ` · ${ui}` : "");
+          cache[fmt] = { meta, body: text };
+          if (activeFmt === fmt) {
+            contentMeta.textContent = meta;
+            contentPre.textContent = text;
           }
+        } catch (err) {
+          const meta = "Fetch failed (CORS or network)";
+          cache[fmt] = { meta, body: String(err && err.message || err) };
+          if (activeFmt === fmt) {
+            contentMeta.textContent = meta;
+            contentPre.textContent = cache[fmt].body;
+          }
+        }
+      }
+
+      // Tab style: pill underline for active. Two tabs only — base64
+      // (default, what most clients want) and yaml (Clash format).
+      const tabBtn = (label, fmt) => {
+        const b = h("button", {
+          class: "btn btn-sm",
+          style: "border: none; background: transparent; "
+               + "border-bottom: 2px solid transparent; "
+               + "border-radius: 0; padding: 8px 14px; font-weight: 500",
+          onclick: () => {
+            activeFmt = fmt;
+            urlEl.value = buildUrl() || urlEl.value;
+            for (const t of tabBar.children) {
+              t.style.borderBottom = "2px solid transparent";
+              t.style.opacity = "0.6";
+            }
+            b.style.borderBottom = "2px solid var(--accent, #b06c2c)";
+            b.style.opacity = "1";
+            loadFmt(fmt);
+          },
+        }, label);
+        return b;
+      };
+      tabBar.appendChild(tabBtn("base64", "base64"));
+      tabBar.appendChild(tabBtn("yaml", "clash"));
+      // Speed-test tab — runs separate logic instead of fetching /sub.
+      // We hide the URL/Copy/Refresh buttons + content pre when this tab
+      // is active, and show a probe results table instead.
+      const speedTbl = h("table", { class: "data",
+        style: "width: 100%; font-size: 12.5px; display: none" });
+      speedTbl.appendChild(h("thead", null, h("tr", null,
+        h("th", null, "Node"),
+        h("th", null, "Server:Port"),
+        h("th", null, "TCP latency"),
+        h("th", null, "Status"))));
+      const speedTbody = h("tbody");
+      speedTbl.appendChild(speedTbody);
+      const probeAllBtn = h("button", { class: "btn btn-sm",
+        disabled: !baseSubUrl,
+        style: "display: none",
+        onclick: () => runProbeAll(),
+      }, "Probe all");
+      // Parse Clash YAML body into [{name, host, port}, ...]. Regex —
+      // not a full YAML parser, but the body is generated by us
+      // (_build_clash_yaml) so we know the exact shape: each proxy
+      // block has `name:`, `server:`, `port:` lines.
+      function parseProxies(yamlText) {
+        const out = [];
+        const re = /-\s+name:\s+"?([^"\n]+)"?\s*\n[\s\S]*?server:\s+"?([^"\n]+?)"?\s*\n\s+port:\s+(\d+)/g;
+        let m;
+        while ((m = re.exec(yamlText)) !== null) {
+          out.push({ name: m[1].trim(), host: m[2].trim(), port: parseInt(m[3], 10) });
+        }
+        return out;
+      }
+      async function runProbeAll() {
+        // Make sure we have the clash body cached so we can parse it.
+        if (!cache.clash) await loadFmt("clash");
+        const body = (cache.clash && cache.clash.body) || "";
+        const proxies = parseProxies(body);
+        speedTbody.innerHTML = "";
+        if (proxies.length === 0) {
+          speedTbody.appendChild(h("tr", null,
+            h("td", { colspan: 4, class: "muted" },
+              "No nodes found — yaml content is empty.")));
+          return;
+        }
+        // Render a row per proxy with placeholder cells we'll fill in.
+        const rowEls = proxies.map((p) => {
+          const lat = h("td", { class: "mono muted" }, "…");
+          const st = h("td", { class: "muted" }, "queued");
+          const tr = h("tr", null,
+            h("td", null, p.name),
+            h("td", { class: "mono", style: "font-size: 12px" },
+              `${p.host}:${p.port}`),
+            lat, st);
+          speedTbody.appendChild(tr);
+          return { p, lat, st };
+        });
+        probeAllBtn.disabled = true;
+        probeAllBtn.textContent = "Probing…";
+        try {
+          // Sequential — keeps the UI responsive and avoids slamming a
+          // node with 7 concurrent connect attempts (which can look
+          // like an attack on a small VPS).
+          for (const { p, lat, st } of rowEls) {
+            st.textContent = "probing…";
+            st.className = "muted";
+            try {
+              const r = await api("POST", "/api/probe-host",
+                { host: p.host, port: p.port, timeout_ms: 4000 });
+              const ms = r.latency_ms;
+              lat.textContent = `${ms} ms`;
+              if (r.ok) {
+                lat.className = "mono " + (ms < 100 ? "" :
+                  ms < 250 ? "" : "muted");
+                st.innerHTML = "";
+                st.appendChild(h("span", { class: "badge ok" }, "ok"));
+              } else {
+                lat.className = "mono muted";
+                st.innerHTML = "";
+                st.appendChild(h("span", { class: "badge warn" },
+                  r.error || "fail"));
+              }
+            } catch (err) {
+              lat.textContent = "—";
+              st.innerHTML = "";
+              st.appendChild(h("span", { class: "badge warn" },
+                (err && err.message) || "error"));
+            }
+          }
+        } finally {
+          probeAllBtn.disabled = false;
+          probeAllBtn.textContent = "Probe again";
+        }
+      }
+      // Custom tab btn for speed — not a /sub format, so it bypasses
+      // loadFmt + content fetch + URL update. Toggles visibility.
+      const speedTabBtn = h("button", {
+        class: "btn btn-sm",
+        style: "border: none; background: transparent; "
+             + "border-bottom: 2px solid transparent; "
+             + "border-radius: 0; padding: 8px 14px; font-weight: 500",
+        onclick: () => {
+          activeFmt = "_speed_";
+          for (const t of tabBar.children) {
+            t.style.borderBottom = "2px solid transparent";
+            t.style.opacity = "0.6";
+          }
+          speedTabBtn.style.borderBottom = "2px solid var(--accent, #b06c2c)";
+          speedTabBtn.style.opacity = "1";
+          // Hide normal content view, show speed view.
+          contentMeta.style.display = "none";
+          contentPre.style.display = "none";
+          copyContentBtn.style.display = "none";
+          refreshBtn.style.display = "none";
+          speedTbl.style.display = "table";
+          probeAllBtn.style.display = "inline-block";
+          // Auto-run on first activation.
+          if (speedTbody.children.length === 0) runProbeAll();
         },
-      }, "Show content");
-      // Wire format change to refresh URL field + content preview if
-      // already showing. Cheaper than a re-render and keeps user's
-      // scroll position.
-      fmtSel.addEventListener("change", () => {
-        urlEl.value = buildUrl() || urlEl.value;
-        if (previewWrap.style.display === "flex") showBtn.click();
-      });
+      }, "speed test");
+      tabBar.appendChild(speedTabBtn);
+      // Wrap base64/yaml tab clicks to restore default visibility.
+      for (const tab of [tabBar.children[0], tabBar.children[1]]) {
+        const orig = tab.onclick;
+        tab.onclick = (e) => {
+          contentMeta.style.display = "";
+          contentPre.style.display = "";
+          copyContentBtn.style.display = "";
+          refreshBtn.style.display = "";
+          speedTbl.style.display = "none";
+          probeAllBtn.style.display = "none";
+          orig(e);
+        };
+      }
+      // Activate the first tab — also kicks off the initial fetch.
+      tabBar.children[0].click();
+
       const meta = [];
       meta.push(h("span", { class: "badge ok" }, "active"));
       if (s.expires_at) {
@@ -9859,16 +10031,25 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
       meta.push(h("span", { class: "muted", style: "font-size: 12px" },
         `kind=${s.kind || "—"}`));
       const card = h("div", { class: "card" },
-        h("div", { class: "card-body", style: "padding: 12px; display: flex; flex-direction: column; gap: 8px" },
-          h("div", { class: "row", style: "gap: 10px; align-items: center; flex-wrap: wrap" },
+        h("div", { class: "card-body",
+          style: "padding: 14px; display: flex; flex-direction: column; gap: 10px" },
+          // Row 1: product header
+          h("div", { class: "row",
+            style: "gap: 10px; align-items: center; flex-wrap: wrap" },
             h("strong", null, productLabel),
             ...meta),
+          // Row 2: full-width URL + Copy URL + Open
           h("div", { class: "row", style: "gap: 6px; align-items: stretch" },
-            h("label", { class: "muted",
-              style: "font-size: 12px; align-self: center; white-space: nowrap" },
-              "format"),
-            fmtSel, urlEl, copyBtn, openBtn, showBtn),
-          previewWrap));
+            urlEl, copyUrlBtn, openBtn),
+          // Row 3+: tab strip and content body
+          h("div", { class: "row",
+            style: "gap: 0; align-items: flex-end; justify-content: space-between" },
+            tabBar,
+            h("div", { class: "row", style: "gap: 6px; padding-bottom: 4px" },
+              copyContentBtn, refreshBtn, probeAllBtn)),
+          contentMeta,
+          contentPre,
+          speedTbl));
       body.appendChild(card);
     }
     Modal.open({
