@@ -795,6 +795,73 @@ def _build_subscription_uris(user_id: str, sub_id: int,
   return uris
 
 
+def _build_clash_yaml(inbounds: list[dict]) -> str:
+  """Render the same set of inbounds as a minimal Clash config (proxies
+  + a single Select group + a MATCH rule). Mirrors the filtering rules
+  of ``_build_subscription_uris``: only fully-resolved VLESS+Reality
+  inbounds make it in; anything else is silently skipped so a partial
+  preset never produces a broken config that crashes Clash.
+  """
+  lines: list[str] = ["proxies:"]
+  proxy_names: list[str] = []
+  for ib in inbounds:
+    proto = (ib.get("protocol") or "").lower()
+    host  = ib.get("node_host")
+    port  = ib.get("port")
+    tag   = (ib.get("tag") or "").strip() or f"{host}-{port}"
+    uuid  = ib.get("vless_uuid")
+    if proto != "vless" or not (host and port and uuid):
+      continue
+    reality = ib.get("reality") or {}
+    sni = reality.get("sni") or ""
+    pub = reality.get("public_key") or reality.get("pubkey") or ""
+    sid = reality.get("short_id") or ""
+    if not (sni and pub and sid) or pub == "auto" or sid == "auto":
+      continue
+    # Clash YAML — names must be unique. Tag uniqueness is enforced
+    # upstream (xout boot validation rejects dupes), so we trust it.
+    name = tag
+    proxy_names.append(name)
+    # Inline yaml — no external dep. Quote string values to keep
+    # special chars (colons in IPv6, dashes in tags) safe.
+    def q(v): return '"' + str(v).replace('"', '\\"') + '"'
+    lines.append(f"  - name: {q(name)}")
+    lines.append(f"    type: vless")
+    lines.append(f"    server: {q(host)}")
+    lines.append(f"    port: {int(port)}")
+    lines.append(f"    uuid: {q(uuid)}")
+    lines.append(f"    network: tcp")
+    lines.append(f"    udp: true")
+    lines.append(f"    tls: true")
+    lines.append(f"    flow: xtls-rprx-vision")
+    lines.append(f"    servername: {q(sni)}")
+    lines.append(f"    client-fingerprint: chrome")
+    lines.append(f"    reality-opts:")
+    lines.append(f"      public-key: {q(pub)}")
+    lines.append(f"      short-id: {q(sid)}")
+  if not proxy_names:
+    # Don't return an empty config — a Clash subscription with zero
+    # proxies will silently route everything through DIRECT and confuse
+    # the user. Surface the empty state explicitly.
+    return ("# No usable proxies in this subscription.\n"
+            "# Either no nodes are deployed yet, or their reality keys\n"
+            "# haven't been resolved by xout. Try again in a minute.\n"
+            "proxies: []\nproxy-groups: []\nrules: []\n")
+  lines.append("")
+  lines.append("proxy-groups:")
+  lines.append('  - name: "🚀 Proxy"')
+  lines.append("    type: select")
+  lines.append("    proxies:")
+  for n in proxy_names:
+    lines.append(f"      - \"{n}\"")
+  lines.append("      - DIRECT")
+  lines.append("")
+  lines.append("rules:")
+  lines.append('  - MATCH,🚀 Proxy')
+  lines.append("")
+  return "\n".join(lines)
+
+
 def _xout_config_for_user(user_id: str) -> dict | None:
   """Compose the ``xout`` block returned by /api/me.
 
@@ -2213,17 +2280,29 @@ def subscription(token: str, format: str = "base64", request: Request = None) ->
     raise HTTPException(status_code=404, detail="not a xout subscription")
   uris = _build_subscription_uris(row["user_id"], row["id"], this_sub["inbounds"])
   body = "\n".join(uris).encode("utf-8")
+  # CORS: /sub/{token} is a public, token-gated endpoint. Allowing
+  # cross-origin reads lets the operator's admin SPA fetch + preview
+  # content from a different origin without server-side proxying.
+  base_headers = {"Cache-Control": "no-store",
+                  "Access-Control-Allow-Origin": "*",
+                  "Access-Control-Expose-Headers": "Subscription-Userinfo"}
   if format == "raw":
     return Response(content=body,
                     media_type="text/plain; charset=utf-8",
-                    headers={"Cache-Control": "no-store"})
+                    headers=base_headers)
+  if format in ("clash", "yaml"):
+    yaml_text = _build_clash_yaml(this_sub["inbounds"])
+    return Response(content=yaml_text.encode("utf-8"),
+                    media_type="text/yaml; charset=utf-8",
+                    headers={**base_headers,
+                             "Subscription-Userinfo": _build_userinfo_header(row["user_id"], row["product_id"])})
   # Default: base64 (newline-separated URIs, then the whole thing
   # base64-encoded). v2rayN / Streisand / Shadowrocket all expect this.
   import base64 as _b64
   encoded = _b64.b64encode(body).decode("ascii")
   return Response(content=encoded,
                   media_type="text/plain; charset=utf-8",
-                  headers={"Cache-Control": "no-store",
+                  headers={**base_headers,
                            "Subscription-Userinfo": _build_userinfo_header(row["user_id"], row["product_id"])})
 
 

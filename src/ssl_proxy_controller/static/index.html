@@ -9755,29 +9755,99 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
       const productLabel = (s.product_name && s.product_name["zh-CN"])
         ? `${s.product_code} · ${s.product_name["zh-CN"]}`
         : s.product_code;
-      const url = (baseUrl && s.subscription_token)
+      const baseSubUrl = (baseUrl && s.subscription_token)
         ? `${baseUrl}/sub/${s.subscription_token}`
         : "";
+      // Format selector: base64 (default) or clash YAML. URL field
+      // updates live so Copy / Open / Show content all use the picked
+      // variant. ?format=base64 is the implicit default; the param is
+      // included anyway for clarity when sharing the URL.
+      const fmtSel = h("select", { class: "select",
+        style: "max-width: 110px" },
+        h("option", { value: "base64" }, "base64"),
+        h("option", { value: "clash" }, "yaml"));
+      const buildUrl = () => {
+        if (!baseSubUrl) return "";
+        const f = fmtSel.value;
+        return f === "base64" ? baseSubUrl : `${baseSubUrl}?format=${f}`;
+      };
       const urlEl = h("input", {
         class: "input mono", readonly: true, type: "text",
         style: "font-size: 12px",
-        value: url || "(no token — re-grant to issue one)",
+        value: baseSubUrl || "(no token — re-grant to issue one)",
         onclick: (e) => e.target.select(),
       });
       const copyBtn = h("button", { class: "btn btn-sm",
-        disabled: !url,
+        disabled: !baseSubUrl,
         onclick: async () => {
-          const ok = await copyTextToClipboard(url);
+          const ok = await copyTextToClipboard(buildUrl());
           toast(ok ? "success" : "error",
-                ok ? "Copied" : "Copy failed",
-                ok ? productLabel : "Try selecting and Cmd+C");
+                ok ? "URL copied" : "Copy failed",
+                ok ? `${productLabel} (${fmtSel.value})` : "Try selecting and Cmd+C");
         },
-      }, "Copy");
+      }, "Copy URL");
       const openBtn = h("button", { class: "btn btn-sm",
-        disabled: !url,
-        title: "Open in a new tab — preview what the client will fetch",
-        onclick: () => window.open(url, "_blank", "noopener"),
+        disabled: !baseSubUrl,
+        title: "Open the URL in a new tab — preview the raw response",
+        onclick: () => window.open(buildUrl(), "_blank", "noopener"),
       }, "Open");
+      // Inline content preview. Fetches /sub/{token}?format=… via CORS
+      // and shows the body in a <pre> with a Copy-content button. Keeps
+      // the operator from having to open a separate tab + view-source.
+      const previewWrap = h("div", { style: "display: none; flex-direction: column; gap: 6px" });
+      const previewMeta = h("div", { class: "muted", style: "font-size: 12px" });
+      const previewPre = h("pre", { class: "mono",
+        style: "max-height: 280px; overflow: auto; font-size: 11.5px; "
+             + "background: var(--card-bg, #faf6ee); padding: 8px; "
+             + "border: 1px solid var(--border, #ddd); margin: 0; "
+             + "white-space: pre-wrap; word-break: break-all" });
+      const previewCopy = h("button", { class: "btn btn-sm",
+        onclick: async () => {
+          const ok = await copyTextToClipboard(previewPre.textContent);
+          toast(ok ? "success" : "error",
+                ok ? "Content copied" : "Copy failed",
+                ok ? `${productLabel} (${fmtSel.value})` : "");
+        },
+      }, "Copy content");
+      const previewHide = h("button", { class: "btn btn-sm",
+        onclick: () => { previewWrap.style.display = "none"; showBtn.textContent = "Show content"; }
+      }, "Hide");
+      previewWrap.appendChild(previewMeta);
+      previewWrap.appendChild(previewPre);
+      previewWrap.appendChild(h("div", { class: "row",
+        style: "gap: 6px; justify-content: flex-end" },
+        previewCopy, previewHide));
+      const showBtn = h("button", { class: "btn btn-sm",
+        disabled: !baseSubUrl,
+        title: "Fetch /sub/{token} content and show inline",
+        onclick: async () => {
+          const u = buildUrl();
+          previewWrap.style.display = "flex";
+          previewMeta.textContent = `Fetching ${u} …`;
+          previewPre.textContent = "";
+          showBtn.textContent = "Refresh";
+          try {
+            const r = await fetch(u, { cache: "no-store" });
+            const text = await r.text();
+            const ui = r.headers.get("Subscription-Userinfo") || "";
+            previewMeta.textContent =
+              `HTTP ${r.status} · ${(r.headers.get("content-type") || "").split(";")[0]}`
+              + ` · ${text.length} bytes`
+              + (ui ? ` · ${ui}` : "");
+            previewPre.textContent = text;
+          } catch (err) {
+            previewMeta.textContent = "Fetch failed (CORS or network)";
+            previewPre.textContent = String(err && err.message || err);
+          }
+        },
+      }, "Show content");
+      // Wire format change to refresh URL field + content preview if
+      // already showing. Cheaper than a re-render and keeps user's
+      // scroll position.
+      fmtSel.addEventListener("change", () => {
+        urlEl.value = buildUrl() || urlEl.value;
+        if (previewWrap.style.display === "flex") showBtn.click();
+      });
       const meta = [];
       meta.push(h("span", { class: "badge ok" }, "active"));
       if (s.expires_at) {
@@ -9794,7 +9864,11 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
             h("strong", null, productLabel),
             ...meta),
           h("div", { class: "row", style: "gap: 6px; align-items: stretch" },
-            urlEl, copyBtn, openBtn)));
+            h("label", { class: "muted",
+              style: "font-size: 12px; align-self: center; white-space: nowrap" },
+              "format"),
+            fmtSel, urlEl, copyBtn, openBtn, showBtn),
+          previewWrap));
       body.appendChild(card);
     }
     Modal.open({
