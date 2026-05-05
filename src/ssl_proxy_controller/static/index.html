@@ -9536,6 +9536,10 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
               onclick: () => openUserGrantModal(u, load) }, "Grant"));
           if ((u.active_subs || 0) > 0) {
             actions.appendChild(h("button", { class: "btn btn-sm",
+              title: "View and copy this user's /sub/{token} subscription URLs",
+              onclick: () => openUserSubscriptionsModal(u) },
+              `Subs (${u.active_subs})`));
+            actions.appendChild(h("button", { class: "btn btn-sm",
               title: "Revoke a currently-active subscription",
               onclick: () => openUserRevokeModal(u, load) }, "Revoke"));
           }
@@ -9561,7 +9565,8 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
   }
 
   function openUserCreateModal(onDone) {
-    const email = h("input", { class: "input", type: "email", placeholder: "user@example.com" });
+    const email = h("input", { class: "input", type: "email", required: true,
+      placeholder: "user@example.com (required)" });
     const name  = h("input", { class: "input", placeholder: "Display name (optional)" });
     const locale = h("select", { class: "select" });
     locale.appendChild(h("option", { value: "zh-CN" }, "zh-CN"));
@@ -9572,13 +9577,24 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
     openModal({
       title: "New user",
       body: h("div", { class: "form-grid" },
-        h("label", null, "Email"), email,
+        h("label", null, "Email *"), email,
         h("label", null, "Display name"), name,
         h("label", null, "Locale"), locale,
         h("label", null, "Password"), password,
         h("label", null, "Admin"), h("label", { class: "row", style: "gap: 6px" }, isAdmin, h("span", { class: "muted" }, "is_admin = true"))),
       onSave: async () => {
-        const payload = { email: email.value.trim() };
+        const emailVal = email.value.trim();
+        if (!emailVal) {
+          email.focus();
+          throw new Error("Email is required");
+        }
+        // Lightweight client-side check; user-service still validates
+        // server-side via EMAIL_RE.
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailVal)) {
+          email.focus();
+          throw new Error("Email looks invalid");
+        }
+        const payload = { email: emailVal };
         if (name.value.trim())     payload.display_name = name.value.trim();
         if (locale.value)          payload.locale = locale.value;
         if (password.value)        payload.password = password.value;
@@ -9610,7 +9626,10 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
         productSel.appendChild(h("option", { value: p.code }, label));
       }
     }
-    const expires = h("input", { class: "input", type: "datetime-local" });
+    // Date-only — most operator grants are "good through end of day X",
+    // not a wall-clock minute. We translate to 23:59:59 UTC of that day
+    // server-side so the subscription stays active through the whole day.
+    const expires = h("input", { class: "input", type: "date" });
     const sourceSel = h("select", { class: "select" });
     for (const s of ["manual", "grant", "stripe"]) {
       sourceSel.appendChild(h("option", { value: s }, s));
@@ -9620,17 +9639,20 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
       body: h("div", { class: "form-grid" },
         h("label", null, "Product"), productSel,
         h("label", null, "Source"), sourceSel,
-        h("label", null, "Expires at (optional)"), expires,
+        h("label", null, "Expires (optional)"), expires,
         h("div", { class: "muted", style: "grid-column: 1/-1; font-size: 12px" },
           "If product is ", h("code", null, "kind=period"),
-          " and expires_at is left empty, it auto-fills from period_days. ",
+          " and Expires is left empty, it auto-fills from period_days. ",
+          "Date-only — interpreted as end-of-day UTC. ",
           "Xout products will also auto-provision the user's vless_uuid on every node in the selector.")),
       onSave: async () => {
         const code = productSel.value.trim();
         if (!code) throw new Error("pick a product");
         const payload = { product_code: code, source: sourceSel.value };
         if (expires.value) {
-          payload.expires_at = new Date(expires.value).toISOString();
+          // expires.value is YYYY-MM-DD — interpret as 23:59:59.999 UTC
+          // so "expires May 6" stays valid through the whole of May 6.
+          payload.expires_at = new Date(`${expires.value}T23:59:59.999Z`).toISOString();
         }
         await api("POST", `/api/user-service/users/${user.id}/grant`, payload);
         toast("success", "Subscription granted", `${user.primary_email} → ${code}`);
@@ -9692,6 +9714,93 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
               `${user.primary_email} → ${code}`);
         onDone && onDone();
       },
+    });
+  }
+
+  // List a user's active subscription URLs. Each active subscription
+  // gets a /sub/{token} URL that returns the subscription bundle when
+  // hit by a VPN client. We surface the full URL + Copy + Open here so
+  // operators can hand a link to a customer without copy-pasting from
+  // the DB.
+  async function openUserSubscriptionsModal(user) {
+    // Fetch in parallel: the user detail (for subscriptions + tokens)
+    // and the user-service base URL (so we can build absolute URLs).
+    let detail = null;
+    let baseUrl = "";
+    try {
+      const [d, cfg] = await Promise.all([
+        api("GET", `/api/user-service/users/${user.id}`),
+        api("GET", "/api/system-config/user_service.base_url").catch(() => ({})),
+      ]);
+      detail = d;
+      // /api/system-config/{key} returns the value object directly
+      // (e.g. {url: "https://user.develop.cc"}) — not wrapped.
+      baseUrl = ((cfg && cfg.url) || "").replace(/\/+$/, "");
+    } catch (err) {
+      toast("error", "Could not load subscriptions", err.message || err);
+      return;
+    }
+    const subs = (detail.subscriptions || []).filter((s) => s.status === "active");
+    const body = h("div", { style: "display: flex; flex-direction: column; gap: 12px" });
+    if (subs.length === 0) {
+      body.appendChild(h("div", { class: "muted" },
+        "No active subscriptions. Use the Grant button to add one."));
+    } else if (!baseUrl) {
+      body.appendChild(h("div", { class: "alert alert-warn" },
+        "User Service base URL is not configured. Set it in ",
+        h("strong", null, "Settings → User Service"),
+        " before sharing /sub/{token} URLs."));
+    }
+    for (const s of subs) {
+      const productLabel = (s.product_name && s.product_name["zh-CN"])
+        ? `${s.product_code} · ${s.product_name["zh-CN"]}`
+        : s.product_code;
+      const url = (baseUrl && s.subscription_token)
+        ? `${baseUrl}/sub/${s.subscription_token}`
+        : "";
+      const urlEl = h("input", {
+        class: "input mono", readonly: true, type: "text",
+        style: "font-size: 12px",
+        value: url || "(no token — re-grant to issue one)",
+        onclick: (e) => e.target.select(),
+      });
+      const copyBtn = h("button", { class: "btn btn-sm",
+        disabled: !url,
+        onclick: async () => {
+          const ok = await copyTextToClipboard(url);
+          toast(ok ? "success" : "error",
+                ok ? "Copied" : "Copy failed",
+                ok ? productLabel : "Try selecting and Cmd+C");
+        },
+      }, "Copy");
+      const openBtn = h("button", { class: "btn btn-sm",
+        disabled: !url,
+        title: "Open in a new tab — preview what the client will fetch",
+        onclick: () => window.open(url, "_blank", "noopener"),
+      }, "Open");
+      const meta = [];
+      meta.push(h("span", { class: "badge ok" }, "active"));
+      if (s.expires_at) {
+        meta.push(h("span", { class: "muted", style: "font-size: 12px" },
+          `expires ${fmtDate(s.expires_at)}`));
+      } else {
+        meta.push(h("span", { class: "muted", style: "font-size: 12px" }, "no expiry"));
+      }
+      meta.push(h("span", { class: "muted", style: "font-size: 12px" },
+        `kind=${s.kind || "—"}`));
+      const card = h("div", { class: "card" },
+        h("div", { class: "card-body", style: "padding: 12px; display: flex; flex-direction: column; gap: 8px" },
+          h("div", { class: "row", style: "gap: 10px; align-items: center; flex-wrap: wrap" },
+            h("strong", null, productLabel),
+            ...meta),
+          h("div", { class: "row", style: "gap: 6px; align-items: stretch" },
+            urlEl, copyBtn, openBtn)));
+      body.appendChild(card);
+    }
+    Modal.open({
+      title: `Subscriptions — ${user.primary_email}`,
+      body: body,
+      footer: h("button", { class: "btn", onclick: () => Modal.close() }, "Close"),
     });
   }
 

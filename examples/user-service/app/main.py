@@ -829,6 +829,7 @@ def _list_user_subscriptions(user_id: str) -> list[dict]:
         """
         SELECT s.id, s.product_id, p.code AS product_code, p.kind,
                s.status, s.starts_at, s.expires_at, s.source,
+               s.subscription_token,
                p.name AS product_name, p.description AS product_description
         FROM subscriptions s
         JOIN products p ON p.id = s.product_id
