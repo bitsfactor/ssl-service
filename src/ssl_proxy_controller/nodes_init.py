@@ -2,6 +2,10 @@
 
 Drives a multi-step bootstrap of a remote node:
 
+  0. Ensure curl is installed (every later step fetches bfs.sh via curl,
+     and several minimal VPS images — Debian netinst, Alpine, CentOS
+     minimal — ship without it; this step uses the native package
+     manager since we can't bootstrap bfs.sh until curl exists)
   1. Set timezone
   2. Install git
   3. Install python
@@ -214,6 +218,50 @@ def _run_remote_with_input_file(
 
 # Each step is a small closure over the BFS launcher.
 
+# Bootstrap script: ensure `curl` is on PATH. Every other step depends on it
+# (we fetch bfs.sh via curl), and we can't use bfs.sh to install curl because
+# bfs.sh is itself fetched via curl. So this one step talks to the native
+# package manager directly. Covers apt/dnf/yum/apk/pacman/zypper — the six
+# managers we'd realistically encounter on a fresh VPS.
+_BOOTSTRAP_CURL_SCRIPT = r"""
+set -e
+if command -v curl >/dev/null 2>&1; then
+  echo "[ok] curl already installed: $(curl --version 2>/dev/null | head -n1)"
+  exit 0
+fi
+echo "[info] curl not found, installing via native package manager..."
+if command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends curl ca-certificates
+elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y curl ca-certificates
+elif command -v yum >/dev/null 2>&1; then
+  yum install -y curl ca-certificates
+elif command -v apk >/dev/null 2>&1; then
+  apk add --no-cache curl ca-certificates
+elif command -v pacman >/dev/null 2>&1; then
+  pacman -Sy --noconfirm curl ca-certificates
+elif command -v zypper >/dev/null 2>&1; then
+  zypper --non-interactive install curl ca-certificates
+else
+  echo "[error] no recognized package manager (apt/dnf/yum/apk/pacman/zypper) and curl is missing" >&2
+  echo "[error] please install curl manually on the target host and retry" >&2
+  exit 1
+fi
+command -v curl >/dev/null 2>&1 || {
+  echo "[error] package manager reported success but curl is still not on PATH" >&2
+  exit 1
+}
+echo "[ok] curl installed: $(curl --version 2>/dev/null | head -n1)"
+"""
+
+
+def _step_bootstrap_curl(ssh, cfg: InitConfig, log) -> int:
+  cmd = "bash -c " + shlex.quote(_BOOTSTRAP_CURL_SCRIPT)
+  return _run_remote_with_input_file(ssh, command=cmd, input_lines=None, log_func=log, timeout=300.0)
+
+
 def _step_set_timezone(ssh, cfg: InitConfig, log) -> int:
   cmd = _bfs_remote_command(f"env set-timezone {shlex.quote(cfg.timezone or 'Asia/Shanghai')}")
   return _run_remote_with_input_file(ssh, command=cmd, input_lines=None, log_func=log, timeout=120.0)
@@ -316,6 +364,9 @@ def _step_change_ssh_port(ssh, cfg: InitConfig, log) -> int:
 
 # Default step order. macOS-only steps (brew) are filtered at runtime.
 DEFAULT_STEPS: list[Step] = [
+  # bootstrap-curl MUST be first: every later step pipes `curl ... bfs.sh`
+  # into bash, so without curl nothing works. Required=True — abort early.
+  Step("bootstrap-curl",   "Ensure curl is installed",    _step_bootstrap_curl,   required=True),
   Step("set-timezone",     "Set system timezone",         _step_set_timezone,     required=False),
   Step("install-git",      "Install git",                  _step_install_git,      required=True),
   Step("install-python",   "Install Python 3",             _step_install_python,   required=False),

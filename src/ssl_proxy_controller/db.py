@@ -3196,6 +3196,7 @@ class Database:
       with connection.cursor() as cursor:
         cursor.execute(
           """SELECT a.node_name, a.preset_id, a.applied_at, a.applied_by,
+                    a.last_synced_at,
                     p.name AS preset_name, p.description AS preset_description
              FROM xout_node_assignments a
              LEFT JOIN xout_presets p ON p.id = a.preset_id
@@ -3212,6 +3213,7 @@ class Database:
           "preset_description": row.get("preset_description"),
           "applied_at": row.get("applied_at"),
           "applied_by": row.get("applied_by"),
+          "last_synced_at": row.get("last_synced_at"),
         }
 
   def list_xout_assignments(self) -> list[dict]:
@@ -3219,6 +3221,7 @@ class Database:
       with connection.cursor() as cursor:
         cursor.execute(
           """SELECT a.node_name, a.preset_id, a.applied_at, a.applied_by,
+                    a.last_synced_at,
                     p.name AS preset_name
              FROM xout_node_assignments a
              LEFT JOIN xout_presets p ON p.id = a.preset_id
@@ -3231,6 +3234,7 @@ class Database:
             "preset_name": r.get("preset_name"),
             "applied_at": r.get("applied_at"),
             "applied_by": r.get("applied_by"),
+            "last_synced_at": r.get("last_synced_at"),
           }
           for r in cursor.fetchall()
         ]
@@ -3248,7 +3252,7 @@ class Database:
             preset_id = EXCLUDED.preset_id,
             applied_at = NOW(),
             applied_by = EXCLUDED.applied_by
-          RETURNING node_name, preset_id, applied_at, applied_by
+          RETURNING node_name, preset_id, applied_at, applied_by, last_synced_at
           """,
           (node_name, int(preset_id), applied_by),
         )
@@ -3259,6 +3263,7 @@ class Database:
       "preset_id": int(row["preset_id"]),
       "applied_at": row.get("applied_at"),
       "applied_by": row.get("applied_by"),
+      "last_synced_at": row.get("last_synced_at"),
     }
 
   # ---------- xout tokens (= users) ----------
@@ -3406,6 +3411,41 @@ class Database:
       "could not regenerate a unique token_value after 5 attempts"
     ) from last_exc
 
+  # ---- node inbound state (resolved Reality keys etc.) ----
+
+  def list_xout_node_inbounds(self, node_name: str) -> list[dict]:
+    """Return what the xout container has reported for this node's
+    inbounds. Each xout container generates Reality x25519 keys via
+    ``xray x25519`` on first boot and upserts them into this table,
+    keyed by (node_name, tag). The Subscription URI builder reads
+    here to fill in the real ``public_key`` / ``sni`` / ``short_id``
+    that the preset stores as the placeholder ``"auto"``.
+
+    Returns ``[]`` when the table does not exist on this DB (defensive
+    — the table is owned by the xout container's migration logic, so
+    a fresh dev database that's never had an xout container connect
+    won't have it yet)."""
+    with self.connect() as connection:
+      with connection.cursor() as cursor:
+        try:
+          cursor.execute(
+            """SELECT tag, port, protocol, sni, public_key, short_id
+               FROM xout_node_inbounds WHERE node_name = %s""",
+            (node_name,),
+          )
+          return [dict(r) for r in cursor.fetchall()]
+        except Exception:  # noqa: BLE001
+          # Table may not exist yet on dev DBs; return empty so the
+          # caller's "build subscription" path silently drops VLESS
+          # entries that need a real public_key — same observable
+          # behavior as before, just no traceback in the logs.
+          # rollback() is required: catching the exception here means
+          # the connection.__exit__ won't see one, so without an
+          # explicit rollback psycopg's pool would try to commit an
+          # aborted transaction and raise InFailedSqlTransaction.
+          connection.rollback()
+          return []
+
   # ---- node-token junction ----
 
   def list_xout_node_tokens_for_node(self, node_name: str) -> list[dict]:
@@ -3413,7 +3453,6 @@ class Database:
       with connection.cursor() as cursor:
         cursor.execute(
           """SELECT nt.node_name, nt.token_id, nt.provisioned_at, nt.last_seen_at,
-                    nt.base64_subscription, nt.clash_subscription,
                     t.name AS token_name, t.uuid AS token_uuid
              FROM xout_node_tokens nt JOIN xout_tokens t ON t.id = nt.token_id
              WHERE nt.node_name = %s ORDER BY t.name""",
@@ -3425,8 +3464,7 @@ class Database:
     with self.connect() as connection:
       with connection.cursor() as cursor:
         cursor.execute(
-          """SELECT node_name, token_id, provisioned_at, last_seen_at,
-                    base64_subscription, clash_subscription
+          """SELECT node_name, token_id, provisioned_at, last_seen_at
              FROM xout_node_tokens WHERE token_id = %s ORDER BY node_name""",
           (int(token_id),),
         )
@@ -3434,26 +3472,33 @@ class Database:
 
   def upsert_xout_node_token(
     self, node_name: str, token_id: int, *,
-    base64_subscription: str | None = None,
-    clash_subscription: str | None = None,
     last_seen_at: bool = False,
   ) -> dict:
-    seen_clause = "last_seen_at = NOW()," if last_seen_at else ""
+    """Upsert a (node, token) row. Used by the sync-traffic path to bump
+    ``last_seen_at`` when xray's StatsService reports activity for a
+    UUID. The cached subscription columns this function used to write
+    were removed alongside the sync-tokens flow — admin's subscription
+    handler now resolves Reality keys from xout_node_inbounds at
+    request time, just like user-service's /sub/<token>."""
+    seen_clause = "last_seen_at = NOW()" if last_seen_at else ""
+    set_clause = f"SET {seen_clause}" if seen_clause else ""
+    # ON CONFLICT DO UPDATE requires at least one assignment; if we
+    # don't bump last_seen_at there's no other column to touch, so fall
+    # back to DO NOTHING which is the desired no-op semantic anyway.
+    conflict_action = (
+      f"DO UPDATE {set_clause}" if seen_clause else "DO NOTHING"
+    )
     with self.connect() as connection:
       with connection.cursor() as cursor:
         cursor.execute(
           f"""
           INSERT INTO xout_node_tokens (node_name, token_id, provisioned_at,
-            last_seen_at, base64_subscription, clash_subscription)
-          VALUES (%s, %s, NOW(), {('NOW()' if last_seen_at else 'NULL')}, %s, %s)
-          ON CONFLICT (node_name, token_id) DO UPDATE SET
-            {seen_clause}
-            base64_subscription = COALESCE(EXCLUDED.base64_subscription, xout_node_tokens.base64_subscription),
-            clash_subscription  = COALESCE(EXCLUDED.clash_subscription,  xout_node_tokens.clash_subscription)
-          RETURNING node_name, token_id, provisioned_at, last_seen_at,
-                    base64_subscription, clash_subscription
+            last_seen_at)
+          VALUES (%s, %s, NOW(), {('NOW()' if last_seen_at else 'NULL')})
+          ON CONFLICT (node_name, token_id) {conflict_action}
+          RETURNING node_name, token_id, provisioned_at, last_seen_at
           """,
-          (node_name, int(token_id), base64_subscription, clash_subscription),
+          (node_name, int(token_id)),
         )
         row = cursor.fetchone()
       connection.commit()

@@ -705,18 +705,18 @@ BEFORE UPDATE ON xout_tokens
 FOR EACH ROW
 EXECUTE FUNCTION touch_updated_at();
 
--- Which tokens are provisioned on which nodes. last_seen_at is updated
--- by sync-tokens whenever the actual xout container has the token's
--- UUID listed in /data/preset.json.resolved (= we're sure it's live).
--- The base64/clash subscription strings are computed at sync time and
--- cached so the UI can read them without re-rendering.
+-- Which tokens are provisioned on which nodes. ``last_seen_at`` is
+-- bumped by the sync-traffic path whenever xray's StatsService reports
+-- activity for a UUID, so it tracks "this token has been used on this
+-- node lately". The cached subscription columns this table once held
+-- (base64_subscription, clash_subscription) were dropped as part of
+-- the sync-tokens cleanup — admin's subscription handler now reads
+-- xout_node_inbounds at request time, exactly like user-service.
 CREATE TABLE IF NOT EXISTS xout_node_tokens (
   node_name TEXT NOT NULL REFERENCES nodes(name) ON DELETE CASCADE ON UPDATE CASCADE,
   token_id  BIGINT NOT NULL REFERENCES xout_tokens(id) ON DELETE CASCADE,
   provisioned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   last_seen_at   TIMESTAMPTZ,
-  base64_subscription TEXT,
-  clash_subscription  TEXT,
   PRIMARY KEY (node_name, token_id)
 );
 
@@ -783,6 +783,23 @@ ALTER TABLE xout_tokens DROP COLUMN IF EXISTS is_default;
 -- misleading the operator, so the column is dropped here. The column
 -- existed only briefly between two earlier xout schema revisions.
 ALTER TABLE xout_presets DROP COLUMN IF EXISTS outbounds;
+
+-- Per-node sync heartbeat. Each xout container writes NOW() into this
+-- column at the end of every 30s tick (after reading preset+users from
+-- DB and pushing traffic deltas back). The Deployed-nodes UI reads it
+-- to show "last synced N seconds ago" — staleness > ~2 min means the
+-- container is down or the DB DSN is misconfigured.
+ALTER TABLE xout_node_assignments
+  ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ;
+
+-- sync-tokens cleanup. The SSH-based reverse-pull path has been
+-- removed: admin's subscription handler now reads resolved Reality keys
+-- from xout_node_inbounds (which the container upserts on first boot),
+-- exactly like user-service's /sub/<token> already does. The two cached
+-- subscription strings on xout_node_tokens are no longer written or
+-- read by anything; drop them.
+ALTER TABLE xout_node_tokens DROP COLUMN IF EXISTS base64_subscription;
+ALTER TABLE xout_node_tokens DROP COLUMN IF EXISTS clash_subscription;
 
 -- Init defaults ----------------------------------------------------------
 -- The Initialize-a-node flow needs two pieces of credential material:

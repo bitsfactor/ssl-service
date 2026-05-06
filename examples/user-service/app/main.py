@@ -802,7 +802,14 @@ def _build_clash_yaml(inbounds: list[dict]) -> str:
   inbounds make it in; anything else is silently skipped so a partial
   preset never produces a broken config that crashes Clash.
   """
-  lines: list[str] = ["proxies:"]
+  # Top-level fields signal "this is a complete clash config, don't
+  # overlay your default template". Some Clash GUIs (clash-party in
+  # particular) merge subscription rules with their own template rules
+  # by default, which causes errors when the template's rules
+  # reference proxy-groups our YAML doesn't define. Setting `mode: rule`
+  # explicitly is the conventional signal that the sub author already
+  # provided everything.
+  lines: list[str] = ["mode: rule", "log-level: info", "", "proxies:"]
   proxy_names: list[str] = []
   for ib in inbounds:
     proto = (ib.get("protocol") or "").lower()
@@ -849,7 +856,17 @@ def _build_clash_yaml(inbounds: list[dict]) -> str:
             "proxies: []\nproxy-groups: []\nrules: []\n")
   lines.append("")
   lines.append("proxy-groups:")
-  lines.append('  - name: "🚀 Proxy"')
+  # The select group MUST be named ``PROXY`` (uppercase). Almost every
+  # Clash GUI client (clash-party, clash-verge, mihomo-party, …) layers
+  # its own default rule-set list on top of the imported subscription
+  # — and those rules conventionally target a group named ``PROXY``.
+  # Naming it anything else (e.g. "🚀 Proxy") causes the GUI's bundled
+  # rules to fail validation with errors like
+  # ``RULE-SET,google,PROXY: proxy [PROXY] not found``.
+  #
+  # No url-test "Auto" group — operators want users to pick a node by
+  # hand, not have the client silently switch under them.
+  lines.append("  - name: PROXY")
   lines.append("    type: select")
   lines.append("    proxies:")
   for n in proxy_names:
@@ -857,7 +874,7 @@ def _build_clash_yaml(inbounds: list[dict]) -> str:
   lines.append("      - DIRECT")
   lines.append("")
   lines.append("rules:")
-  lines.append('  - MATCH,🚀 Proxy')
+  lines.append("  - MATCH,PROXY")
   lines.append("")
   return "\n".join(lines)
 
@@ -2285,17 +2302,33 @@ def subscription(token: str, format: str = "base64", request: Request = None) ->
   # content from a different origin without server-side proxying.
   base_headers = {"Cache-Control": "no-store",
                   "Access-Control-Allow-Origin": "*",
-                  "Access-Control-Expose-Headers": "Subscription-Userinfo"}
+                  "Access-Control-Expose-Headers":
+                    "Subscription-Userinfo, Content-Disposition, "
+                    "profile-update-interval"}
+  # filename hint — Clash GUI clients display this as the subscription
+  # name. Without it they fall back to the URL's last segment, which is
+  # the opaque token (looks like noise to operators). Some clients
+  # (clash-party) display the filename verbatim including any
+  # extension, so we deliberately omit the .yaml suffix — the
+  # Content-Type already declares the format, and "oversea" reads
+  # cleaner than "oversea.yaml" in the sub list.
+  fname = (row.get("code") or "subscription").replace('"', "")
   if format == "raw":
     return Response(content=body,
                     media_type="text/plain; charset=utf-8",
                     headers=base_headers)
   if format in ("clash", "yaml"):
     yaml_text = _build_clash_yaml(this_sub["inbounds"])
+    # profile-update-interval (hours) tells Clash clients how often to
+    # auto-refresh the sub. 24h is the convention.
     return Response(content=yaml_text.encode("utf-8"),
                     media_type="text/yaml; charset=utf-8",
                     headers={**base_headers,
-                             "Subscription-Userinfo": _build_userinfo_header(row["user_id"], row["product_id"])})
+                             "Content-Disposition":
+                               f'attachment; filename="{fname}"',
+                             "profile-update-interval": "24",
+                             "Subscription-Userinfo":
+                               _build_userinfo_header(row["user_id"], row["product_id"])})
   # Default: base64 (newline-separated URIs, then the whole thing
   # base64-encoded). v2rayN / Streisand / Shadowrocket all expect this.
   import base64 as _b64
@@ -2303,7 +2336,11 @@ def subscription(token: str, format: str = "base64", request: Request = None) ->
   return Response(content=encoded,
                   media_type="text/plain; charset=utf-8",
                   headers={**base_headers,
-                           "Subscription-Userinfo": _build_userinfo_header(row["user_id"], row["product_id"])})
+                           "Content-Disposition":
+                             f'attachment; filename="{fname}"',
+                           "profile-update-interval": "24",
+                           "Subscription-Userinfo":
+                             _build_userinfo_header(row["user_id"], row["product_id"])})
 
 
 _TOKEN_RE = None

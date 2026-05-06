@@ -4890,25 +4890,14 @@ def _build_router(ctx: AdminContext) -> _Router:
   def service_deploy_handler(request: _Request) -> _Response:
     name = request.path_params["name"]
     payload = request.json_body() or {}
-    # xout has its own per-deploy state (preset assignment + token set).
-    # Validate + persist + render preset.json into extra_files BEFORE
-    # the generic deploy runs. After deploy succeeds, run sync-tokens
-    # on the successful nodes so cached subscription strings reflect
-    # the new container's resolved Reality public key.
-    if name == "xout":
-      _xout_prepare_deploy_payload(payload)
-    result = deploy_service_to_nodes(ctx, name, payload)
-    if name == "xout":
-      good_nodes = [r["node"] for r in (result.get("results") or [])
-                    if r.get("ok") and r.get("node")]
-      if good_nodes:
-        try:
-          result["xout_post_sync"] = _xout_sync_tokens_on_nodes(good_nodes)
-        except Exception:  # noqa: BLE001
-          # Sync is best-effort; deploy itself succeeded so don't fail
-          # the response. The operator can retry from the Xout tab.
-          LOGGER.exception("xout post-deploy sync failed for %s", good_nodes)
-    return _json_response(HTTPStatus.OK, result)
+    # xout deploy is plain env-driven (post xout-merge refactor
+    # 2026-05-04): the container reads preset assignment + user list
+    # from the DB on each 30s tick, generates its own Reality keys on
+    # first boot and upserts them into xout_node_inbounds, and pushes
+    # traffic deltas back to xout_traffic_daily. Nothing xout-specific
+    # to do here — once the container is up its tick takes over.
+    return _json_response(HTTPStatus.OK,
+                          deploy_service_to_nodes(ctx, name, payload))
 
   # ---------- xout channel ----------------------------------------------
 
@@ -5467,7 +5456,12 @@ def _build_router(ctx: AdminContext) -> _Router:
 
   def xout_nodes_list_handler(_request: _Request) -> _Response:
     """List all nodes that have xout deployed (have a service_node_state row
-    for service_name='xout'), plus their current preset assignment."""
+    for service_name='xout'), plus their current preset assignment.
+
+    ``last_synced_at`` is the heartbeat the xout container writes at the
+    end of every 30s tick (after pulling preset+users and pushing
+    traffic deltas). The UI uses it to show "Last synced N seconds ago"
+    on each node and to flag containers whose tick has stalled."""
     states = ctx.database.list_service_node_states(service_name="xout")
     assignments = {a["node_name"]: a for a in ctx.database.list_xout_assignments()}
     out = []
@@ -5485,97 +5479,21 @@ def _build_router(ctx: AdminContext) -> _Router:
         "preset_id": a["preset_id"] if a else None,
         "preset_name": (a or {}).get("preset_name"),
         "applied_at": _to_jsonable((a or {}).get("applied_at")),
+        "last_synced_at": _to_jsonable((a or {}).get("last_synced_at")),
       })
     return _json_response(HTTPStatus.OK, {"nodes": out})
 
-  def _xout_prepare_deploy_payload(payload: dict) -> dict:
-    """Validate xout-specific deploy payload and persist the per-node
-    state (preset assignment + token set) so the resolved preset.json
-    we ship to each node reflects the operator's selection.
-
-    Mutates ``payload`` to inject the rendered preset.json into
-    ``extra_files['data/preset.json']`` so the existing
-    deploy_service_to_nodes flow ships it with no special-casing.
-
-    Token set is full-replaced on every selected node — the tokens the
-    operator picks at deploy time become the authoritative set.
-
-    Raises HttpError on validation failure."""
-    raw_tokens = payload.get("tokens")
-    if not isinstance(raw_tokens, list) or not raw_tokens:
-      raise HttpError(HTTPStatus.BAD_REQUEST,
-                      "tokens must be a non-empty list of token ids",
-                      code="tokens_required")
-    try:
-      token_ids = [int(t) for t in raw_tokens]
-    except (TypeError, ValueError):
-      raise HttpError(HTTPStatus.BAD_REQUEST,
-                      "tokens must be integer ids",
-                      code="invalid_tokens") from None
-    try:
-      preset_id = int(payload.get("preset_id") or 0)
-    except (TypeError, ValueError):
-      raise HttpError(HTTPStatus.BAD_REQUEST,
-                      "preset_id must be an integer",
-                      code="invalid_preset_id") from None
-    if not preset_id:
-      raise HttpError(HTTPStatus.BAD_REQUEST,
-                      "preset_id is required",
-                      code="preset_id_required")
-
-    preset = ctx.database.get_xout_preset(preset_id)
-    if preset is None:
-      raise HttpError(HTTPStatus.NOT_FOUND,
-                      f"preset not found: {preset_id}",
-                      code="preset_not_found")
-
-    # Validate every selected token exists. This catches stale UI state
-    # (token deleted between modal-open and Deploy click).
-    missing_tokens: list[int] = []
-    for tid in token_ids:
-      if ctx.database.get_xout_token(tid) is None:
-        missing_tokens.append(tid)
-    if missing_tokens:
-      raise HttpError(HTTPStatus.NOT_FOUND,
-                      f"token(s) not found: {missing_tokens}",
-                      code="token_not_found")
-
-    # Resolve target nodes. Mirrors the same logic deploy_service_to_nodes
-    # uses so we hit the exact node set both for state writes and the
-    # subsequent deploy.
-    if payload.get("all"):
-      target_names = [n.name for n in ctx.database.list_nodes()]
-    else:
-      raw_nodes = payload.get("nodes") or []
-      target_names = [str(n).strip() for n in raw_nodes if str(n).strip()]
-    if not target_names:
-      raise HttpError(HTTPStatus.BAD_REQUEST,
-                      "nodes must be a non-empty list (or set all=true)",
-                      code="nodes_required")
-
-    # Persist the (preset, tokens) selection BEFORE the actual deploy so
-    # that mid-deploy crashes don't leave the cache out of sync with what
-    # the container is about to render.
-    for nn in target_names:
-      ctx.database.upsert_xout_assignment(nn, preset_id, applied_by="admin")
-      ctx.database.replace_xout_node_token_set(nn, token_ids)
-
-    # Resolve the preset using one of the selected nodes — they all have
-    # the same token set now, so the rendered output is identical.
-    sample_node = target_names[0]
-    resolved_inbounds = _xout_resolve_preset(preset, node_name=sample_node)
-
-    import json as _json
-    preset_json = _json.dumps(resolved_inbounds, indent=2)
-    extra = dict(payload.get("extra_files") or {})
-    extra["data/preset.json"] = preset_json
-    payload["extra_files"] = extra
-    payload.setdefault("triggered_by", "xout-channel")
-    return {
-      "preset_id": preset_id,
-      "token_ids": token_ids,
-      "target_names": target_names,
-    }
+  # NOTE: _xout_prepare_deploy_payload was removed in the xout-merge
+  # cleanup pass. The function used to gate xout deploys on a
+  # `tokens` + `preset_id` payload that the legacy "Services → xout →
+  # Deploy" modal sent. Post-refactor (2026-05-04) xout is a plain
+  # env-driven service: the container reads its preset assignment and
+  # user list from the DB on every 30s tick, preset assignments live
+  # behind /api/xout/assignments, and the container reports its
+  # generated Reality keys back via xout_node_inbounds. The legacy
+  # SSH-based /api/xout/sync-tokens endpoint was removed in the same
+  # pass since admin's subscription handler now reads the same
+  # xout_node_inbounds table directly.
 
   def xout_outbound_targets_handler(_request: _Request) -> _Response:
     """Unified picker source for the per-inbound Outbound editor:
@@ -5698,10 +5616,11 @@ def _build_router(ctx: AdminContext) -> _Router:
           pub = reality.get("public_key", "") or reality.get("pubkey", "")
           sid = reality.get("short_id", "")
           # Treat "auto" the same as missing — that's the placeholder
-          # operators put in the preset; the real key is generated on
-          # the node and only available via sync-tokens (which reads
-          # /data/preset.json.resolved). Either way, can't build a URI
-          # without the actual public key.
+          # operators put in the preset; the real key is generated by
+          # the xout container on first boot and upserted into
+          # xout_node_inbounds. Either way, can't build a URI without
+          # the actual public key, so we drop the inbound and let the
+          # caller surface "node hasn't reported yet" in the response.
           if not pub or pub.lower() == "auto":
             continue
           # Display name = inbound tag verbatim (operator-chosen, e.g.
@@ -5914,15 +5833,48 @@ def _build_router(ctx: AdminContext) -> _Router:
                       code="token_not_found")
     return _json_response(HTTPStatus.OK, rec)
 
+  def _resolve_inbounds_with_node_reality(node_name: str, preset: dict) -> list[dict]:
+    """Like ``_xout_resolve_preset(node_name=...)`` but additionally
+    overlays each VLESS inbound's reality.{public_key, sni, short_id}
+    with the values the xout container has reported back via
+    ``xout_node_inbounds`` (keyed by tag). The container generates
+    Reality x25519 keys on first boot and upserts them into that
+    table, so this is the post-merge replacement for SSHing the node
+    to read ``/data/preset.json.resolved``.
+
+    Inbounds whose reality.public_key is still ``"auto"`` after the
+    overlay (= the container hasn't reported the tag yet) get dropped
+    by ``_build_subscriptions_for_token`` since you can't form a
+    working VLESS URI without a real key."""
+    resolved = _xout_resolve_preset(preset, node_name=node_name)
+    reported = ctx.database.list_xout_node_inbounds(node_name)
+    by_tag = {r.get("tag"): r for r in reported if r.get("tag")}
+    for ib in resolved:
+      if (ib.get("protocol") or "").lower() != "vless":
+        continue
+      rep = by_tag.get(ib.get("tag"))
+      if rep is None:
+        continue
+      reality = dict(ib.get("reality") or {})
+      if rep.get("sni"):        reality["sni"] = rep["sni"]
+      if rep.get("public_key"): reality["public_key"] = rep["public_key"]
+      if rep.get("short_id"):   reality["short_id"] = rep["short_id"]
+      ib["reality"] = reality
+    return resolved
+
   def xout_tokens_subscription_handler(request: _Request) -> _Response:
     """Aggregated subscription content for one token across every node
     that has it provisioned.
 
-    Prefers the per-node cached strings (populated by sync-tokens, which
-    reads ``/data/preset.json.resolved`` so the URI has the REAL Reality
-    public key). If a node has no cached value, falls back to building
-    on-the-fly from the stored preset — that path silently drops vless
-    URIs whose public key is still ``"auto"``."""
+    Builds URIs at request time from the stored preset, with each
+    VLESS inbound's Reality params overlaid from ``xout_node_inbounds``
+    (the table the xout container upserts into on first boot). No
+    SSH, no caches — same source-of-truth path user-service's
+    /sub/<token> already uses.
+
+    A node whose container has not yet reported its Reality keys back
+    (e.g. fresh deploy, container still booting) shows up in
+    ``nodes_unreported`` and contributes zero VLESS URIs."""
     tid = int(request.path_params["id"])
     token = ctx.database.get_xout_token(tid)
     if token is None:
@@ -5930,78 +5882,47 @@ def _build_router(ctx: AdminContext) -> _Router:
                       code="token_not_found")
     rows = ctx.database.list_xout_node_tokens_for_token(tid)
     nodes_seen: list[str] = []
-    nodes_cached: list[str] = []
-    nodes_uncached: list[str] = []
-    cached_b64_chunks: list[str] = []
-    cached_clash_chunks: list[str] = []
-    on_the_fly: dict[str, dict] = {}
+    nodes_unreported: list[str] = []
+    node_assignments: dict[str, dict] = {}
 
     for r in rows:
-      node = ctx.database.get_node(r["node_name"])
+      nn = r["node_name"]
+      node = ctx.database.get_node(nn)
       if node is None: continue
-      nodes_seen.append(r["node_name"])
-      cached_b64 = r.get("base64_subscription")
-      cached_clash = r.get("clash_subscription")
-      if cached_b64 or cached_clash:
-        nodes_cached.append(r["node_name"])
-        if cached_b64: cached_b64_chunks.append(cached_b64)
-        if cached_clash: cached_clash_chunks.append(cached_clash)
-      else:
-        a = ctx.database.get_xout_assignment(r["node_name"])
-        if a is None: continue
-        preset = ctx.database.get_xout_preset(a["preset_id"])
-        if preset is None: continue
-        on_the_fly[r["node_name"]] = {"node": node, "preset": preset}
-        nodes_uncached.append(r["node_name"])
+      nodes_seen.append(nn)
+      a = ctx.database.get_xout_assignment(nn)
+      if a is None: continue
+      preset = ctx.database.get_xout_preset(a["preset_id"])
+      if preset is None: continue
+      # Build a node-specific preset whose inbounds carry the resolved
+      # Reality public_key (or "auto" if the container hasn't reported
+      # yet). _build_subscriptions_for_token drops VLESS rows with
+      # public_key=="auto", so unreported nodes simply contribute
+      # nothing rather than producing broken URIs.
+      resolved_inbounds = _resolve_inbounds_with_node_reality(nn, preset)
+      any_real_pubkey = any(
+        (ib.get("protocol") or "").lower() == "vless"
+        and (ib.get("reality") or {}).get("public_key", "auto").lower() != "auto"
+        for ib in resolved_inbounds
+      )
+      if not any_real_pubkey:
+        nodes_unreported.append(nn)
+      node_assignments[nn] = {
+        "node": node,
+        "preset": {"name": preset.get("name"), "inbounds": resolved_inbounds},
+      }
 
-    fly_subs = _build_subscriptions_for_token(token, on_the_fly) \
-      if on_the_fly else {"raw": [], "plain": "", "base64": "", "clash": ""}
+    subs = _build_subscriptions_for_token(token, node_assignments) \
+      if node_assignments else {"raw": [], "plain": "", "base64": "", "clash": ""}
 
-    # Merge cached + on-the-fly. The cached base64 strings each decode
-    # to a `\n`-separated URI list — we just concat them with the new
-    # plain text and re-encode. For Clash, cached chunks already start
-    # with "proxies:"; concat by stripping the header from chunks 2+.
-    import base64 as _b64
-    plain_parts: list[str] = []
-    for chunk in cached_b64_chunks:
-      try:
-        plain_parts.append(_b64.b64decode(chunk).decode("utf-8"))
-      except Exception:
-        pass
-    if fly_subs.get("plain"):
-      plain_parts.append(fly_subs["plain"])
-    plain = "".join(plain_parts)
-    b64 = _b64.b64encode(plain.encode("utf-8")).decode("ascii") if plain else ""
-
-    clash_parts: list[str] = []
-    for i, chunk in enumerate(cached_clash_chunks):
-      if i == 0:
-        clash_parts.append(chunk.rstrip("\n"))
-      else:
-        # strip the duplicated "proxies:" header
-        body = "\n".join(line for line in chunk.splitlines()
-                         if line.strip() and line.strip() != "proxies:")
-        if body:
-          clash_parts.append(body)
-    if fly_subs.get("clash"):
-      body = fly_subs["clash"]
-      if clash_parts:
-        body = "\n".join(line for line in body.splitlines()
-                         if line.strip() and line.strip() != "proxies:")
-      if body:
-        clash_parts.append(body.rstrip("\n"))
-    clash = ("\n".join(clash_parts) + "\n") if clash_parts else ""
-
-    raw = [u for u in plain.split("\n") if u]
     return _json_response(HTTPStatus.OK, {
       "token": {"id": token["id"], "name": token["name"], "uuid": token["uuid"]},
       "nodes": nodes_seen,
-      "nodes_cached": nodes_cached,
-      "nodes_uncached": nodes_uncached,
-      "raw": raw,
-      "plain": plain,
-      "base64": b64,
-      "clash": clash,
+      "nodes_unreported": nodes_unreported,
+      "raw": subs.get("raw") or [],
+      "plain": subs.get("plain") or "",
+      "base64": subs.get("base64") or "",
+      "clash": subs.get("clash") or "",
     })
 
   def xout_node_traffic_summary_handler(request: _Request) -> _Response:
@@ -6339,113 +6260,14 @@ def _build_router(ctx: AdminContext) -> _Router:
                       "raw_lines": len(matches)})
     return _json_response(HTTPStatus.OK, {"results": results})
 
-  def _xout_sync_tokens_on_nodes(target_names: list[str]) -> list[dict[str, Any]]:
-    """Reconcile token presence + cached subscription strings on the
-    given nodes by reading ``/data/preset.json.resolved`` over SSH.
-    Shared by the manual sync-tokens endpoint and by the post-deploy
-    auto-sync hook.
-
-    For each VLESS UUID found in the resolved preset, ensures an
-    ``xout_node_tokens`` row exists and rebuilds its
-    ``base64_subscription`` / ``clash_subscription`` cache."""
-    if not target_names:
-      return []
-    tokens_by_uuid = {t["uuid"]: t for t in ctx.database.list_xout_tokens()}
-    results: list[dict[str, Any]] = []
-
-    for nn in target_names:
-      node = ctx.database.get_node(nn)
-      if node is None:
-        results.append({"node": nn, "ok": False, "error": "not found"})
-        continue
-      try:
-        # /data is mounted INSIDE the xout container (bind-mounted from
-        # /opt/xout/data on the host). Reading via host path requires
-        # the bind mount path; reading via the container is more
-        # robust. Try host path first (faster if running), then fall
-        # back to docker exec.
-        cmd = (
-          "set -e; "
-          "for f in /opt/xout/data/preset.json.resolved /opt/xout/data/preset.json; do "
-          "  if [ -f \"$f\" ]; then cat \"$f\"; exit 0; fi; "
-          "done; "
-          "if command -v docker >/dev/null 2>&1; then "
-          "  for f in /data/preset.json.resolved /data/preset.json; do "
-          "    if docker exec xout test -f \"$f\" 2>/dev/null; then "
-          "      docker exec xout cat \"$f\"; exit 0; fi; "
-          "  done; "
-          "fi; "
-          "echo '{}'"
-        )
-        rc = nodes_mod.run_command(node, cmd, timeout=30.0,
-                                    linked_keys=_ssh_credentials_for_node(ctx, nn))
-      except Exception as exc:
-        results.append({"node": nn, "ok": False, "error": str(exc)[:200]})
-        continue
-      raw = (rc.stdout or "").strip() or "[]"
-      try:
-        data = json.loads(raw)
-      except Exception:
-        # Container may have rendered template literals or be missing —
-        # don't fail the whole sync, just report.
-        results.append({"node": nn, "ok": False,
-                        "error": f"could not parse preset on node ({len(raw)} bytes)"})
-        continue
-
-      # The on-disk shape is a JSON ARRAY of inbound objects (entrypoint
-      # writes it that way; see scripts/container-entrypoint.sh).
-      # Some older internal callers pass {"inbounds":[...]} so support
-      # both — list-shape unwraps to itself, dict-shape unwraps via key.
-      if isinstance(data, list):
-        inbounds_list = data
-      elif isinstance(data, dict):
-        inbounds_list = data.get("inbounds") or []
-      else:
-        results.append({"node": nn, "ok": False,
-                        "error": f"unexpected preset shape: {type(data).__name__}"})
-        continue
-
-      uuids_present: set[str] = set()
-      for ib in inbounds_list:
-        if not isinstance(ib, dict): continue
-        if ib.get("protocol") != "vless":
-          continue
-        for u in (ib.get("users") or []):
-          if not isinstance(u, dict): continue
-          uid = (u.get("uuid") or "").strip()
-          if uid:
-            uuids_present.add(uid)
-
-      linked = 0
-      tokens_for_this_node: list[dict] = []
-      for uid in uuids_present:
-        tok = tokens_by_uuid.get(uid)
-        if tok is None:
-          continue
-        ctx.database.upsert_xout_node_token(nn, tok["id"], last_seen_at=True)
-        linked += 1
-        tokens_for_this_node.append(tok)
-
-      # Rebuild the cached subscription strings using the RESOLVED
-      # preset we just parsed from /data/preset.json.resolved on the
-      # node. The stored preset has placeholders (e.g. public_key:
-      # "auto"); the resolved file has the real generated values, so
-      # only it produces working subscription URIs.
-      resolved_preset = {"name": "resolved", "inbounds": inbounds_list}
-      for tok in tokens_for_this_node:
-        subs = _build_subscriptions_for_token(
-          tok, {nn: {"node": node, "preset": resolved_preset}},
-        )
-        ctx.database.upsert_xout_node_token(
-          nn, tok["id"],
-          base64_subscription=subs.get("base64"),
-          clash_subscription=subs.get("clash"),
-        )
-
-      results.append({"node": nn, "ok": True,
-                      "tokens_present": len(uuids_present),
-                      "tokens_linked": linked})
-    return results
+  # NOTE: _xout_sync_tokens_on_nodes was removed. The function used to
+  # SSH each node and read /data/preset.json.resolved to harvest the
+  # auto-generated Reality keys + cache subscription URIs. In the
+  # post-merge architecture each xout container generates its own
+  # Reality keys on first boot and upserts them straight into
+  # xout_node_inbounds, so the SSH path is dead — admin's subscription
+  # handler now overlays Reality params from that table at request
+  # time, exactly like user-service's /sub/<token> already does.
 
   def xout_assignments_bulk_handler(request: _Request) -> _Response:
     """Bulk-assign one preset to N nodes.
@@ -6497,29 +6319,9 @@ def _build_router(ctx: AdminContext) -> _Router:
     return _json_response(HTTPStatus.OK,
       {"assigned": targets, "preset_id": preset_id})
 
-  def xout_sync_tokens_handler(request: _Request) -> _Response:
-    """Public wrapper around _xout_sync_tokens_on_nodes.
-
-    Body: ``{nodes: [...]}`` (optional — defaults to all assigned nodes).
-    Returns per-node ``{ok, tokens_present, tokens_linked}``."""
-    _require_readwrite(ctx)
-    p = request.json_body() or {}
-    raw_nodes = p.get("nodes")
-    if isinstance(raw_nodes, list) and raw_nodes:
-      seen: set[str] = set()
-      target_names: list[str] = []
-      for n in raw_nodes:
-        nn = _normalize_node_name(str(n))
-        if nn not in seen:
-          seen.add(nn); target_names.append(nn)
-    else:
-      assignments = ctx.database.list_xout_assignments()
-      target_names = [a["node_name"] for a in assignments]
-    if not target_names:
-      return _json_response(HTTPStatus.OK,
-        {"results": [], "message": "no xout nodes to sync"})
-    return _json_response(HTTPStatus.OK,
-      {"results": _xout_sync_tokens_on_nodes(target_names)})
+  # NOTE: xout_sync_tokens_handler (POST /api/xout/sync-tokens) was
+  # removed alongside _xout_sync_tokens_on_nodes — see the note above
+  # at the function-deletion site for why.
 
   def _xout_fetch_resolved_inbounds(node_name: str) -> list[dict[str, Any]]:
     """SSH into ``node_name`` and read ``/data/preset.json.resolved``
@@ -7517,7 +7319,6 @@ def _build_router(ctx: AdminContext) -> _Router:
              with_auth(xout_tokens_regenerate_value_handler))
   router.add("GET",    "/api/xout/tokens/{id}/subscription", with_auth(xout_tokens_subscription_handler))
   router.add("POST",   "/api/xout/sync-traffic",             with_auth(xout_sync_traffic_handler))
-  router.add("POST",   "/api/xout/sync-tokens",              with_auth(xout_sync_tokens_handler))
   router.add("POST",   "/api/xout/assignments",              with_auth(xout_assignments_bulk_handler))
   router.add("GET",    "/api/xout/nodes/{name}/traffic-summary",
              with_auth(xout_node_traffic_summary_handler))

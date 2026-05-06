@@ -2832,6 +2832,13 @@
       }
     }
     const footer = h("div", { class: "row" },
+      h("button", { class: "btn", onclick: async () => {
+        const text = log.textContent || "";
+        if (!text.trim()) { toast("info", "Nothing to copy", "Log is empty"); return; }
+        const ok = await copyTextToClipboard(text);
+        if (ok) toast("success", "Copied", `${text.length} chars`);
+        else toast("error", "Copy failed", "Clipboard unavailable");
+      } }, "Copy log"),
       h("button", { class: "btn btn-primary", onclick: () => {
         if (pollTimer) clearInterval(pollTimer);
         Modal.close();
@@ -3314,6 +3321,14 @@
       wrap.appendChild(out);
 
       footer.innerHTML = "";
+      footer.appendChild(h("button", { class: "btn", onclick: async () => {
+        const el = document.getElementById("wiz-log");
+        const text = el ? (el.textContent || "") : "";
+        if (!text.trim()) { toast("info", "Nothing to copy", "Log is empty"); return; }
+        const ok = await copyTextToClipboard(text);
+        if (ok) toast("success", "Copied", `${text.length} chars`);
+        else toast("error", "Copy failed", "Clipboard unavailable");
+      } }, "Copy log"));
       footer.appendChild(h("button", { class: "btn", onclick: () => Modal.close() }, "Close"));
     }
 
@@ -9757,6 +9772,12 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
         h("strong", null, "Settings → User Service"),
         " before sharing /sub/{token} URLs."));
     }
+    // Collect each subscription's card; show only the active one when
+    // the user has multiple subs. With 2+ subscriptions we render a
+    // product-name tab strip at the top so the operator picks which
+    // subscription's URL/content to view. With a single sub there's
+    // nothing to switch between, so we skip the tab strip entirely.
+    const subCards = [];
     for (const s of subs) {
       const productLabel = (s.product_name && s.product_name["zh-CN"])
         ? `${s.product_code} · ${s.product_name["zh-CN"]}`
@@ -10050,7 +10071,45 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
           contentMeta,
           contentPre,
           speedTbl));
-      body.appendChild(card);
+      subCards.push({ card, label: productLabel, sub: s });
+    }
+    // Render: optional product-tab strip (only when 2+ subs) +
+    // the active subscription's card.
+    if (subCards.length > 1) {
+      const productBar = h("div", { class: "row",
+        style: "gap: 0; border-bottom: 1px solid var(--border); "
+             + "margin-bottom: 4px; flex-wrap: wrap" });
+      const showCard = (idx) => {
+        for (let i = 0; i < subCards.length; i++) {
+          subCards[i].card.style.display = i === idx ? "" : "none";
+        }
+        for (let i = 0; i < productBar.children.length; i++) {
+          const t = productBar.children[i];
+          t.style.borderBottom = i === idx
+            ? "2px solid var(--accent, #b06c2c)"
+            : "2px solid transparent";
+          t.style.opacity = i === idx ? "1" : "0.6";
+        }
+      };
+      subCards.forEach((sc, i) => {
+        const tabBtn = h("button", {
+          class: "btn btn-sm",
+          style: "border: none; background: transparent; "
+               + "border-bottom: 2px solid transparent; "
+               + "border-radius: 0; padding: 8px 14px; font-weight: 500",
+          onclick: () => showCard(i),
+        }, sc.label);
+        productBar.appendChild(tabBtn);
+      });
+      body.appendChild(productBar);
+      for (const sc of subCards) body.appendChild(sc.card);
+      // Activate the first sub by default — its content will fetch
+      // automatically because the inner format-tab onclick fires when
+      // its card was constructed (still queued in cache).
+      showCard(0);
+    } else {
+      // Single sub — no product tab strip needed.
+      for (const sc of subCards) body.appendChild(sc.card);
     }
     Modal.open({
       title: `Subscriptions — ${user.primary_email}`,
@@ -10848,14 +10907,11 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
     const syncTrafficBtn = h("button", { class: "btn btn-sm",
       title: "Pull live traffic stats from selected nodes (or all)",
       onclick: () => bulkSyncTraffic() }, "Sync traffic");
-    const syncTokensBtn = h("button", { class: "btn btn-sm",
-      title: "Reconcile tokens-on-disk with database (selected nodes or all)",
-      onclick: () => bulkSyncTokens() }, "Sync tokens");
     nodesCard.appendChild(h("div", { class: "card-header" },
       h("h2", null, "Deployed nodes"),
       h("div", { class: "row", style: "gap: 6px; flex: 1; justify-content: flex-end" },
         h("span", { class: "hint", id: "xout-nodes-count" }, ""),
-        assignPresetBtn, syncTrafficBtn, syncTokensBtn)));
+        assignPresetBtn, syncTrafficBtn)));
     const nodesBody = h("div", { class: "card-body" });
     nodesCard.appendChild(nodesBody);
     root.appendChild(nodesCard);
@@ -10942,17 +10998,11 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
         },
       });
     }
-    async function bulkSyncTokens() {
-      const nodes = selectedNodeNames();
-      try {
-        const r = await api("POST", "/api/xout/sync-tokens", { nodes });
-        const okCount = (r.results || []).filter((x) => x.ok).length;
-        toast("success", "Tokens reconciled", `${okCount}/${(r.results || []).length} nodes`);
-        refresh();
-      } catch (err) {
-        toast("error", "Sync tokens failed", err.message);
-      }
-    }
+    // bulkSyncTokens / "Sync tokens" button removed — admin's
+    // subscription handler now reads xout_node_inbounds at request
+    // time, and the xout container writes Reality keys + token
+    // presence directly into the DB on its 30s tick. No SSH-pull
+    // reconciliation step needed anymore.
 
     const renderPresets = (presets) => {
       presetsBody.innerHTML = "";
@@ -11015,7 +11065,7 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
         nodesBody.appendChild(h("div", { class: "empty" },
           h("div", { class: "title" }, "No xout deployments yet"),
           h("div", { class: "sub" },
-            "Deploy from Services → xout → Deploy. Pick the tokens and the preset there.")));
+            "Deploy from Services → xout → Deploy. Assign a preset on this page after the container is up — the container reads its preset and user list from the DB on every 30s tick.")));
         return;
       }
       const tbl = h("table", { class: "data" });
@@ -11029,6 +11079,8 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
         h("th", null, "Container"),
         h("th", null, "Health"),
         h("th", null, "Current preset"),
+        h("th", { title: "When the xout container last finished a tick (read preset+users from DB, pushed traffic deltas back). Tick is 30s." },
+          "Last synced"),
         h("th", null, "Last deploy"),
         h("th", null, ""))));
       const tb = h("tbody");
@@ -11045,6 +11097,25 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
           if (n.healthcheck_ok === false) return h("span", { class: "badge danger" }, "✗");
           return h("span", { class: "muted" }, "—");
         })();
+        // Staleness signal — tick is 30s, so anything past 2min means
+        // the container hasn't ticked for ~4 cycles and is likely down
+        // or has lost DB connectivity.
+        const lastSyncedCell = (() => {
+          if (!n.last_synced_at) {
+            return h("span", { class: "muted",
+              title: "Container has never reported a completed tick. Wait ~30-60s after deploy, then refresh." },
+              "never");
+          }
+          const ageMs = Date.now() - new Date(n.last_synced_at).getTime();
+          if (Number.isNaN(ageMs)) return h("span", { class: "muted" }, n.last_synced_at);
+          const rel = fmtRelative(n.last_synced_at);
+          if (ageMs > 120_000) {
+            return h("span", { class: "badge danger",
+              title: `Last tick was ${rel} — container may be down or DB DSN misconfigured. Tick should fire every 30s.` },
+              rel);
+          }
+          return h("span", { class: "muted", style: "font-size: 12px" }, rel);
+        })();
         const cb = h("input", { type: "checkbox", class: "xout-node-cb" });
         cb.dataset.node = n.node_name;
         tb.appendChild(h("tr", null,
@@ -11053,6 +11124,7 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
           h("td", null, stateBadge),
           h("td", null, healthBadge),
           h("td", { class: "mono" }, n.preset_name || h("span", { class: "muted" }, "(unassigned)")),
+          h("td", null, lastSyncedCell),
           h("td", { class: "muted", style: "font-size: 12px" },
             n.last_observed_at ? fmtRelative(n.last_observed_at) : "never"),
           h("td", { class: "actions" },
@@ -11060,11 +11132,11 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
               onclick: () => openXoutTestModal(n.node_name) },
               "Test"),
             h("button", { class: "btn btn-sm",
-              title: "Show this node's tokens, this-month traffic and residual quota",
+              title: "Show this node's users, this-month traffic and residual quota",
               onclick: () => openVerifyTrafficModal(n.node_name) },
               "Verify traffic"),
             h("button", { class: "btn btn-sm",
-              title: "Get the subscription content for every token published to this node",
+              title: "Get the subscription content for every user published to this node",
               onclick: () => openNodeSubscriptionModal(n.node_name) },
               "Subscription")),
         ));
@@ -11245,12 +11317,12 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
 
     if (!(r.per_token || []).length) {
       body.appendChild(h("div", { class: "muted", style: "padding: 12px" },
-        "No tokens recorded for this node yet. Run 'Sync traffic' or 'Sync tokens' first."));
+        "No users recorded for this node yet. The xout container reports presence on its 30s tick — wait a minute and refresh, or run 'Sync traffic' to seed historical rows."));
     } else {
       const tbl = h("table", { class: "data" });
       tbl.appendChild(h("thead", null, h("tr", null,
-        h("th", null, "Token"),
-        h("th", { title: "Traffic since this token's reset day" }, "Cycle"),
+        h("th", null, "User"),
+        h("th", { title: "Traffic since this user's reset day" }, "Cycle"),
         h("th", null, "Total"), h("th", null, "Last seen"))));
       const tb = h("tbody");
       for (const pt of r.per_token) {
@@ -11323,10 +11395,10 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
       h("span", { class: "muted" },
         `· ${vlessN} vless inbound${vlessN === 1 ? "" : "s"}`),
       matchedN ? h("span", { class: "badge ok", style: "font-size: 11px",
-        title: "User UUID matches a DB token" },
+        title: "User UUID matches a DB user" },
         `${matchedN} matched`) : null,
       unknownN ? h("span", { class: "badge danger", style: "font-size: 11px",
-        title: "User UUID present in deployed preset but not registered in the Tokens table — usage won't be attributed to any token" },
+        title: "User UUID present in deployed preset but not registered in the Users table — usage won't be attributed to any user" },
         `${unknownN} unknown`) : null,
     ));
 
@@ -11417,19 +11489,9 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
 
     Modal.open({ title: `Subscription: ${nodeName}`, body,
       footer: h("div", { class: "row" },
-        h("button", { class: "btn", title: "Pull fresh subscription from this node",
-          onclick: async (e) => {
-            e.target.disabled = true;
-            e.target.textContent = "Syncing…";
-            try {
-              await api("POST", "/api/xout/sync-tokens", { nodes: [nodeName] });
-              openNodeSubscriptionModal(nodeName);
-            } catch (err) {
-              toast("error", "Sync failed", err.message);
-              e.target.disabled = false;
-              e.target.textContent = "Sync tokens";
-            }
-          } }, "Sync tokens"),
+        h("button", { class: "btn", title: "Re-fetch subscription from the database",
+          onclick: () => { Modal.close(); openNodeSubscriptionModal(nodeName); }
+        }, "Refresh"),
         h("div", { style: "flex: 1" }),
         h("button", { class: "btn btn-primary", onclick: () => Modal.close() }, "Close")) });
   }
