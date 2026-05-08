@@ -676,130 +676,22 @@ CREATE TABLE IF NOT EXISTS xout_node_assignments (
 CREATE INDEX IF NOT EXISTS idx_xout_assignments_preset
   ON xout_node_assignments (preset_id);
 
--- xout tokens (= xout users) -------------------------------------------
--- One row per logical user. The ``uuid`` is the stable VLESS client id
--- and is reused on every node — that's the value that makes a vless://
--- subscription URL keep working when the operator re-deploys. Mark
--- exactly one row as ``is_default`` (partial unique index enforces it);
--- newly-deployed xout instances seed their first user from that row.
-CREATE TABLE IF NOT EXISTS xout_tokens (
-  id BIGSERIAL PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE,
-  uuid TEXT NOT NULL UNIQUE,
-  password TEXT,
-  monthly_quota_gb INTEGER NOT NULL DEFAULT 1000
-    CHECK (monthly_quota_gb >= 0 AND monthly_quota_gb <= 1000000),
-  monthly_reset_day INTEGER NOT NULL DEFAULT 1
-    CHECK (monthly_reset_day BETWEEN 1 AND 28),
-  notes TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
--- Note: ``is_default`` and its partial unique index used to live here.
--- Both were dropped in the xout v2 migration further down — the operator
--- now picks the token set explicitly at deploy time, no fallback default.
-
-DROP TRIGGER IF EXISTS xout_tokens_touch_updated_at ON xout_tokens;
-CREATE TRIGGER xout_tokens_touch_updated_at
-BEFORE UPDATE ON xout_tokens
-FOR EACH ROW
-EXECUTE FUNCTION touch_updated_at();
-
--- Which tokens are provisioned on which nodes. ``last_seen_at`` is
--- bumped by the sync-traffic path whenever xray's StatsService reports
--- activity for a UUID, so it tracks "this token has been used on this
--- node lately". The cached subscription columns this table once held
--- (base64_subscription, clash_subscription) were dropped as part of
--- the sync-tokens cleanup — admin's subscription handler now reads
--- xout_node_inbounds at request time, exactly like user-service.
-CREATE TABLE IF NOT EXISTS xout_node_tokens (
-  node_name TEXT NOT NULL REFERENCES nodes(name) ON DELETE CASCADE ON UPDATE CASCADE,
-  token_id  BIGINT NOT NULL REFERENCES xout_tokens(id) ON DELETE CASCADE,
-  provisioned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  last_seen_at   TIMESTAMPTZ,
-  PRIMARY KEY (node_name, token_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_xout_node_tokens_token
-  ON xout_node_tokens (token_id);
-
--- Per-day traffic accumulator. We record one row per (node, token, day);
--- the operator-pulled stats from each xout container's StatsService get
--- snapshotted into here on every "Sync traffic" call. Daily granularity
--- keeps storage tiny and is enough for "this-month total" + "lifetime
--- total" rollups.
-CREATE TABLE IF NOT EXISTS xout_traffic_daily (
-  node_name TEXT NOT NULL REFERENCES nodes(name) ON DELETE CASCADE ON UPDATE CASCADE,
-  token_id  BIGINT NOT NULL REFERENCES xout_tokens(id) ON DELETE CASCADE,
-  day DATE NOT NULL,
-  uplink_bytes   BIGINT NOT NULL DEFAULT 0,
-  downlink_bytes BIGINT NOT NULL DEFAULT 0,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (node_name, token_id, day)
-);
-
-CREATE INDEX IF NOT EXISTS idx_xout_traffic_daily_day
-  ON xout_traffic_daily (day);
-CREATE INDEX IF NOT EXISTS idx_xout_traffic_daily_token
-  ON xout_traffic_daily (token_id);
-
--- xout v2 ---------------------------------------------------------------
--- Token value: opaque alphanumeric URL slug (≥24 chars) used as the
--- public identifier for a token in subscription URLs (separate from
--- the internal numeric ``id`` and the VLESS ``uuid``). Auto-generated
--- on row creation; the operator can regenerate but cannot pick the
--- value (length+entropy = security).
-ALTER TABLE xout_tokens ADD COLUMN IF NOT EXISTS token_value TEXT;
-
--- Backfill pre-existing rows. md5() of three jittered sources → 32 hex
--- chars, take 24. Operator can immediately Regenerate after migration
--- to upgrade to the proper python-secrets-token alphabet (a..zA..Z0..9)
--- if they want — this DB-side fallback only exists so the NOT NULL
--- constraint below doesn't blow up on rows we've already shipped.
-DO $$
-DECLARE
-  rec RECORD;
-BEGIN
-  FOR rec IN SELECT id FROM xout_tokens WHERE token_value IS NULL LOOP
-    UPDATE xout_tokens
-       SET token_value = substr(
-         md5(random()::text || clock_timestamp()::text || rec.id::text), 1, 24)
-     WHERE id = rec.id;
-  END LOOP;
-END $$;
-
-ALTER TABLE xout_tokens ALTER COLUMN token_value SET NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_xout_tokens_token_value
-  ON xout_tokens (token_value);
-
--- is_default removed: the operator now picks token set explicitly at
--- deploy time. Empty selection at deploy = error, no fallback.
-DROP INDEX IF EXISTS idx_xout_tokens_default_unique;
-ALTER TABLE xout_tokens DROP COLUMN IF EXISTS is_default;
-
 -- Preset outbounds: removed. Top-level outbounds were never read by
 -- the xout container's entrypoint — it derives outbounds per-inbound
--- from each inbound's `outbound` field. Keeping it as dead data was
--- misleading the operator, so the column is dropped here. The column
--- existed only briefly between two earlier xout schema revisions.
+-- from each inbound's `outbound` field.
 ALTER TABLE xout_presets DROP COLUMN IF EXISTS outbounds;
 
 -- Per-node sync heartbeat. Each xout container writes NOW() into this
--- column at the end of every 30s tick (after reading preset+users from
--- DB and pushing traffic deltas back). The Deployed-nodes UI reads it
--- to show "last synced N seconds ago" — staleness > ~2 min means the
--- container is down or the DB DSN is misconfigured.
+-- column at the end of every 30s tick. Deployed-nodes UI shows
+-- "last synced N seconds ago"; staleness > ~2 min ⇒ container down.
 ALTER TABLE xout_node_assignments
   ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ;
 
--- sync-tokens cleanup. The SSH-based reverse-pull path has been
--- removed: admin's subscription handler now reads resolved Reality keys
--- from xout_node_inbounds (which the container upserts on first boot),
--- exactly like user-service's /sub/<token> already does. The two cached
--- subscription strings on xout_node_tokens are no longer written or
--- read by anything; drop them.
-ALTER TABLE xout_node_tokens DROP COLUMN IF EXISTS base64_subscription;
-ALTER TABLE xout_node_tokens DROP COLUMN IF EXISTS clash_subscription;
+-- Legacy operator-managed xout_tokens / xout_node_tokens / xout_traffic_daily
+-- tables were removed in the user-system unification. The single source
+-- of truth for "who can use xout" is now auth_users + subscriptions
+-- + xout_products. See the user-system migration block at the bottom
+-- of this file for column additions and DROP TABLE statements.
 
 -- Init defaults ----------------------------------------------------------
 -- The Initialize-a-node flow needs two pieces of credential material:
@@ -933,19 +825,32 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- Email is stored as plain TEXT; the application lowercases on insert
 -- (and a unique index on LOWER(primary_email) enforces that anyway).
 -- We avoid citext to skip a non-default extension on managed Postgres.
+-- One row per real person. username + primary_email + a password row in
+-- auth_passwords are all required; vless_uuid and subscription_token
+-- are auto-generated and never user-visible (operator can't pick them).
+-- The migration block at the bottom of this file backfills, hardens
+-- NOT NULL, and adds unique indexes for existing DBs that pre-date these
+-- columns -- so this CREATE TABLE matches the steady-state shape after
+-- migration.
 CREATE TABLE IF NOT EXISTS auth_users (
-  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  primary_email   TEXT,
-  status          TEXT NOT NULL DEFAULT 'active'
-                  CHECK (status IN ('active','disabled','deleted')),
-  locale          TEXT NOT NULL DEFAULT 'zh-CN'
-                  CHECK (locale IN ('zh-CN','en-US')),
-  display_name    TEXT,
-  is_admin        BOOLEAN NOT NULL DEFAULT FALSE,
-  metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  username            TEXT,                              -- NOT NULL added in migration
+  primary_email       TEXT,                              -- NOT NULL added in migration
+  vless_uuid          UUID DEFAULT gen_random_uuid(),    -- NOT NULL added in migration
+  subscription_token  TEXT,                              -- NOT NULL added in migration
+  status              TEXT NOT NULL DEFAULT 'active'
+                      CHECK (status IN ('active','disabled','deleted')),
+  locale              TEXT NOT NULL DEFAULT 'zh-CN'
+                      CHECK (locale IN ('zh-CN','en-US')),
+  display_name        TEXT,
+  is_admin            BOOLEAN NOT NULL DEFAULT FALSE,
+  email_verified_at   TIMESTAMPTZ,
+  metadata            JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- Backfill column for DBs that pre-date the email_verified_at addition.
+ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_primary_email
   ON auth_users (LOWER(primary_email)) WHERE primary_email IS NOT NULL;
@@ -1057,6 +962,26 @@ CREATE INDEX IF NOT EXISTS idx_subscriptions_user_status
   ON subscriptions (user_id, status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_product
   ON subscriptions (product_id);
+-- Enforce: at most one (user, product) row in non-terminal status at a
+-- time. Without this, two concurrent grants race into duplicate active
+-- subs that the operator then has to manually clean up.
+-- Pre-fixup: a pre-migration DB may already have duplicate active subs
+-- (this happens when the operator double-clicked grant before the
+-- index was added). Keep the latest by id and cancel the rest so
+-- CREATE INDEX doesn't fail on existing data.
+WITH dups AS (
+  SELECT id,
+         row_number() OVER (PARTITION BY user_id, product_id
+                              ORDER BY id DESC) AS rn
+    FROM subscriptions
+   WHERE status IN ('pending', 'active', 'over_quota')
+)
+UPDATE subscriptions
+   SET status = 'canceled', updated_at = NOW()
+ WHERE id IN (SELECT id FROM dups WHERE rn > 1);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_one_active_per_user_product
+  ON subscriptions (user_id, product_id)
+  WHERE status IN ('pending', 'active', 'over_quota');
 
 DROP TRIGGER IF EXISTS subscriptions_touch_updated_at ON subscriptions;
 CREATE TRIGGER subscriptions_touch_updated_at
@@ -1134,16 +1059,148 @@ CREATE TRIGGER xout_products_touch_updated_at
 BEFORE UPDATE ON xout_products
 FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
 
-CREATE TABLE IF NOT EXISTS xout_node_users (
-  node_name        TEXT NOT NULL REFERENCES nodes(name) ON DELETE CASCADE ON UPDATE CASCADE,
-  user_id          UUID NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
-  vless_uuid       UUID NOT NULL,                      -- = auth_users.id
-  provisioned_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  last_seen_at     TIMESTAMPTZ,
-  PRIMARY KEY (node_name, user_id)
-);
-CREATE INDEX IF NOT EXISTS idx_xout_node_users_user
-  ON xout_node_users (user_id);
+-- xout_node_users (legacy per-(node, user) VLESS UUID table) was removed
+-- in the user-system unification. The user's VLESS UUID is now a single
+-- value on auth_users (see migration block at the bottom of this file).
+
+-- =========================================================================
+-- User-system unification migration -- one source of truth for "users"
+-- =========================================================================
+-- Goals after this migration:
+--   1. auth_users carries username + email + password_hash (all required,
+--      username and email globally unique). primary_email becomes NOT NULL.
+--   2. auth_users carries vless_uuid (one per user, not per (user, node))
+--      and subscription_token (one URL per user, not per subscription).
+--      Both auto-generated at creation and globally unique.
+--   3. Legacy xout_tokens / xout_node_tokens / xout_traffic_daily are
+--      gone. xout_node_users is gone.
+--   4. subscriptions.subscription_token is gone -- /sub URL is now keyed
+--      off auth_users.subscription_token, returning *all* of that user's
+--      active xout subs aggregated.
+-- Idempotent. Re-running is a no-op once the new state is reached.
+
+-- Helper: random url-safe slug, used for default subscription_token.
+-- 18 random bytes ⇒ 24 base64 chars; translate to make url-safe.
+-- Schema-qualifies gen_random_bytes because Supabase installs pgcrypto
+-- under the ``extensions`` schema, which isn't on the default search_path.
+CREATE OR REPLACE FUNCTION _gen_url_safe_token() RETURNS TEXT
+LANGUAGE sql VOLATILE AS $$
+  SELECT translate(encode(extensions.gen_random_bytes(18), 'base64'), '+/=', '-_')
+$$;
+
+-- 1. username (TEXT, NOT NULL, UNIQUE case-insensitive).
+ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS username TEXT;
+-- Backfill from email local-part for any row missing one.
+-- Collisions are resolved by appending a numeric suffix.
+DO $$
+DECLARE
+  rec RECORD;
+  candidate TEXT;
+  attempt INT;
+BEGIN
+  FOR rec IN SELECT id, primary_email FROM auth_users
+              WHERE username IS NULL OR username = '' LOOP
+    candidate := lower(regexp_replace(
+      split_part(COALESCE(rec.primary_email, ''), '@', 1),
+      '[^a-z0-9_.-]', '', 'gi'));
+    IF candidate = '' THEN
+      candidate := 'user_' || substr(rec.id::text, 1, 8);
+    END IF;
+    attempt := 0;
+    WHILE EXISTS (SELECT 1 FROM auth_users
+                  WHERE LOWER(username) = LOWER(
+                    candidate || CASE WHEN attempt = 0 THEN ''
+                                      ELSE '_' || attempt::text END))
+    LOOP
+      attempt := attempt + 1;
+    END LOOP;
+    UPDATE auth_users
+       SET username = candidate || CASE WHEN attempt = 0 THEN ''
+                                        ELSE '_' || attempt::text END
+     WHERE id = rec.id;
+  END LOOP;
+END $$;
+ALTER TABLE auth_users ALTER COLUMN username SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_username
+  ON auth_users (LOWER(username));
+
+-- 2. primary_email NOT NULL (already has unique-on-LOWER index).
+UPDATE auth_users SET primary_email = LOWER(primary_email)
+  WHERE primary_email IS NOT NULL;
+-- For rows with NULL email (shouldn't happen in prod but defensive):
+UPDATE auth_users SET primary_email = username || '@unknown.local'
+  WHERE primary_email IS NULL OR primary_email = '';
+ALTER TABLE auth_users ALTER COLUMN primary_email SET NOT NULL;
+
+-- 3. vless_uuid (UUID, NOT NULL, UNIQUE).
+ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS vless_uuid UUID;
+-- For users that already have rows in (now-defunct) xout_node_users with
+-- a stable VLESS UUID, preserve that value so existing clients keep
+-- working without re-issuing subscription URLs. We only do this lookup
+-- when the legacy table still exists (idempotent re-runs).
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.tables
+     WHERE table_schema = current_schema()
+       AND table_name = 'xout_node_users'
+  ) THEN
+    EXECUTE $migrate$
+      UPDATE auth_users u
+         SET vless_uuid = sub.vless_uuid
+        FROM (
+          SELECT DISTINCT ON (user_id) user_id, vless_uuid
+            FROM xout_node_users
+           ORDER BY user_id, provisioned_at ASC
+        ) sub
+       WHERE sub.user_id = u.id
+         AND u.vless_uuid IS NULL
+    $migrate$;
+  END IF;
+END $$;
+-- Generate fresh UUIDs for any remaining users.
+UPDATE auth_users SET vless_uuid = gen_random_uuid()
+  WHERE vless_uuid IS NULL;
+ALTER TABLE auth_users ALTER COLUMN vless_uuid SET NOT NULL;
+ALTER TABLE auth_users
+  ALTER COLUMN vless_uuid SET DEFAULT gen_random_uuid();
+CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_vless_uuid
+  ON auth_users (vless_uuid);
+
+-- 4. subscription_token (TEXT, NOT NULL, UNIQUE).
+ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS subscription_token TEXT;
+UPDATE auth_users SET subscription_token = _gen_url_safe_token()
+  WHERE subscription_token IS NULL OR subscription_token = '';
+ALTER TABLE auth_users ALTER COLUMN subscription_token SET NOT NULL;
+ALTER TABLE auth_users
+  ALTER COLUMN subscription_token SET DEFAULT _gen_url_safe_token();
+CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_subscription_token
+  ON auth_users (subscription_token);
+
+-- 5. Every active user must have a password row (the user-system goal
+-- says "username, email, password" are all required). For migrated rows
+-- without one, write a random argon2-shaped placeholder hash that no
+-- real password can ever match. Operator can later set a real password
+-- via the admin UI.
+INSERT INTO auth_passwords (user_id, argon2_hash)
+  SELECT u.id,
+    '$argon2id$v=19$m=65536,t=3,p=4$' ||
+    encode(extensions.gen_random_bytes(16), 'base64') || '$' ||
+    encode(extensions.gen_random_bytes(32), 'base64')
+    FROM auth_users u
+   WHERE NOT EXISTS (
+     SELECT 1 FROM auth_passwords p WHERE p.user_id = u.id
+   );
+
+-- 6. Drop subscriptions.subscription_token. The /sub URL is per-user
+-- now; one user, one URL, all active xout subs aggregated server-side.
+ALTER TABLE subscriptions DROP COLUMN IF EXISTS subscription_token;
+
+-- 7. Drop legacy tables. Order matters: drop child FKs first.
+DROP TABLE IF EXISTS xout_traffic_daily;
+DROP TABLE IF EXISTS xout_node_tokens;
+DROP TABLE IF EXISTS xout_tokens;
+DROP TABLE IF EXISTS xout_node_users;
 
 -- Sequence re-sync ------------------------------------------------------
 -- After cross-database sync (online→one or primary→one), BIGSERIAL columns

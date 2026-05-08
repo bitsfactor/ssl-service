@@ -458,19 +458,6 @@ def _redact_dsn(dsn: str | None) -> str:
     return "***"
 
 
-def _cycle_start_for(today, reset_day: int):
-  """Return the date the most recent billing cycle started, given a
-  reset day-of-month (1..28). If today is before reset_day, the cycle
-  began on reset_day of the previous month; otherwise this month."""
-  from datetime import date as _date
-  rd = max(1, min(28, int(reset_day or 1)))
-  if today.day >= rd:
-    return today.replace(day=rd)
-  # previous month's reset day
-  prev_month = today.month - 1 or 12
-  prev_year = today.year if today.month > 1 else today.year - 1
-  return _date(prev_year, prev_month, rd)
-
 
 class Database:
   def __init__(
@@ -493,15 +480,29 @@ class Database:
     self._home_dsn = dsn
     self._pool = None
     if use_pool and ConnectionPool is not None:
+      # Recycle connections aggressively so a Supabase-side TLS
+      # session that's gone stale (the SSL handshake stays valid
+      # but the session keys rotate periodically) can't keep
+      # poisoning the pool. Without this the operator sees "SSL
+      # error: decryption failed or bad record mac" on the first
+      # long-running write after ~30 min idle, and every subsequent
+      # reuse of that conn fails until admin is restarted.
+      _pool_kwargs: dict = {
+        "min_size": pool_min_size,
+        "max_size": pool_max_size,
+        "timeout": pool_timeout,
+        "open": True,
+        "kwargs": {"row_factory": dict_row},
+        "max_lifetime": 600.0,
+        "max_idle": 120.0,
+      }
+      # ``check`` is psycopg-pool 3.2+. Probe before passing to
+      # support older versions that don't know the kwarg.
+      _check_fn = getattr(ConnectionPool, "check_connection", None)
+      if callable(_check_fn):
+        _pool_kwargs["check"] = _check_fn
       try:
-        self._pool = ConnectionPool(
-          dsn,
-          min_size=pool_min_size,
-          max_size=pool_max_size,
-          timeout=pool_timeout,
-          open=True,
-          kwargs={"row_factory": dict_row},
-        )
+        self._pool = ConnectionPool(dsn, **_pool_kwargs)
         # Block until at least one connection is ready so the first
         # request after startup doesn't pay the full TLS/handshake tax.
         self._pool.wait(timeout=pool_timeout)
@@ -599,12 +600,41 @@ class Database:
 
   @contextmanager
   def connect(self) -> Iterator[psycopg.Connection]:
-    if self._pool is not None:
-      with self._pool.connection() as connection:
-        yield connection
-    else:
+    """Open a connection from the pool (or create a one-shot if no
+    pool is configured). Auto-retries once on OperationalError caused
+    by a Supabase TLS-session rotation -- the pool has aggressive
+    max_idle but stale connections still leak past `check` when
+    Supabase rekeys mid-handoff."""
+    if self._pool is None:
       with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
         yield connection
+      return
+    last_exc: Exception | None = None
+    for attempt in range(2):
+      try:
+        with self._pool.connection() as connection:
+          yield connection
+          return
+      except psycopg.OperationalError as exc:
+        # Match the SSL-rotation symptoms only; non-SSL OperationalErrors
+        # (timeouts, auth, etc.) shouldn't hit the retry path.
+        msg = str(exc)
+        if "SSL error" not in msg and "bad record mac" not in msg \
+           and "consuming input failed" not in msg:
+          raise
+        last_exc = exc
+        LOGGER.warning(
+          "psycopg pool: stale connection (%s); discarding pool and retrying",
+          msg.strip()[:120],
+        )
+        # Force-recycle every idle connection in the pool so the
+        # retry doesn't get the same poisoned conn handed back.
+        try:
+          self._pool.check()
+        except Exception:  # noqa: BLE001
+          LOGGER.exception("pool.check() raised during recovery")
+    if last_exc is not None:
+      raise last_exc
 
   @property
   def home_dsn(self) -> str:
@@ -3266,151 +3296,6 @@ class Database:
       "last_synced_at": row.get("last_synced_at"),
     }
 
-  # ---------- xout tokens (= users) ----------
-
-  @staticmethod
-  def _generate_token_value() -> str:
-    """24 alphanumeric chars (~144 bits of entropy). Used as the public
-    URL slug for token-scoped endpoints. Long enough to make brute-force
-    enumeration impractical; short enough to fit comfortably in a URL."""
-    import secrets
-    import string
-    alphabet = string.ascii_letters + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(24))
-
-  @staticmethod
-  def _row_to_xout_token(row: dict) -> dict:
-    return {
-      "id": int(row["id"]),
-      "name": row["name"],
-      "uuid": row["uuid"],
-      "token_value": row["token_value"],
-      "password": row.get("password"),
-      "monthly_quota_gb": int(row.get("monthly_quota_gb") or 1000),
-      "monthly_reset_day": int(row.get("monthly_reset_day") or 1),
-      "notes": row.get("notes"),
-      "created_at": row.get("created_at"),
-      "updated_at": row.get("updated_at"),
-    }
-
-  _XOUT_TOKEN_COLS = (
-    "id, name, uuid, token_value, password, monthly_quota_gb, "
-    "monthly_reset_day, notes, created_at, updated_at"
-  )
-
-  def list_xout_tokens(self) -> list[dict]:
-    with self.connect() as connection:
-      with connection.cursor() as cursor:
-        cursor.execute(
-          f"SELECT {self._XOUT_TOKEN_COLS} FROM xout_tokens ORDER BY name ASC"
-        )
-        return [self._row_to_xout_token(r) for r in cursor.fetchall()]
-
-  def get_xout_token(self, token_id: int) -> dict | None:
-    with self.connect() as connection:
-      with connection.cursor() as cursor:
-        cursor.execute(
-          f"SELECT {self._XOUT_TOKEN_COLS} FROM xout_tokens WHERE id = %s",
-          (int(token_id),),
-        )
-        row = cursor.fetchone()
-        return None if row is None else self._row_to_xout_token(row)
-
-  def insert_xout_token(
-    self, *, name: str, uuid: str, password: str | None = None,
-    monthly_quota_gb: int = 1000, monthly_reset_day: int = 1,
-    notes: str | None = None,
-  ) -> dict:
-    """token_value is auto-generated; the operator never picks it. Retry
-    on the (vanishingly unlikely) collision against the UNIQUE index."""
-    last_exc: Exception | None = None
-    for _attempt in range(5):
-      candidate = self._generate_token_value()
-      try:
-        with self.connect() as connection:
-          with connection.cursor() as cursor:
-            cursor.execute(
-              f"""
-              INSERT INTO xout_tokens (name, uuid, token_value, password,
-                monthly_quota_gb, monthly_reset_day, notes, created_at, updated_at)
-              VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-              RETURNING {self._XOUT_TOKEN_COLS}
-              """,
-              (name, uuid, candidate, password, int(monthly_quota_gb),
-               int(monthly_reset_day), notes),
-            )
-            row = cursor.fetchone()
-          connection.commit()
-        return self._row_to_xout_token(row)
-      except Exception as exc:  # noqa: BLE001
-        last_exc = exc
-        # Only retry on token_value collisions; surface other errors.
-        if "idx_xout_tokens_token_value" not in str(exc):
-          raise
-    raise RuntimeError(
-      "could not generate a unique token_value after 5 attempts"
-    ) from last_exc
-
-  def update_xout_token(self, token_id: int, fields: dict) -> dict | None:
-    """token_value is intentionally NOT in the allow-list — callers must
-    use regenerate_xout_token_value() to roll it (forces them to think
-    about the URL invalidation that comes with it)."""
-    allowed = {"name", "password", "monthly_quota_gb", "monthly_reset_day", "notes"}
-    sets = []
-    params: dict = {"id": int(token_id)}
-    for k, v in fields.items():
-      if k not in allowed:
-        continue
-      sets.append(f"{k} = %({k})s")
-      params[k] = v
-    if not sets:
-      return self.get_xout_token(token_id)
-    with self.connect() as connection:
-      with connection.cursor() as cursor:
-        cursor.execute(
-          f"""UPDATE xout_tokens SET {', '.join(sets)}, updated_at = NOW()
-              WHERE id = %(id)s
-              RETURNING {self._XOUT_TOKEN_COLS}""",
-          params,
-        )
-        row = cursor.fetchone()
-      connection.commit()
-    return None if row is None else self._row_to_xout_token(row)
-
-  def delete_xout_token(self, token_id: int) -> bool:
-    with self.connect() as connection:
-      with connection.cursor() as cursor:
-        cursor.execute("DELETE FROM xout_tokens WHERE id = %s", (int(token_id),))
-        deleted = cursor.rowcount
-      connection.commit()
-    return deleted > 0
-
-  def regenerate_xout_token_value(self, token_id: int) -> dict | None:
-    """Roll the public URL slug for this token. Existing subscription
-    URLs that embed the old value stop working immediately."""
-    last_exc: Exception | None = None
-    for _attempt in range(5):
-      candidate = self._generate_token_value()
-      try:
-        with self.connect() as connection:
-          with connection.cursor() as cursor:
-            cursor.execute(
-              f"""UPDATE xout_tokens SET token_value = %s, updated_at = NOW()
-                  WHERE id = %s
-                  RETURNING {self._XOUT_TOKEN_COLS}""",
-              (candidate, int(token_id)),
-            )
-            row = cursor.fetchone()
-          connection.commit()
-        return None if row is None else self._row_to_xout_token(row)
-      except Exception as exc:  # noqa: BLE001
-        last_exc = exc
-        if "idx_xout_tokens_token_value" not in str(exc):
-          raise
-    raise RuntimeError(
-      "could not regenerate a unique token_value after 5 attempts"
-    ) from last_exc
-
   # ---- node inbound state (resolved Reality keys etc.) ----
 
   def list_xout_node_inbounds(self, node_name: str) -> list[dict]:
@@ -3446,238 +3331,55 @@ class Database:
           connection.rollback()
           return []
 
-  # ---- node-token junction ----
+  # ---- auth_users helpers (ssl-service is a reader; user-service owns writes) ----
 
-  def list_xout_node_tokens_for_node(self, node_name: str) -> list[dict]:
+  def list_auth_users_for_xout_lookup(self) -> list[dict]:
+    """Return a minimal projection of auth_users used by the xout
+    subscription / introspection paths -- maps a VLESS UUID seen on a
+    node back to the username + email so the operator can identify
+    who's connecting.
+
+    Read-only; ssl-service does not write auth_users (that's
+    user-service's job over at user.develop.cc)."""
     with self.connect() as connection:
       with connection.cursor() as cursor:
         cursor.execute(
-          """SELECT nt.node_name, nt.token_id, nt.provisioned_at, nt.last_seen_at,
-                    t.name AS token_name, t.uuid AS token_uuid
-             FROM xout_node_tokens nt JOIN xout_tokens t ON t.id = nt.token_id
-             WHERE nt.node_name = %s ORDER BY t.name""",
-          (node_name,),
+          """SELECT id, username, primary_email, vless_uuid, status
+             FROM auth_users ORDER BY username""",
         )
         return [dict(r) for r in cursor.fetchall()]
 
-  def list_xout_node_tokens_for_token(self, token_id: int) -> list[dict]:
-    with self.connect() as connection:
-      with connection.cursor() as cursor:
-        cursor.execute(
-          """SELECT node_name, token_id, provisioned_at, last_seen_at
-             FROM xout_node_tokens WHERE token_id = %s ORDER BY node_name""",
-          (int(token_id),),
-        )
-        return [dict(r) for r in cursor.fetchall()]
+  def list_active_xout_users_for_node(self, node_name: str) -> list[dict]:
+    """Return the live xout user list for one node: every user with at
+    least one active xout subscription whose product's inbound_selector
+    includes ``node_name``.
 
-  def upsert_xout_node_token(
-    self, node_name: str, token_id: int, *,
-    last_seen_at: bool = False,
-  ) -> dict:
-    """Upsert a (node, token) row. Used by the sync-traffic path to bump
-    ``last_seen_at`` when xray's StatsService reports activity for a
-    UUID. The cached subscription columns this function used to write
-    were removed alongside the sync-tokens flow — admin's subscription
-    handler now resolves Reality keys from xout_node_inbounds at
-    request time, just like user-service's /sub/<token>."""
-    seen_clause = "last_seen_at = NOW()" if last_seen_at else ""
-    set_clause = f"SET {seen_clause}" if seen_clause else ""
-    # ON CONFLICT DO UPDATE requires at least one assignment; if we
-    # don't bump last_seen_at there's no other column to touch, so fall
-    # back to DO NOTHING which is the desired no-op semantic anyway.
-    conflict_action = (
-      f"DO UPDATE {set_clause}" if seen_clause else "DO NOTHING"
-    )
-    with self.connect() as connection:
-      with connection.cursor() as cursor:
-        cursor.execute(
-          f"""
-          INSERT INTO xout_node_tokens (node_name, token_id, provisioned_at,
-            last_seen_at)
-          VALUES (%s, %s, NOW(), {('NOW()' if last_seen_at else 'NULL')})
-          ON CONFLICT (node_name, token_id) {conflict_action}
-          RETURNING node_name, token_id, provisioned_at, last_seen_at
-          """,
-          (node_name, int(token_id)),
-        )
-        row = cursor.fetchone()
-      connection.commit()
-    return dict(row) if row else {}
+    Used by the xout container's user-sync loop AND by ssl-service
+    admin's "what users are on this node right now?" introspection.
 
-  def delete_xout_node_token(self, node_name: str, token_id: int) -> bool:
-    with self.connect() as connection:
-      with connection.cursor() as cursor:
-        cursor.execute(
-          "DELETE FROM xout_node_tokens WHERE node_name = %s AND token_id = %s",
-          (node_name, int(token_id)),
-        )
-        deleted = cursor.rowcount
-      connection.commit()
-    return deleted > 0
-
-  def replace_xout_node_token_set(
-    self, node_name: str, token_ids: list[int],
-  ) -> dict:
-    """Replace the set of tokens provisioned on this node with exactly
-    ``token_ids``. Rows for tokens not in the new set are deleted (and
-    their cached subscription strings with them); rows for tokens that
-    are in the new set are inserted (or left intact if already present).
-
-    Returns ``{added: [...], removed: [...], kept: [...]}`` so the
-    caller can log/announce the diff."""
-    new_set = {int(t) for t in token_ids}
-    with self.connect() as connection:
-      with connection.cursor() as cursor:
-        cursor.execute(
-          "SELECT token_id FROM xout_node_tokens WHERE node_name = %s",
-          (node_name,),
-        )
-        existing = {int(r["token_id"]) for r in cursor.fetchall()}
-        to_remove = existing - new_set
-        to_add = new_set - existing
-        kept = existing & new_set
-        if to_remove:
-          cursor.execute(
-            "DELETE FROM xout_node_tokens WHERE node_name = %s "
-            "AND token_id = ANY(%s::bigint[])",
-            (node_name, list(to_remove)),
-          )
-        for tid in sorted(to_add):
-          cursor.execute(
-            """INSERT INTO xout_node_tokens
-                 (node_name, token_id, provisioned_at)
-               VALUES (%s, %s, NOW())
-               ON CONFLICT (node_name, token_id) DO NOTHING""",
-            (node_name, tid),
-          )
-      connection.commit()
-    return {
-      "added": sorted(to_add),
-      "removed": sorted(to_remove),
-      "kept": sorted(kept),
-    }
-
-  # ---- traffic ----
-
-  def upsert_xout_traffic_daily(
-    self, node_name: str, token_id: int, day, *,
-    uplink_bytes: int, downlink_bytes: int,
-  ) -> None:
-    """Snapshot raw cumulative byte counters into the daily row.
-
-    Xray's stats counters reset to 0 every time the container restarts.
-    If a container restarts mid-day and we sync after restart, the
-    'fresh' reading is smaller than what we already stored. Using
-    GREATEST(existing, incoming) keeps the highest reading we've seen
-    today, so a single same-day restart only loses traffic between the
-    restart moment and the next sync — not everything pre-restart.
-
-    For a perfectly accurate counter you'd track 'last raw reading' and
-    add deltas; the GREATEST trick is the high-confidence approximation
-    that doesn't need extra state. The next day's row starts fresh."""
+    Selector grammar (intentionally simple for v1):
+      {"nodes": [{"name": "us01"}, {"name": "us-he"}]}
+    A future v2 may add "node_groups" / "tags"; until then we match
+    only the explicit nodes list."""
     with self.connect() as connection:
       with connection.cursor() as cursor:
         cursor.execute(
           """
-          INSERT INTO xout_traffic_daily (node_name, token_id, day,
-            uplink_bytes, downlink_bytes, updated_at)
-          VALUES (%s, %s, %s, %s, %s, NOW())
-          ON CONFLICT (node_name, token_id, day) DO UPDATE SET
-            uplink_bytes   = GREATEST(xout_traffic_daily.uplink_bytes,   EXCLUDED.uplink_bytes),
-            downlink_bytes = GREATEST(xout_traffic_daily.downlink_bytes, EXCLUDED.downlink_bytes),
-            updated_at = NOW()
+          SELECT DISTINCT u.id, u.username, u.primary_email, u.vless_uuid
+            FROM auth_users u
+            JOIN subscriptions s ON s.user_id = u.id
+            JOIN xout_products xp ON xp.product_id = s.product_id
+           WHERE u.status = 'active'
+             AND s.status = 'active'
+             AND (s.expires_at IS NULL OR s.expires_at > NOW())
+             AND xp.inbound_selector -> 'nodes' @> jsonb_build_array(
+                   jsonb_build_object('name', %s::text))
+           ORDER BY u.username
           """,
-          (node_name, int(token_id), day, int(uplink_bytes), int(downlink_bytes)),
+          (node_name,),
         )
-      connection.commit()
+        return [dict(r) for r in cursor.fetchall()]
 
-  def sum_traffic_for_token(self, token_id: int, *, since=None) -> dict:
-    """Return totals for one token (across nodes + days). ``since`` is an
-    optional date — pass the start of the current month for 'this-month'.
-    """
-    where = "WHERE token_id = %s"
-    params: list = [int(token_id)]
-    if since is not None:
-      where += " AND day >= %s"
-      params.append(since)
-    with self.connect() as connection:
-      with connection.cursor() as cursor:
-        cursor.execute(
-          f"""SELECT COALESCE(SUM(uplink_bytes + downlink_bytes), 0) AS total,
-                     COALESCE(SUM(uplink_bytes), 0) AS up,
-                     COALESCE(SUM(downlink_bytes), 0) AS down
-              FROM xout_traffic_daily {where}""",
-          params,
-        )
-        row = cursor.fetchone()
-        return {"total": int(row["total"] or 0),
-                "up": int(row["up"] or 0),
-                "down": int(row["down"] or 0)}
-
-  def sum_traffic_for_node(self, node_name: str, *, since=None) -> dict:
-    where = "WHERE node_name = %s"
-    params: list = [node_name]
-    if since is not None:
-      where += " AND day >= %s"
-      params.append(since)
-    with self.connect() as connection:
-      with connection.cursor() as cursor:
-        cursor.execute(
-          f"""SELECT COALESCE(SUM(uplink_bytes + downlink_bytes), 0) AS total
-              FROM xout_traffic_daily {where}""",
-          params,
-        )
-        row = cursor.fetchone()
-        return {"total": int(row["total"] or 0)}
-
-  def list_token_deployment_summary(self) -> list[dict]:
-    """One row per token, with a count of nodes it's deployed to plus
-    aggregated 'current cycle' and lifetime traffic. The cycle starts
-    on each token's ``monthly_reset_day`` (e.g. day=15 means the cycle
-    started on the 15th of last month if today < 15th, otherwise the
-    15th of this month). Used as the Tokens table's row payload."""
-    from datetime import date as _date
-    today = _date.today()
-    with self.connect() as connection:
-      with connection.cursor() as cursor:
-        cursor.execute(
-          """
-          SELECT t.id, t.name, t.uuid, t.token_value, t.password,
-                 t.monthly_quota_gb, t.monthly_reset_day, t.notes,
-                 t.created_at, t.updated_at,
-                 COALESCE(nt.node_count, 0) AS node_count,
-                 COALESCE(tot.total, 0) AS total_bytes
-          FROM xout_tokens t
-          LEFT JOIN (SELECT token_id, COUNT(*) AS node_count FROM xout_node_tokens GROUP BY token_id) nt
-            ON nt.token_id = t.id
-          LEFT JOIN (SELECT token_id, SUM(uplink_bytes + downlink_bytes) AS total
-                     FROM xout_traffic_daily GROUP BY token_id) tot
-            ON tot.token_id = t.id
-          ORDER BY t.name
-          """,
-        )
-        bases = list(cursor.fetchall())
-      # Per-token current-cycle sum — separate query because the cutoff
-      # depends on each token's monthly_reset_day.
-      out: list[dict] = []
-      with connection.cursor() as cursor:
-        for r in bases:
-          d = self._row_to_xout_token(r)
-          d["node_count"] = int(r.get("node_count") or 0)
-          d["total_bytes"] = int(r.get("total_bytes") or 0)
-          reset_day = d.get("monthly_reset_day") or 1
-          cycle_start = _cycle_start_for(today, reset_day)
-          d["cycle_start"] = cycle_start.isoformat()
-          cursor.execute(
-            """SELECT COALESCE(SUM(uplink_bytes + downlink_bytes), 0) AS s
-               FROM xout_traffic_daily
-               WHERE token_id = %s AND day >= %s""",
-            (d["id"], cycle_start),
-          )
-          row = cursor.fetchone()
-          d["month_bytes"] = int((row and row["s"]) or 0)
-          out.append(d)
-      return out
 
   def try_advisory_lock(self, connection: psycopg.Connection, key: str) -> bool:
     with connection.cursor() as cursor:

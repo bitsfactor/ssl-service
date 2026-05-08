@@ -814,10 +814,15 @@ def list_nodes(ctx: AdminContext, *, with_status: bool = False) -> list[dict[str
   import time as _time
   from concurrent.futures import ThreadPoolExecutor
   t0 = _time.perf_counter()
-  with ThreadPoolExecutor(max_workers=4) as ex:
+  with ThreadPoolExecutor(max_workers=5) as ex:
     fut_records = ex.submit(ctx.database.list_nodes)
     fut_links = ex.submit(ctx.database.list_all_node_ssh_key_links)
     fut_statuses = ex.submit(ctx.database.list_node_statuses) if with_status else None
+    # Pull every (service, node) liveness row so each node row can show
+    # the full list of services it has running, not just ssl-service.
+    # One query for the whole table — a few hundred rows on a typical
+    # fleet — beats N per-node queries.
+    fut_svc_states = ex.submit(ctx.database.list_service_node_states)
     # Pre-collect names so we can fetch latest_init_runs for the whole set.
     records = fut_records.result()
     fut_inits = ex.submit(
@@ -826,6 +831,22 @@ def list_nodes(ctx: AdminContext, *, with_status: bool = False) -> list[dict[str
     links_by_node = fut_links.result()
     statuses = fut_statuses.result() if fut_statuses is not None else {}
     init_runs = fut_inits.result() if fut_inits is not None else {}
+    svc_states_all = fut_svc_states.result() or []
+  # Group service states by node so the per-row loop is O(1) lookup.
+  svc_by_node: dict[str, list[dict]] = {}
+  for st in svc_states_all:
+    svc_by_node.setdefault(st.node_name, []).append({
+      "service_name": st.service_name,
+      "container_state": st.container_state,
+      "container_image": st.container_image,
+      "healthcheck_ok": st.healthcheck_ok,
+      "deploy_status": st.status,
+      "revision": st.revision,
+      "last_observed_at": _to_jsonable(st.last_observed_at),
+    })
+  # Stable display order: by service_name within each node.
+  for lst in svc_by_node.values():
+    lst.sort(key=lambda s: s["service_name"])
   t1 = _time.perf_counter()
   LOGGER.info(
     "list_nodes parallel queries: total=%.0fms n=%d with_status=%s",
@@ -838,6 +859,10 @@ def list_nodes(ctx: AdminContext, *, with_status: bool = False) -> list[dict[str
       item["status"] = _node_status_to_dict(statuses.get(node.name))
     item["linked_keys"] = _serialize_linked_keys(links_by_node.get(node.name, []))
     item["ssh_key_ids"] = [k["id"] for k in item["linked_keys"]]
+    # All services this node has ever had a state row for. Empty list
+    # = nothing deployed yet (or never reconciled). The Nodes table
+    # renders one badge per entry.
+    item["services"] = svc_by_node.get(node.name, [])
     # Latest init run summary so the Nodes table can render an
     # "initialized?" badge without a per-row request.
     run = init_runs.get(node.name)
@@ -870,6 +895,25 @@ def get_node_detail(ctx: AdminContext, name: str) -> dict[str, Any]:
   )
   item["linked_keys"] = _linked_keys_for_node(ctx, node.name)
   item["ssh_key_ids"] = [k["id"] for k in item["linked_keys"]]
+  # Same shape as list_nodes — keep /api/nodes/{name} consistent so the
+  # Nodes-table single-row refresh after probe shows the per-service
+  # badges, not "—".
+  svc_states = ctx.database.list_service_node_states_for_node(node.name)
+  item["services"] = sorted(
+    [
+      {
+        "service_name": st.service_name,
+        "container_state": st.container_state,
+        "container_image": st.container_image,
+        "healthcheck_ok": st.healthcheck_ok,
+        "deploy_status": st.status,
+        "revision": st.revision,
+        "last_observed_at": _to_jsonable(st.last_observed_at),
+      }
+      for st in svc_states
+    ],
+    key=lambda s: s["service_name"],
+  )
   return item
 
 
@@ -1928,8 +1972,17 @@ def fetch_service_manifest(
   if s is None:
     raise HttpError(HTTPStatus.NOT_FOUND, f"service not found: {name}", code="service_not_found")
   try:
+    # Pass the GitHub PAT from system_config so PRIVATE repos can be
+    # probed — without it, raw.githubusercontent.com returns 404
+    # indistinguishable from "no .deploy.yaml at root", and we'd
+    # spuriously claim the manifest is missing.
+    gh_token = (
+      (ctx.database.get_system_config_home("github.api_token") or {}).get("token")
+      or None
+    )
     text, branch_used = services_deploy_mod.fetch_deploy_yaml_from_github(
       s.github_repo_url, s.default_branch or "main",
+      token=gh_token,
     )
   except ValueError as exc:
     raise HttpError(HTTPStatus.BAD_REQUEST, str(exc), code="manifest_fetch_failed") from exc
@@ -2024,7 +2077,14 @@ def deploy_service_to_nodes(
     raise HttpError(HTTPStatus.BAD_REQUEST, "env must be an object", code="invalid_env")
   per_deploy_env_clean = {str(k): str(v) for k, v in per_deploy_env.items() if k}
 
-  # System config secrets resolver — `system_config:KEY.PATH`.
+  # System config secrets resolver — `system_config:KEY.PATH` and
+  # `database:<id>` / `database:active`. _current_dsn lives inside
+  # make_admin_router (the route registration scope), so we recompute
+  # it here from the same source-of-truth (ctx.database.dsn or the
+  # boot-time config DSN) rather than reach across scopes.
+  def _live_dsn() -> str:
+    return getattr(ctx.database, "dsn", None) or ctx.config.postgres.dsn
+
   def _resolver(src: str) -> str | None:
     # database:<id>     -> full DSN of that registry entry
     # database:active   -> currently active DSN
@@ -2033,20 +2093,45 @@ def deploy_service_to_nodes(
       if not ident:
         return None
       if ident == "active":
-        return _current_dsn() or None
-      view = db_registry_mod.list_databases(ctx.database, _current_dsn() or "")
+        return _live_dsn() or None
+      view = db_registry_mod.list_databases(ctx.database, _live_dsn() or "")
       for e in view.get("entries") or []:
         if e.get("id") == ident:
           return e.get("dsn") or None
       return None
     if src.startswith("system_config:"):
-      rest = src[len("system_config:"):]
-      parts = rest.split(".", 1)
-      key = parts[0].strip()
-      cfg = ctx.database.get_system_config(key) or {}
-      if len(parts) == 1:
+      # The path is a dot-separated walk that may match either a
+      # literal system_config key (some keys themselves contain dots,
+      # e.g. ``user_service.admin_token``) or a key + nested-dict
+      # path (e.g. ``user_service.admin_token.token``). Try the
+      # longest prefix first, fall back to progressively shorter
+      # prefixes; walk the remainder through the JSONB value.
+      path = src[len("system_config:"):].strip()
+      if not path:
         return None
-      return str(cfg.get(parts[1].strip()) or "") or None
+      parts = path.split(".")
+      for i in range(len(parts), 0, -1):
+        key = ".".join(parts[:i])
+        cfg = ctx.database.get_system_config(key)
+        if cfg is None:
+          continue
+        val = cfg
+        ok = True
+        for seg in parts[i:]:
+          if not isinstance(val, dict):
+            ok = False
+            break
+          val = val.get(seg)
+          if val is None:
+            ok = False
+            break
+        if not ok or val is None:
+          continue
+        # Reject structured leaves -- callers expect a scalar env value.
+        if isinstance(val, (dict, list)):
+          continue
+        return str(val)
+      return None
     return None
 
   env, missing_env = services_deploy_mod.build_effective_env(
@@ -2169,6 +2254,24 @@ def deploy_service_to_nodes(
       revision=r.deployed_sha or revision,
       status=final_status, last_deployment_id=dep.id,
     )
+    # Probe the node right after a successful deploy so the freshly-
+    # started container shows up as "running" in the UI immediately.
+    # Without this, container_state stays NULL until somebody clicks
+    # Probe, and the badge falls back to "unknown" — confusing right
+    # after a deploy that just succeeded. We swallow probe failures:
+    # the deploy itself succeeded, the worst case is the operator
+    # sees "unknown" until the next manual probe.
+    if r.ok:
+      try:
+        st = nodes_mod.probe_node(
+          n, linked_keys=_ssh_credentials_for_node(ctx, n.name))
+        ctx.database.upsert_node_status(st)
+        reconcile_node_services(ctx, n.name, st)
+      except Exception:  # noqa: BLE001
+        LOGGER.exception(
+          "post-deploy probe failed for node=%s service=%s "
+          "(deploy itself succeeded; container_state will stay stale "
+          "until next manual probe)", n.name, s.name)
     return {
       "node": n.name,
       "host": f"{n.ssh_user}@{n.host}:{n.ssh_port}",
@@ -3631,6 +3734,37 @@ SETTINGS_REGISTRY: list[dict[str, Any]] = [
       {"name": "starttls",   "label": "Use STARTTLS","type": "bool"},
     ],
   },
+
+  # ===== Chat (chat.develop.cc) =======================================
+  {
+    "group": "Chat",
+    "key": "chat.openai",
+    "title": "Chat: OpenAI provider",
+    "hint": "OpenAI-compatible endpoint backing chat.develop.cc. "
+            "Injected into the chat container as OPENAI_API_KEY + "
+            "OPENAI_PROXY_URL by the deploy resolver.",
+    "fields": [
+      {"name": "api_key",   "label": "API key",  "type": "password", "secret": True},
+      {"name": "proxy_url", "label": "Base URL", "type": "url",
+       "placeholder": "https://api.develop.cc/v1"},
+    ],
+    "status_msg": {"configured": "configured", "missing": "not configured"},
+  },
+  {
+    "group": "Chat",
+    "key": "chat.encryption",
+    "title": "Chat: encryption keys",
+    "hint": "AUTH_SECRET (Better-Auth session signing) and KEY_VAULTS_SECRET "
+            "(per-user API key encryption). Generate once with "
+            "`openssl rand -base64 32`. Rotating KEY_VAULTS_SECRET requires "
+            "re-encrypting any user-stored API keys in the chat DB, so "
+            "treat it as immutable post-launch.",
+    "fields": [
+      {"name": "auth_secret",       "label": "AUTH_SECRET",       "type": "password", "secret": True},
+      {"name": "key_vaults_secret", "label": "KEY_VAULTS_SECRET", "type": "password", "secret": True},
+    ],
+    "status_msg": {"configured": "configured", "missing": "not configured"},
+  },
 ]
 
 
@@ -4743,8 +4877,29 @@ def _build_router(ctx: AdminContext) -> _Router:
                           fetch_service_manifest(ctx, request.path_params["name"], save=save))
 
   def service_node_config_get_handler(request: _Request) -> _Response:
-    """Return the current per-(service, node) config plus the
-    service's config_schema so the UI can render the form."""
+    """Return the current per-(service, node) config plus everything
+    the UI needs to render BOTH a schema-driven editor (legacy) AND
+    a free-form effective-env viewer (new):
+
+    - ``config_schema``: declared schema entries (may be empty).
+    - ``values``: per-node overrides saved in service_node_config.
+    - ``manifest_defaults``: ``defaults:`` block from the parsed
+      .deploy.yaml (the actual env baseline at deploy time).
+    - ``service_defaults``: ``service.default_env`` (admin-side
+      override of manifest defaults that applies to every node).
+    - ``schema_defaults``: ``default`` field from each config_schema
+      entry (lowest priority).
+    - ``secrets``: list of {env, from} from manifest's ``secrets:``
+      block — describes WHERE each secret value comes from without
+      ever revealing the value itself.
+    - ``effective``: final merged env that the deploy script would
+      write to the node's .env file (priority high-to-low: per-node
+      override > manifest secrets > service default > manifest
+      defaults > schema defaults). Secret values are MASKED.
+    - ``sources``: per-key tag explaining which layer "won". One of
+      ``override`` / ``secret`` / ``service_default`` /
+      ``manifest_default`` / ``schema_default``.
+    """
     service_name = _normalize_service_name(request.path_params["name"])
     node_name = _normalize_node_name(request.path_params["node_name"])
     s = ctx.database.get_service(service_name)
@@ -4755,23 +4910,108 @@ def _build_router(ctx: AdminContext) -> _Router:
     if n is None:
       raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {node_name}",
                       code="node_not_found")
-    values = ctx.database.get_service_node_config(service_name, node_name)
-    # Build effective values: schema defaults overlaid by service.default_env
-    # overlaid by saved per-node values. The form shows whichever is "live".
-    effective: dict[str, str] = {}
+    values = ctx.database.get_service_node_config(service_name, node_name) or {}
+
+    # Parse manifest if present so we can surface its defaults: and
+    # secrets:. If parsing fails (deploy_yaml empty or malformed)
+    # we degrade gracefully — the older schema-only fields still work.
+    manifest_defaults: dict[str, str] = {}
+    manifest_secrets: list[dict[str, str]] = []
+    if s.deploy_yaml:
+      try:
+        manifest = services_deploy_mod.parse_deploy_yaml(s.deploy_yaml)
+        manifest_defaults = dict(manifest.defaults or {})
+        manifest_secrets = [
+          {"env": str(item.get("env") or ""), "from": str(item.get("from") or "")}
+          for item in (manifest.secrets or [])
+          if isinstance(item, dict) and item.get("env")
+        ]
+      except Exception:  # noqa: BLE001
+        LOGGER.exception(
+          "service_node_config_get: failed to parse deploy_yaml for %s",
+          service_name,
+        )
+
+    schema_defaults: dict[str, str] = {}
     for entry in (s.config_schema or []):
-      if "default" in entry:
-        effective[entry["key"]] = str(entry["default"])
-    for k, v in (s.default_env or {}).items():
-      effective[k] = str(v)
-    for k, v in (values or {}).items():
-      effective[k] = "" if v is None else str(v)
+      if isinstance(entry, dict) and "default" in entry and entry.get("key"):
+        schema_defaults[str(entry["key"])] = str(entry["default"])
+
+    service_defaults: dict[str, str] = {
+      str(k): "" if v is None else str(v)
+      for k, v in (s.default_env or {}).items()
+    }
+
+    overrides: dict[str, str] = {
+      str(k): "" if v is None else str(v) for k, v in values.items()
+    }
+
+    # Mask secret values: any key listed in manifest.secrets, plus
+    # heuristic match on common sensitive name fragments. Mask is the
+    # same shape the SPA uses elsewhere ("********"), not the original
+    # length — leaking length is a (small) information disclosure.
+    secret_envs = {str(item.get("env") or "") for item in manifest_secrets}
+    sensitive_re = re.compile(
+      r"(SECRET|TOKEN|PASSWORD|API_KEY|PRIVATE_KEY|DSN|DATABASE_URL)\b",
+      re.IGNORECASE,
+    )
+    def _looks_secret(key: str) -> bool:
+      return key in secret_envs or bool(sensitive_re.search(key))
+
+    # Compose final effective + per-key source attribution. Priority:
+    # per-node override > manifest secret > service_default >
+    # manifest_default > schema_default.
+    effective: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    for k, v in schema_defaults.items():
+      effective[k] = v
+      sources[k] = "schema_default"
+    for k, v in manifest_defaults.items():
+      effective[k] = v
+      sources[k] = "manifest_default"
+    for k, v in service_defaults.items():
+      effective[k] = v
+      sources[k] = "service_default"
+    # Secrets next: we don't have the resolved value here (resolution
+    # happens at deploy time and may reach the registry / system_config),
+    # but we want every secret env to APPEAR in effective so operators
+    # see the full env picture. Value is the masked sentinel.
+    for s_item in manifest_secrets:
+      key = s_item["env"]
+      if not key:
+        continue
+      effective[key] = "********"
+      sources[key] = "secret"
+    # Per-node overrides win, but mark secrets-overriden specially
+    # so the UI can tell the operator their override is shadowing
+    # the resolved secret.
+    for k, v in overrides.items():
+      if sources.get(k) == "secret":
+        sources[k] = "override (shadows secret)"
+      else:
+        sources[k] = "override"
+      effective[k] = v
+
+    # Final mask pass — if a key looks sensitive but the value is NOT
+    # the secret sentinel and NOT empty, mask it. Operators with the
+    # admin token can still pull plain values via DB if needed; the UI
+    # prefers safety over convenience.
+    for k in list(effective.keys()):
+      val = effective[k]
+      if val and val != "********" and _looks_secret(k):
+        effective[k] = "********"
+
     return _json_response(HTTPStatus.OK, {
       "service": service_name,
       "node": node_name,
       "config_schema": list(s.config_schema or []),
       "values": values,
+      "manifest_defaults": manifest_defaults,
+      "service_defaults": service_defaults,
+      "schema_defaults": schema_defaults,
+      "secrets": manifest_secrets,
       "effective": effective,
+      "sources": sources,
     })
 
   def service_node_config_put_handler(request: _Request) -> _Response:
@@ -5283,24 +5523,12 @@ def _build_router(ctx: AdminContext) -> _Router:
 
   def _xout_resolve_preset(preset: dict, *, node_name: str | None = None) -> list[dict]:
     """Walk preset['inbounds'] and replace each referential outbound
-    with its concrete form. For VLESS inbounds, also bake in the user
-    list from xout_node_tokens for this node. The preset's own 'users'
-    field is ignored when a node-specific assignment exists — the
-    platform is the source of truth, not the preset row.
-
-    No automatic fallback if a node has zero tokens provisioned: a
-    VLESS inbound without users gets the 'auto' placeholder so xray
-    can still boot (entrypoint resolves it). The deploy flow rejects
-    empty token selection up-front, so this branch is reserved for
-    sync/introspection paths where it's expected to occasionally hit
-    zero tokens (e.g. node deleted right before sync)."""
-    tokens_for_node: list[dict] = []
-    if node_name:
-      try:
-        tokens_for_node = ctx.database.list_xout_node_tokens_for_node(node_name)
-      except Exception:
-        tokens_for_node = []
-
+    with its concrete form. The user list for VLESS inbounds is no
+    longer baked here -- the xout container reads active users
+    directly from auth_users + subscriptions + xout_products on every
+    tick (post user-system-unification, 2026-05-06). Each VLESS
+    inbound is shipped with a placeholder ``users[]`` that the xout
+    container overwrites at runtime."""
     out: list[dict] = []
     for ib in (preset.get("inbounds") or []):
       ib2 = dict(ib)
@@ -5316,21 +5544,11 @@ def _build_router(ctx: AdminContext) -> _Router:
             ib2[_slot] = ib2[_slot].replace("{node_name}", node_name)
       ib2["outbound"] = _xout_resolve_outbound(ib.get("outbound") or {"type": "direct"})
       if ib2.get("protocol") == "vless":
-        if tokens_for_node:
-          # Replace whatever the preset's users field said with the
-          # platform-tracked token list. Stable UUIDs = client subs
-          # survive across redeploys.
-          ib2["users"] = [
-            {"name": t.get("token_name") or "user",
-             "uuid": t.get("token_uuid") or t.get("uuid")}
-            for t in tokens_for_node
-          ]
-        elif not (ib2.get("users") or []):
-          # Empty users[] makes xray reject the inbound at startup.
-          # Synthesize a placeholder so the container at least starts
-          # — the entrypoint resolves the "auto" UUID into a stable one
-          # via /data/auto-secrets.json on first run. Operator can then
-          # publish a real token and redeploy.
+        # Empty users[] makes xray reject the inbound at startup,
+        # so synthesize a placeholder. The container's user-sync
+        # loop replaces this with the live auth_users list within a
+        # tick after boot.
+        if not (ib2.get("users") or []):
           ib2["users"] = [{"name": "default", "uuid": "auto"}]
       out.append(ib2)
     return out
@@ -5563,416 +5781,6 @@ def _build_router(ctx: AdminContext) -> _Router:
       })
     return _json_response(HTTPStatus.OK, {"targets": out})
 
-  # ---------- xout tokens (= users) ----------
-
-  def _gen_uuid_str() -> str:
-    import uuid as _uuid
-    return str(_uuid.uuid4())
-
-  def _build_subscriptions_for_token(token: dict, node_assignments: dict[str, dict]) -> dict:
-    """Build the aggregated subscription content for one token across
-    every node that has this token assigned. Returns
-    {raw: [uri,...], plain: 'uri\nuri\n...', base64: '...', clash: 'yaml-string'}.
-
-    The subscription includes ONE entry per inbound:
-      - VLESS inbounds become ``vless://<token-uuid>@host:port#tag``
-        (Reality params from the inbound's reality{} block)
-      - SOCKS / HTTP inbounds become ``socks5://[user:pass@]host:port#tag``
-        / ``http://[user:pass@]host:port#tag`` (auth from the inbound's
-        auth{} block; absent for anonymous inbounds)
-
-    The tag (e.g. ``us01-香港``) becomes the client-side proxy label so
-    operators who build presets where each inbound represents a
-    different exit country (one VLESS direct + N SOCKS chained to N
-    different upstreams) get one subscription point per exit-country.
-    """
-    import base64 as _b64
-    from urllib.parse import quote as _q
-
-    # Quote a YAML scalar that may contain double-quotes or newlines.
-    # Always uses double-quoted form so any special char is safe;
-    # only ``"`` and ``\`` need escaping.
-    def _yq(s: str) -> str:
-      s = "" if s is None else str(s)
-      return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-    uris: list[str] = []
-    # Minimal Clash config — proxy nodes only, no rules. Clients merge
-    # this into their main rule set. Each entry is a YAML object.
-    clash_lines: list[str] = ["proxies:"]
-    for node_name, info in node_assignments.items():
-      preset = info.get("preset")
-      node = info.get("node")
-      if not preset or not node:
-        continue
-      host = node.host
-      for ib in (preset.get("inbounds") or []):
-        proto = (ib.get("protocol") or "").lower()
-        port = ib.get("port")
-        tag = ib.get("tag", "") or proto or "node"
-        if proto == "vless":
-          reality = ib.get("reality") or {}
-          sni = reality.get("sni", "")
-          pub = reality.get("public_key", "") or reality.get("pubkey", "")
-          sid = reality.get("short_id", "")
-          # Treat "auto" the same as missing — that's the placeholder
-          # operators put in the preset; the real key is generated by
-          # the xout container on first boot and upserted into
-          # xout_node_inbounds. Either way, can't build a URI without
-          # the actual public key, so we drop the inbound and let the
-          # caller surface "node hasn't reported yet" in the response.
-          if not pub or pub.lower() == "auto":
-            continue
-          # Display name = inbound tag verbatim (operator-chosen, e.g.
-          # "美国" / "香港"). No node-name prefix or token-name suffix —
-          # the tag is intentionally the user-facing label.
-          frag = _q(tag, safe="")
-          uri = (
-            f"vless://{token['uuid']}@{host}:{port}"
-            f"?encryption=none&security=reality&type=tcp&flow="
-            f"&sni={_q(sni, safe='')}"
-            f"&pbk={_q(pub, safe='')}&sid={_q(sid, safe='')}&fp=chrome#{frag}"
-          )
-          uris.append(uri)
-          clash_lines.extend([
-            f"  - name: {_yq(tag)}",
-            f"    type: vless",
-            f"    server: {_yq(host)}",
-            f"    port: {port}",
-            f"    uuid: {_yq(token['uuid'])}",
-            f"    network: tcp",
-            f"    tls: true",
-            f"    udp: true",
-            f"    flow: \"\"",
-            f"    servername: {_yq(sni)}",
-            f"    reality-opts:",
-            f"      public-key: {_yq(pub)}",
-            f"      short-id: {_yq(sid)}",
-            f"    client-fingerprint: chrome",
-          ])
-        elif proto in ("socks", "socks5", "http", "https"):
-          # Each socks/http inbound is a real client-facing endpoint.
-          # Auth (if any) is configured on the inbound itself — same
-          # for every token, since SOCKS/HTTP don't have per-user
-          # identity at the wire level.
-          auth = ib.get("auth") or {}
-          u = (auth.get("user") or "").strip()
-          p = (auth.get("pass") or "")
-          scheme = "socks5" if proto in ("socks", "socks5") else "http"
-          cred = (f"{_q(u, safe='')}:{_q(p, safe='')}@" if u else "")
-          frag = _q(tag, safe="")
-          uri = f"{scheme}://{cred}{host}:{port}#{frag}"
-          uris.append(uri)
-          clash_type = "socks5" if scheme == "socks5" else "http"
-          clash_lines.extend([
-            f"  - name: {_yq(tag)}",
-            f"    type: {clash_type}",
-            f"    server: {_yq(host)}",
-            f"    port: {port}",
-          ])
-          if u:
-            clash_lines.extend([
-              f"    username: {_yq(u)}",
-              f"    password: {_yq(p)}",
-            ])
-          if clash_type == "socks5":
-            clash_lines.append(f"    udp: true")
-
-    plain = "\n".join(uris) + "\n" if uris else ""
-    b64 = _b64.b64encode(plain.encode("utf-8")).decode("ascii") if plain else ""
-    clash = "\n".join(clash_lines) + ("\n" if len(clash_lines) > 1 else "")
-
-    return {
-      "raw": uris,
-      "plain": plain,
-      "base64": b64,
-      "clash": clash,
-    }
-
-  def xout_tokens_list_handler(_request: _Request) -> _Response:
-    rows = ctx.database.list_token_deployment_summary()
-    # Don't echo cleartext passwords on the bulk list endpoint — anyone
-    # with the admin token would otherwise harvest them all in one call.
-    # Keep individual GET /tokens/{id} returning password for the editor.
-    for r in rows:
-      if r.get("password"):
-        r["password_set"] = True
-        r["password"] = None
-      else:
-        r["password_set"] = False
-    return _json_response(HTTPStatus.OK, {"tokens": rows})
-
-  def xout_tokens_create_handler(request: _Request) -> _Response:
-    _require_readwrite(ctx)
-    p = request.json_body() or {}
-    name = (p.get("name") or "").strip()
-    # Allow alphanum + . _ - @ so the operator can use email-style
-    # identifiers (alice@team.example, alice.work). The character must
-    # be ASCII so it survives shell interpolation in the deploy step.
-    # Reject leading punctuation so logs don't get hidden by ANSI tricks.
-    if not name or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,63}$", name):
-      raise HttpError(HTTPStatus.BAD_REQUEST,
-                      "name must be 1-64 chars: alphanumeric, dot, underscore, hyphen, @ — and start alphanumeric",
-                      code="invalid_name")
-    uuid = (p.get("uuid") or "").strip() or _gen_uuid_str()
-    if not re.match(
-      r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
-      uuid,
-    ):
-      raise HttpError(HTTPStatus.BAD_REQUEST, "uuid is not a valid UUID",
-                      code="invalid_uuid")
-    # xray and most VLESS clients expect lowercase UUIDs; mixed-case is
-    # legal RFC4122 but causes spurious 'unknown user' errors when the
-    # subscription URL has a different case from the server's stored
-    # value. Normalize on insert so we never have to reason about it.
-    uuid = uuid.lower()
-    password = (p.get("password") or "").strip() or None
-    try:
-      quota = int(p.get("monthly_quota_gb") or 1000)
-    except (TypeError, ValueError):
-      raise HttpError(HTTPStatus.BAD_REQUEST,
-                      "monthly_quota_gb must be an integer",
-                      code="invalid_quota") from None
-    if not (0 <= quota <= 1_000_000):
-      raise HttpError(HTTPStatus.BAD_REQUEST,
-                      "monthly_quota_gb must be between 0 and 1000000",
-                      code="invalid_quota")
-    try:
-      reset_day = int(p.get("monthly_reset_day") or 1)
-    except (TypeError, ValueError):
-      raise HttpError(HTTPStatus.BAD_REQUEST,
-                      "monthly_reset_day must be an integer",
-                      code="invalid_reset_day") from None
-    if not (1 <= reset_day <= 28):
-      raise HttpError(HTTPStatus.BAD_REQUEST,
-                      "monthly_reset_day must be between 1 and 28",
-                      code="invalid_reset_day")
-    notes = (p.get("notes") or "").strip() or None
-    try:
-      out = ctx.database.insert_xout_token(
-        name=name, uuid=uuid, password=password,
-        monthly_quota_gb=quota, monthly_reset_day=reset_day, notes=notes,
-      )
-    except Exception as exc:
-      msg = str(exc).lower()
-      if "duplicate key" in msg or "unique constraint" in msg:
-        raise HttpError(HTTPStatus.CONFLICT,
-                        "name or uuid already in use",
-                        code="name_in_use") from exc
-      raise
-    return _json_response(HTTPStatus.CREATED, out)
-
-  def xout_tokens_get_handler(request: _Request) -> _Response:
-    tid = int(request.path_params["id"])
-    rec = ctx.database.get_xout_token(tid)
-    if rec is None:
-      raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
-                      code="token_not_found")
-    rec["nodes"] = ctx.database.list_xout_node_tokens_for_token(tid)
-    return _json_response(HTTPStatus.OK, rec)
-
-  def xout_tokens_patch_handler(request: _Request) -> _Response:
-    _require_readwrite(ctx)
-    tid = int(request.path_params["id"])
-    p = request.json_body() or {}
-    fields: dict[str, Any] = {}
-    if "name" in p:
-      n = (p["name"] or "").strip()
-      if not n or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,63}$", n):
-        raise HttpError(HTTPStatus.BAD_REQUEST,
-                        "name must be 1-64 chars: alphanumeric, dot, underscore, hyphen, @ — and start alphanumeric",
-                        code="invalid_name")
-      fields["name"] = n
-    if "password" in p:
-      fields["password"] = (p["password"] or "").strip() or None
-    if "monthly_quota_gb" in p:
-      try:
-        q = int(p["monthly_quota_gb"])
-      except (TypeError, ValueError):
-        raise HttpError(HTTPStatus.BAD_REQUEST, "monthly_quota_gb must be int",
-                        code="invalid_quota") from None
-      if not (0 <= q <= 1_000_000):
-        raise HttpError(HTTPStatus.BAD_REQUEST,
-                        "monthly_quota_gb must be 0..1000000",
-                        code="invalid_quota")
-      fields["monthly_quota_gb"] = q
-    if "monthly_reset_day" in p:
-      try:
-        rd = int(p["monthly_reset_day"])
-      except (TypeError, ValueError):
-        raise HttpError(HTTPStatus.BAD_REQUEST, "monthly_reset_day must be int",
-                        code="invalid_reset_day") from None
-      if not (1 <= rd <= 28):
-        raise HttpError(HTTPStatus.BAD_REQUEST, "monthly_reset_day must be 1-28",
-                        code="invalid_reset_day")
-      fields["monthly_reset_day"] = rd
-    if "notes" in p:
-      fields["notes"] = (p["notes"] or "").strip() or None
-    rec = ctx.database.update_xout_token(tid, fields)
-    if rec is None:
-      raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
-                      code="token_not_found")
-    return _json_response(HTTPStatus.OK, rec)
-
-  def xout_tokens_delete_handler(request: _Request) -> _Response:
-    _require_readwrite(ctx)
-    tid = int(request.path_params["id"])
-    if not ctx.database.delete_xout_token(tid):
-      raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
-                      code="token_not_found")
-    return _json_response(HTTPStatus.OK, {"deleted": True})
-
-  def xout_tokens_regenerate_value_handler(request: _Request) -> _Response:
-    """Roll the token's public URL slug. Existing subscription URLs
-    that embed the old value stop working immediately."""
-    _require_readwrite(ctx)
-    tid = int(request.path_params["id"])
-    rec = ctx.database.regenerate_xout_token_value(tid)
-    if rec is None:
-      raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
-                      code="token_not_found")
-    return _json_response(HTTPStatus.OK, rec)
-
-  def _resolve_inbounds_with_node_reality(node_name: str, preset: dict) -> list[dict]:
-    """Like ``_xout_resolve_preset(node_name=...)`` but additionally
-    overlays each VLESS inbound's reality.{public_key, sni, short_id}
-    with the values the xout container has reported back via
-    ``xout_node_inbounds`` (keyed by tag). The container generates
-    Reality x25519 keys on first boot and upserts them into that
-    table, so this is the post-merge replacement for SSHing the node
-    to read ``/data/preset.json.resolved``.
-
-    Inbounds whose reality.public_key is still ``"auto"`` after the
-    overlay (= the container hasn't reported the tag yet) get dropped
-    by ``_build_subscriptions_for_token`` since you can't form a
-    working VLESS URI without a real key."""
-    resolved = _xout_resolve_preset(preset, node_name=node_name)
-    reported = ctx.database.list_xout_node_inbounds(node_name)
-    by_tag = {r.get("tag"): r for r in reported if r.get("tag")}
-    for ib in resolved:
-      if (ib.get("protocol") or "").lower() != "vless":
-        continue
-      rep = by_tag.get(ib.get("tag"))
-      if rep is None:
-        continue
-      reality = dict(ib.get("reality") or {})
-      if rep.get("sni"):        reality["sni"] = rep["sni"]
-      if rep.get("public_key"): reality["public_key"] = rep["public_key"]
-      if rep.get("short_id"):   reality["short_id"] = rep["short_id"]
-      ib["reality"] = reality
-    return resolved
-
-  def xout_tokens_subscription_handler(request: _Request) -> _Response:
-    """Aggregated subscription content for one token across every node
-    that has it provisioned.
-
-    Builds URIs at request time from the stored preset, with each
-    VLESS inbound's Reality params overlaid from ``xout_node_inbounds``
-    (the table the xout container upserts into on first boot). No
-    SSH, no caches — same source-of-truth path user-service's
-    /sub/<token> already uses.
-
-    A node whose container has not yet reported its Reality keys back
-    (e.g. fresh deploy, container still booting) shows up in
-    ``nodes_unreported`` and contributes zero VLESS URIs."""
-    tid = int(request.path_params["id"])
-    token = ctx.database.get_xout_token(tid)
-    if token is None:
-      raise HttpError(HTTPStatus.NOT_FOUND, f"token not found: {tid}",
-                      code="token_not_found")
-    rows = ctx.database.list_xout_node_tokens_for_token(tid)
-    nodes_seen: list[str] = []
-    nodes_unreported: list[str] = []
-    node_assignments: dict[str, dict] = {}
-
-    for r in rows:
-      nn = r["node_name"]
-      node = ctx.database.get_node(nn)
-      if node is None: continue
-      nodes_seen.append(nn)
-      a = ctx.database.get_xout_assignment(nn)
-      if a is None: continue
-      preset = ctx.database.get_xout_preset(a["preset_id"])
-      if preset is None: continue
-      # Build a node-specific preset whose inbounds carry the resolved
-      # Reality public_key (or "auto" if the container hasn't reported
-      # yet). _build_subscriptions_for_token drops VLESS rows with
-      # public_key=="auto", so unreported nodes simply contribute
-      # nothing rather than producing broken URIs.
-      resolved_inbounds = _resolve_inbounds_with_node_reality(nn, preset)
-      any_real_pubkey = any(
-        (ib.get("protocol") or "").lower() == "vless"
-        and (ib.get("reality") or {}).get("public_key", "auto").lower() != "auto"
-        for ib in resolved_inbounds
-      )
-      if not any_real_pubkey:
-        nodes_unreported.append(nn)
-      node_assignments[nn] = {
-        "node": node,
-        "preset": {"name": preset.get("name"), "inbounds": resolved_inbounds},
-      }
-
-    subs = _build_subscriptions_for_token(token, node_assignments) \
-      if node_assignments else {"raw": [], "plain": "", "base64": "", "clash": ""}
-
-    return _json_response(HTTPStatus.OK, {
-      "token": {"id": token["id"], "name": token["name"], "uuid": token["uuid"]},
-      "nodes": nodes_seen,
-      "nodes_unreported": nodes_unreported,
-      "raw": subs.get("raw") or [],
-      "plain": subs.get("plain") or "",
-      "base64": subs.get("base64") or "",
-      "clash": subs.get("clash") or "",
-    })
-
-  def xout_node_traffic_summary_handler(request: _Request) -> _Response:
-    """Per-node traffic rollup: this-month total + lifetime + per-token
-    breakdown. Used by the per-node 'Verify traffic' modal."""
-    name = _normalize_node_name(request.path_params["name"])
-    node = ctx.database.get_node(name)
-    if node is None:
-      raise HttpError(HTTPStatus.NOT_FOUND, f"node not found: {name}",
-                      code="node_not_found")
-    from datetime import date as _date
-    from ssl_proxy_controller.db import _cycle_start_for
-    today = _date.today()
-    summary_total = ctx.database.sum_traffic_for_node(name)
-    # Per-node 'this month' uses the calendar month-start as a sane
-    # default — the per-token breakdown below uses the token's own
-    # reset_day cycle.
-    summary_month = ctx.database.sum_traffic_for_node(name, since=today.replace(day=1))
-    # Per-token rollups for nodes assigned to this node
-    rows = ctx.database.list_xout_node_tokens_for_node(name)
-    per_token = []
-    for r in rows:
-      tok = ctx.database.get_xout_token(r["token_id"]) or {}
-      cycle_start = _cycle_start_for(today, tok.get("monthly_reset_day") or 1)
-      tot = ctx.database.sum_traffic_for_token(r["token_id"])
-      mon = ctx.database.sum_traffic_for_token(r["token_id"], since=cycle_start)
-      per_token.append({
-        "token_id": r["token_id"], "token_name": r.get("token_name"),
-        "total_bytes": tot["total"], "month_bytes": mon["total"],
-        "cycle_start": cycle_start.isoformat(),
-        "last_seen_at": _to_jsonable(r.get("last_seen_at")),
-      })
-    # Residual: 1000 GB default (ish) — we use the largest assigned token's
-    # quota since the operator likely sets policy at token level.
-    quota_bytes = 1000 * 1024**3
-    if rows:
-      max_quota_gb = max(
-        (ctx.database.get_xout_token(r["token_id"]) or {}).get("monthly_quota_gb") or 0
-        for r in rows
-      )
-      if max_quota_gb > 0:
-        quota_bytes = int(max_quota_gb) * 1024**3
-    return _json_response(HTTPStatus.OK, {
-      "node": name,
-      "total_bytes": summary_total["total"],
-      "month_bytes": summary_month["total"],
-      "month_quota_bytes": quota_bytes,
-      "month_residual_bytes": max(0, quota_bytes - summary_month["total"]),
-      "per_token": per_token,
-    })
 
   def xout_node_subscription_handler(request: _Request) -> _Response:
     """Live per-node subscription content.
@@ -6128,17 +5936,22 @@ def _build_router(ctx: AdminContext) -> _Router:
     b64 = _b64.b64encode(plain.encode("utf-8")).decode("ascii") if plain else ""
     clash = ("\n".join(clash_lines) + "\n") if len(clash_lines) > 1 else ""
 
-    # Cross-reference against DB tokens so the UI can show which user
-    # name maps to which DB token (handy for usage / quota tracking).
-    db_tokens = {t["uuid"]: t for t in ctx.database.list_xout_tokens()}
+    # Cross-reference against auth_users so the UI can show which
+    # username maps to which DB user (post user-system-unification each
+    # user has a single global vless_uuid stored on auth_users).
+    db_users = {str(u["vless_uuid"]): u
+                for u in ctx.database.list_auth_users_for_xout_lookup()}
     matched = []
     unknown_uuids = []
     for u in seen_users:
-      tok = db_tokens.get(u["uuid"])
-      if tok is not None:
-        matched.append({"id": tok["id"], "name": tok["name"], "tag": u["tag"]})
+      usr = db_users.get(u["uuid"])
+      if usr is not None:
+        matched.append({"id": str(usr["id"]), "name": usr["username"],
+                        "email": usr.get("primary_email"),
+                        "tag": u["tag"]})
       else:
-        unknown_uuids.append({"uuid": u["uuid"], "name_in_preset": u["name"], "tag": u["tag"]})
+        unknown_uuids.append({"uuid": u["uuid"], "name_in_preset": u["name"],
+                              "tag": u["tag"]})
 
     # Tally protocol counts for the UI hint. Subscription includes
     # vless / socks / http; anything else is silently skipped.
@@ -6165,109 +5978,6 @@ def _build_router(ctx: AdminContext) -> _Router:
       "source_bytes": len(raw_text),
     })
 
-  def xout_sync_traffic_handler(request: _Request) -> _Response:
-    """Pull live byte counters from each requested node's Xray stats API
-    and snapshot them into xout_traffic_daily. Stats are cumulative
-    since the last container restart, so what we store is 'best known
-    for today' — re-runs within the same day overwrite the row."""
-    _require_readwrite(ctx)
-    p = request.json_body() or {}
-    raw_nodes = p.get("nodes")
-    if isinstance(raw_nodes, list) and raw_nodes:
-      # Dedup while preserving order — duplicates would re-ssh the same
-      # box twice for nothing.
-      seen: set[str] = set()
-      target_names = []
-      for n in raw_nodes:
-        nn = _normalize_node_name(str(n))
-        if nn not in seen:
-          seen.add(nn); target_names.append(nn)
-    else:
-      assignments = ctx.database.list_xout_assignments()
-      target_names = [a["node_name"] for a in assignments]
-    if not target_names:
-      return _json_response(HTTPStatus.OK,
-        {"results": [], "message": "no xout nodes to sync"})
-
-    from datetime import date as _date
-    today = _date.today()
-    all_tokens = ctx.database.list_xout_tokens()
-    tokens_by_uuid = {t["uuid"]: t for t in all_tokens}
-    tokens_by_name = {t["name"]: t for t in all_tokens}
-
-    results: list[dict[str, Any]] = []
-    for nn in target_names:
-      node = ctx.database.get_node(nn)
-      if node is None:
-        results.append({"node": nn, "ok": False, "error": "not found"})
-        continue
-      try:
-        cmd = (
-          'docker exec xout xray api statsquery '
-          '--server 127.0.0.1:10085 --pattern "user>>>" 2>&1 || true'
-        )
-        rc = nodes_mod.run_command(node, cmd, timeout=30.0,
-                                    linked_keys=_ssh_credentials_for_node(ctx, nn))
-      except Exception as exc:
-        results.append({"node": nn, "ok": False, "error": str(exc)[:200]})
-        continue
-      out = rc.stdout or ""
-      # Parse JSON-ish output: lines look like
-      #   { "name": "user>>>alice>>>traffic>>>uplink", "value": "1234" }
-      # in pretty-printed multi-line JSON. Easiest: regex.
-      stat_re = re.compile(
-        r'"name"\s*:\s*"user>>>([^>"]+)>>>traffic>>>(uplink|downlink)"\s*,\s*"value"\s*:\s*"?(\d+)"?',
-      )
-      matches = stat_re.findall(out)
-      # If we got NO matches and the output looks like an error
-      # (mentions 'connect', 'refused', 'permission', or 'Error:'),
-      # bubble that up instead of silently reporting 0/0.
-      if not matches:
-        low = out.lower()
-        if any(kw in low for kw in ("connect: connection refused",
-                                     "permission denied",
-                                     "error:", "rpc error", "no such container")):
-          # Trim long stderr to ~300 chars so the response stays small.
-          msg = out.strip()[:300]
-          results.append({"node": nn, "ok": False,
-                          "error": f"xray stats unavailable: {msg}"})
-          continue
-      # Aggregate per (token, direction)
-      per_token: dict[str, dict[str, int]] = {}
-      for tname, direction, val in matches:
-        per_token.setdefault(tname, {"up": 0, "down": 0})
-        if direction == "uplink":
-          per_token[tname]["up"] += int(val)
-        else:
-          per_token[tname]["down"] += int(val)
-
-      written = 0
-      for tname, byt in per_token.items():
-        # token email in xray IS the token name (we set it on insert)
-        tok = tokens_by_name.get(tname) or tokens_by_uuid.get(tname)
-        if tok is None:
-          continue
-        ctx.database.upsert_xout_traffic_daily(
-          nn, tok["id"], today,
-          uplink_bytes=byt["up"], downlink_bytes=byt["down"],
-        )
-        # also bump last_seen_at
-        ctx.database.upsert_xout_node_token(nn, tok["id"], last_seen_at=True)
-        written += 1
-      results.append({"node": nn, "ok": True,
-                      "tokens_seen": len(per_token),
-                      "tokens_written": written,
-                      "raw_lines": len(matches)})
-    return _json_response(HTTPStatus.OK, {"results": results})
-
-  # NOTE: _xout_sync_tokens_on_nodes was removed. The function used to
-  # SSH each node and read /data/preset.json.resolved to harvest the
-  # auto-generated Reality keys + cache subscription URIs. In the
-  # post-merge architecture each xout container generates its own
-  # Reality keys on first boot and upserts them straight into
-  # xout_node_inbounds, so the SSH path is dead — admin's subscription
-  # handler now overlays Reality params from that table at request
-  # time, exactly like user-service's /sub/<token> already does.
 
   def xout_assignments_bulk_handler(request: _Request) -> _Response:
     """Bulk-assign one preset to N nodes.
@@ -7310,18 +7020,14 @@ def _build_router(ctx: AdminContext) -> _Router:
              with_auth(xout_presets_preview_handler))
   router.add("GET",    "/api/xout/nodes",                   with_auth(xout_nodes_list_handler))
   router.add("GET",    "/api/xout/outbound-targets",         with_auth(xout_outbound_targets_handler))
-  router.add("GET",    "/api/xout/tokens",                   with_auth(xout_tokens_list_handler))
-  router.add("POST",   "/api/xout/tokens",                   with_auth(xout_tokens_create_handler))
-  router.add("GET",    "/api/xout/tokens/{id}",              with_auth(xout_tokens_get_handler))
-  router.add("PATCH",  "/api/xout/tokens/{id}",              with_auth(xout_tokens_patch_handler))
-  router.add("DELETE", "/api/xout/tokens/{id}",              with_auth(xout_tokens_delete_handler))
-  router.add("POST",   "/api/xout/tokens/{id}/regenerate-token-value",
-             with_auth(xout_tokens_regenerate_value_handler))
-  router.add("GET",    "/api/xout/tokens/{id}/subscription", with_auth(xout_tokens_subscription_handler))
-  router.add("POST",   "/api/xout/sync-traffic",             with_auth(xout_sync_traffic_handler))
+  # Note: legacy /api/xout/tokens, /api/xout/sync-traffic, and
+  # /api/xout/nodes/{name}/traffic-summary endpoints were removed in the
+  # user-system unification. The token pool, the per-(node,token)
+  # provisioning table, and the daily traffic accumulator are gone — the
+  # single source of truth for xout users is now auth_users + subscriptions
+  # + xout_products, and traffic is reported into usage_events / usage_quotas
+  # by the xout container directly.
   router.add("POST",   "/api/xout/assignments",              with_auth(xout_assignments_bulk_handler))
-  router.add("GET",    "/api/xout/nodes/{name}/traffic-summary",
-             with_auth(xout_node_traffic_summary_handler))
   router.add("GET",    "/api/xout/nodes/{name}/subscription",
              with_auth(xout_node_subscription_handler))
   router.add("POST",   "/api/xout/nodes/{node_name}/test",   with_auth(xout_node_test_handler))

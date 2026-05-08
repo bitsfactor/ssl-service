@@ -1433,15 +1433,43 @@
       h("span", { class: "dot" }), "unreachable");
   }
 
-  function nodeServiceBadge(status) {
-    if (!status || status.service_running == null) return h("span", { class: "badge" }, "—");
-    if (status.service_running) {
-      const mode = status.service_mode || "running";
-      const cls = mode === "readwrite" ? "badge danger" : (mode === "readonly" ? "badge info" : "badge ok");
-      return h("span", { class: cls }, h("span", { class: "dot" }), mode);
+  // Render the Services column for one node. Shows one small badge per
+  // service that has ever had a state row on this node — name + colored
+  // dot reflecting container_state. Empty list = "—".
+  //
+  // Color rules:
+  //   running           → green
+  //   exited / dead     → red
+  //   restarting / paused → yellow
+  //   absent            → grey muted (we know it's gone)
+  //   anything else / null → grey "unknown"
+  function nodeServicesBadges(services) {
+    if (!services || !services.length) return h("span", { class: "muted" }, "—");
+    const wrap = h("div", { class: "row", style: "gap: 4px; flex-wrap: wrap" });
+    for (const svc of services) {
+      const state = (svc.container_state || "").toLowerCase();
+      let cls = "badge muted";
+      let dot = false;
+      if (state === "running")                         { cls = "badge ok";     dot = true; }
+      else if (state === "exited" || state === "dead") { cls = "badge danger"; dot = true; }
+      else if (state === "restarting" || state === "paused" || state === "created")
+                                                       { cls = "badge warn";   dot = true; }
+      else if (state === "absent")                     { cls = "badge"; }
+      // Hover tip: full state + image + last observed
+      const titleBits = [`state: ${state || "unknown"}`];
+      if (svc.container_image)   titleBits.push(`image: ${svc.container_image}`);
+      if (svc.deploy_status)     titleBits.push(`deploy: ${svc.deploy_status}`);
+      if (svc.healthcheck_ok === true)  titleBits.push("healthcheck: ✓");
+      if (svc.healthcheck_ok === false) titleBits.push("healthcheck: ✗");
+      if (svc.last_observed_at)  titleBits.push(`observed: ${svc.last_observed_at}`);
+      const children = [];
+      if (dot) children.push(h("span", { class: "dot" }));
+      children.push(svc.service_name);
+      wrap.appendChild(h("span", { class: cls,
+        title: titleBits.join("\n"),
+        style: "font-size: 11px" }, ...children));
     }
-    if (status.service_installed === false) return h("span", { class: "badge" }, "not installed");
-    return h("span", { class: "badge warn" }, h("span", { class: "dot" }), "stopped");
+    return wrap;
   }
 
   // Populate the #nodes-group-filter bar with one pill per known group,
@@ -1732,7 +1760,8 @@
         h("th", null, "Groups"),
         h("th", null, "Host"),
         h("th", null, "Reachability"),
-        h("th", null, "Service"),
+        h("th", { title: "Services this node has had a state row for. Each badge shows container state (running / exited / absent / etc.); hover for details." },
+          "Services"),
         h("th", null, "Init"),
         h("th", null, "Uptime"),
         h("th", null, "Last probed"),
@@ -2025,7 +2054,7 @@
       h("td", null, renderNodeGroupsBadges(n.groups)),
       h("td", { class: "mono" }, `${n.ssh_user}@${n.host}:${n.ssh_port}`),
       h("td", null, nodeReachBadge(status)),
-      h("td", null, nodeServiceBadge(status)),
+      h("td", null, nodeServicesBadges(n.services)),
       h("td", null, nodeInitBadge(n.init)),
       h("td", { class: "muted" }, status ? fmtUptime(status.uptime_seconds) : "—"),
       h("td", { class: "muted" }, status && status.last_probed_at ? fmtRelative(status.last_probed_at) : "never"),
@@ -2242,6 +2271,10 @@
           const tbl = h("table", { class: "data" });
           const tb = h("tbody");
           for (const c of managed) {
+            // Capture service + node name in scope; closing over `c.name`
+            // and `name` ensures each row's button targets the right pair.
+            const svcName = c.name;
+            const nodeNameForRow = name;
             tb.appendChild(h("tr", null,
               h("td", { class: "mono" }, c.name),
               h("td", null, c.state === "running"
@@ -2249,6 +2282,13 @@
                 : h("span", { class: "badge warn" }, c.state || "?")),
               h("td", { class: "mono", style: "font-size: 11.5px" }, c.image),
               h("td", { class: "muted", style: "font-size: 11.5px" }, c.status_str),
+              h("td", { style: "text-align: right;" },
+                h("button", {
+                  class: "btn",
+                  style: "font-size: 11.5px; padding: 2px 8px;",
+                  onclick: () => openServiceNodeEnvModal(svcName, nodeNameForRow),
+                }, "Env"),
+              ),
             ));
           }
           tbl.appendChild(tb);
@@ -3581,35 +3621,54 @@
   }
 
   async function openServiceDeployModal(service) {
-    let manifest = null;
-    try {
-      // Always re-parse from cached deploy_yaml if available; otherwise fetch.
-      if (service.has_manifest && service.deploy_yaml) {
-        manifest = parseInlineManifest(service);
-      } else {
-        const r = await api("POST", `/api/services/${encodeURIComponent(service.name)}/manifest`,
-          { save: true });
-        manifest = r.manifest;
-      }
-    } catch (err) { toast("error", "Could not load manifest", err.message); return; }
+    // Open the modal IMMEDIATELY with a spinner skeleton. The data
+    // fetches below (manifest / fresh service / databases / nodes)
+    // run in parallel and replace the skeleton when they all land.
+    // Without this, the click felt frozen for 1–3s while the backend
+    // walked GitHub (.deploy.yaml fetch) before anything rendered.
+    const formContainer = h("div", {
+      style: "padding: 32px; text-align: center; font-size: 13px;" },
+      h("div", { class: "spinner",
+        style: "margin: 0 auto 12px; width: 24px; height: 24px; "
+          + "border: 3px solid var(--border); border-top-color: var(--accent); "
+          + "border-radius: 50%; animation: spin 0.9s linear infinite;" }),
+      h("div", { class: "muted" }, "Loading deploy form…"));
+    const cancelBtn = h("button", { type: "button", class: "btn",
+      onclick: () => Modal.close() }, "Cancel");
+    const deployBtn = h("button", { type: "button", class: "btn btn-primary",
+      disabled: true }, "Deploy");
+    const footer = h("div", { class: "row" },
+      cancelBtn, h("div", { style: "flex: 1;" }), deployBtn);
+    Modal.open({ title: `Deploy ${service.name}`, body: formContainer,
+                 footer, size: "wide" });
 
-    // Re-fetch the service so saved default_env (e.g. SSL_SERVICE_PG_DSN
-    // just configured in the Edit dialog) is fresh — the row passed in
-    // from the table can be a stale snapshot. Fall back to the snapshot
-    // if the GET fails so we still render something usable.
+    // Kick off every dependency in parallel. Failures of optional
+    // resources (databases / fresh service / nodes) degrade gracefully
+    // with empty fallbacks so the form still renders. Manifest is the
+    // only hard dependency — if that fails we bail.
+    const cachedManifest = (service.has_manifest && service.deploy_yaml)
+      ? Promise.resolve({manifest: parseInlineManifest(service)})
+      : api("POST", `/api/services/${encodeURIComponent(service.name)}/manifest`,
+            {save: true});
+    let manifestRes, freshSvc, dbRes, nodesRes;
     try {
-      const fresh = await api("GET", `/api/services/${encodeURIComponent(service.name)}`);
-      if (fresh && fresh.name) service = fresh;
-    } catch (_) { /* keep snapshot */ }
-
-    // Pull the Databases registry so the SSL_SERVICE_PG_DSN row can be
-    // a friendly picker (mirrors the Edit modal). Without this, the
-    // saved value displays as the cryptic "database:<id>" token.
-    let databases = [];
-    try {
-      const r = await api("GET", "/api/databases");
-      databases = r.entries || r.databases || [];
-    } catch (_) { databases = []; }
+      [manifestRes, freshSvc, dbRes, nodesRes] = await Promise.all([
+        cachedManifest,
+        api("GET", `/api/services/${encodeURIComponent(service.name)}`)
+          .catch(() => null),
+        api("GET", "/api/databases").catch(() => ({entries: []})),
+        api("GET", "/api/nodes").catch(() => ({nodes: []})),
+      ]);
+    } catch (err) {
+      formContainer.innerHTML = "";
+      formContainer.appendChild(h("div", { style: "padding: 24px; color: var(--danger);" },
+        "Could not load manifest: " + (err.message || "")));
+      return;
+    }
+    const manifest = manifestRes.manifest;
+    if (freshSvc && freshSvc.name) service = freshSvc;
+    const databases = dbRes.entries || dbRes.databases || [];
+    const nodesList = nodesRes.nodes || [];
 
     // (xout used to need its own legacy token/preset selector here. After
     //  the xout-merge refactor it's a plain env-driven service like every
@@ -3753,24 +3812,20 @@
       const el = document.getElementById("svc-deploy-count");
       if (el) el.textContent = `${n} selected`;
     }
-    try {
-      const r = await api("GET", "/api/nodes");
-      for (const n of (r.nodes || [])) {
-        const id = `sn-${n.name}`;
-        list.appendChild(h("label", {
-          class: "row", style: "gap: 8px; padding: 4px 6px; cursor: pointer; align-items: center;", for: id },
-          h("input", { type: "checkbox", id, "data-node": n.name, onchange: updateCount }),
-          h("span", { class: "mono" }, n.name),
-          h("span", { class: "muted", style: "font-size: 11.5px;" },
-            ` ${n.ssh_user}@${n.host}:${n.ssh_port}`),
-          h("span", { class: "badge", style: "margin-left: auto; font-size: 10.5px;" }, n.auth_method),
-        ));
-      }
-    } catch (err) { toast("error", "Could not list nodes", err.message); }
+    // Use the nodes list that was pre-fetched in parallel above. No
+    // extra round-trip here.
+    for (const n of nodesList) {
+      const id = `sn-${n.name}`;
+      list.appendChild(h("label", {
+        class: "row", style: "gap: 8px; padding: 4px 6px; cursor: pointer; align-items: center;", for: id },
+        h("input", { type: "checkbox", id, "data-node": n.name, onchange: updateCount }),
+        h("span", { class: "mono" }, n.name),
+        h("span", { class: "muted", style: "font-size: 11.5px;" },
+          ` ${n.ssh_user}@${n.host}:${n.ssh_port}`),
+        h("span", { class: "badge", style: "margin-left: auto; font-size: 10.5px;" }, n.auth_method),
+      ));
+    }
 
-    const cancelBtn = h("button", { type: "button", class: "btn",
-      onclick: () => Modal.close() }, "Cancel");
-    const deployBtn = h("button", { type: "button", class: "btn btn-primary" }, "Deploy");
     deployBtn.addEventListener("click", async () => {
       const nodes = Array.from(form.querySelectorAll('input[type="checkbox"][data-node]:checked'))
         .map(c => c.getAttribute("data-node"));
@@ -3835,12 +3890,10 @@
         toast("error", "Deploy failed", err.message);
       }
     });
-    const footer = h("div", { class: "row" },
-      cancelBtn,
-      h("div", { style: "flex: 1;" }),
-      deployBtn,
-    );
-    Modal.open({ title: `Deploy ${service.name}`, body: form, footer, size: "wide" });
+    // Swap the spinner skeleton out for the real form and enable Deploy.
+    formContainer.innerHTML = "";
+    formContainer.appendChild(form);
+    deployBtn.disabled = false;
   }
 
   function parseInlineManifest(service) {
@@ -4225,6 +4278,264 @@
     );
 
     Modal.open({ title, body, footer });
+  }
+
+
+  // ---------------------------------------------------------------------------
+  // Effective env viewer / editor — works for ANY service, not just those
+  // that declared a config_schema. Shows the full env that the deploy script
+  // would write to the node's .env, with per-key source attribution. Lets
+  // operators add/edit/clear free-form per-node overrides + (optionally)
+  // trigger a redeploy so the running container picks up the change.
+  //
+  // Backed by the same /api/services/{name}/nodes/{node}/config endpoint
+  // as the schema-based modal — the GET response now includes effective +
+  // sources + manifest_defaults + secrets so the UI can render this view
+  // without parsing yaml on the client.
+  // ---------------------------------------------------------------------------
+  async function openServiceNodeEnvModal(serviceName, nodeName) {
+    const title = `Effective env: ${serviceName} on ${nodeName}`;
+    const body = h("div");
+    body.appendChild(h("div", { class: "muted", style: "padding: 16px;" }, "Loading…"));
+    Modal.open({ title, body });
+
+    let payload;
+    try {
+      payload = await api("GET",
+        `/api/services/${encodeURIComponent(serviceName)}/nodes/${encodeURIComponent(nodeName)}/config`);
+    } catch (err) {
+      body.innerHTML = "";
+      body.appendChild(h("div", { style: "padding: 16px; color: var(--danger);" },
+        "Load failed: " + (err.message || err)));
+      return;
+    }
+
+    const effective = payload.effective || {};
+    const sources = payload.sources || {};
+    const overrides = payload.values || {};
+    const manifestDefaults = payload.manifest_defaults || {};
+    const serviceDefaults = payload.service_defaults || {};
+    const schemaDefaults = payload.schema_defaults || {};
+    const secrets = payload.secrets || [];
+
+    // We mutate this on every edit and POST it back as the FULL set of
+    // per-node overrides. The user can clear an override by deleting its
+    // value (we drop empty strings before PUT, treating "" as "use the
+    // layer below this override").
+    const editedOverrides = { ...overrides };
+
+    body.innerHTML = "";
+
+    // Summary header.
+    const summary = h("div", {
+      class: "muted",
+      style: "padding: 4px 0 12px 0; font-size: 12px;",
+    },
+      `${Object.keys(effective).length} env vars · `,
+      `${Object.keys(overrides).length} per-node override${Object.keys(overrides).length === 1 ? "" : "s"} · `,
+      `${secrets.length} secret${secrets.length === 1 ? "" : "s"} from manifest`,
+    );
+    body.appendChild(summary);
+
+    const sourceColors = {
+      "override": "#1f8a4c",
+      "override (shadows secret)": "#b03a2e",
+      "secret": "#7a5af8",
+      "service_default": "#1f6feb",
+      "manifest_default": "#6b7280",
+      "schema_default": "#6b7280",
+    };
+    const sourceLabel = (src) => {
+      const colour = sourceColors[src] || "#6b7280";
+      return h("span", {
+        class: "badge",
+        style: `background: ${colour}1a; color: ${colour}; border: 1px solid ${colour}55;
+                font-size: 10.5px; padding: 1px 6px; border-radius: 3px;`,
+      }, src);
+    };
+
+    // Build the rows. Sort: overrides first, then by key alphabetically.
+    const sortedKeys = Object.keys(effective).sort((a, b) => {
+      const ao = a in overrides ? 0 : 1;
+      const bo = b in overrides ? 0 : 1;
+      if (ao !== bo) return ao - bo;
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+
+    const tbl = h("table", {
+      class: "data",
+      style: "width: 100%; table-layout: fixed; font-size: 12.5px;",
+    });
+    tbl.appendChild(h("colgroup", null,
+      h("col", { style: "width: 32%;" }),
+      h("col", { style: "width: 42%;" }),
+      h("col", { style: "width: 16%;" }),
+      h("col", { style: "width: 10%;" }),
+    ));
+    tbl.appendChild(h("thead", null, h("tr", null,
+      h("th", null, "Key"),
+      h("th", null, "Value"),
+      h("th", null, "Source"),
+      h("th", null, ""),
+    )));
+    const tb = h("tbody");
+    tbl.appendChild(tb);
+
+    // Renders one row. Re-rendered on every edit so badges + buttons
+    // stay in sync with the current `editedOverrides` state.
+    function renderRow(key) {
+      const tr = h("tr");
+      tr.appendChild(h("td", { class: "mono", style: "vertical-align: top; padding-top: 8px;" }, key));
+
+      const valTd = h("td", { style: "vertical-align: top;" });
+      const isOverridden = key in editedOverrides;
+      const baseline =
+        key in serviceDefaults ? serviceDefaults[key] :
+        key in manifestDefaults ? manifestDefaults[key] :
+        key in schemaDefaults ? schemaDefaults[key] :
+        "";
+      const currentVal = isOverridden ? editedOverrides[key] : (effective[key] || "");
+
+      const isMaskedSecret = currentVal === "********" && (sources[key] === "secret");
+      const input = h("input", {
+        type: "text",
+        value: isMaskedSecret ? "" : currentVal,
+        placeholder: isMaskedSecret ? "(masked secret — type a value to override)" : "(empty)",
+        style: "width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;",
+        oninput: (e) => {
+          editedOverrides[key] = e.target.value;
+          refreshSummary();
+        },
+      });
+      valTd.appendChild(input);
+
+      // Show baseline (the value that would apply if override were cleared)
+      // when the user has overridden a key whose underlying value is known.
+      if (isOverridden && baseline !== "" && baseline !== editedOverrides[key]) {
+        valTd.appendChild(h("div", {
+          class: "muted",
+          style: "font-size: 11px; margin-top: 3px;",
+        }, "baseline: ", h("span", { class: "mono" }, baseline)));
+      }
+      tr.appendChild(valTd);
+
+      const srcKey = isOverridden && sources[key] !== "override (shadows secret)" ? "override" : sources[key] || "—";
+      const srcTd = h("td", { style: "vertical-align: top; padding-top: 8px;" });
+      srcTd.appendChild(sourceLabel(srcKey));
+      tr.appendChild(srcTd);
+
+      const actTd = h("td", { style: "vertical-align: top; padding-top: 6px; text-align: right;" });
+      if (isOverridden) {
+        actTd.appendChild(h("button", {
+          class: "btn",
+          style: "font-size: 11px; padding: 2px 8px;",
+          onclick: () => {
+            delete editedOverrides[key];
+            redrawTable();
+          },
+        }, "clear"));
+      }
+      tr.appendChild(actTd);
+
+      return tr;
+    }
+
+    function redrawTable() {
+      tb.innerHTML = "";
+      // Re-derive sortedKeys to surface newly-added keys at top.
+      const keys = new Set([...Object.keys(effective), ...Object.keys(editedOverrides)]);
+      const sorted = [...keys].sort((a, b) => {
+        const ao = a in editedOverrides ? 0 : 1;
+        const bo = b in editedOverrides ? 0 : 1;
+        if (ao !== bo) return ao - bo;
+        return a < b ? -1 : a > b ? 1 : 0;
+      });
+      for (const k of sorted) tb.appendChild(renderRow(k));
+      refreshSummary();
+    }
+
+    function refreshSummary() {
+      const overrideCount = Object.values(editedOverrides).filter((v) => v !== "").length;
+      summary.innerHTML = "";
+      summary.appendChild(document.createTextNode(
+        `${tb.children.length} env vars · ${overrideCount} per-node override${overrideCount === 1 ? "" : "s"} · ${secrets.length} secret${secrets.length === 1 ? "" : "s"} from manifest`,
+      ));
+    }
+
+    redrawTable();
+    body.appendChild(tbl);
+
+    // Free-form add — dropping a brand-new key into editedOverrides and
+    // letting redrawTable surface a fresh row at the top.
+    const addRow = h("div", {
+      style: "margin-top: 14px; padding: 10px 12px; background: var(--surface-alt); border-radius: 4px;",
+    });
+    const newKeyInput = h("input", {
+      type: "text",
+      placeholder: "NEW_ENV_VAR",
+      style: "font-family: ui-monospace, monospace; font-size: 12px; padding: 4px 8px; width: 32%;",
+    });
+    const newValInput = h("input", {
+      type: "text",
+      placeholder: "value",
+      style: "font-family: ui-monospace, monospace; font-size: 12px; padding: 4px 8px; width: 42%; margin-left: 8px;",
+    });
+    const addBtn = h("button", {
+      class: "btn btn-primary",
+      style: "margin-left: 8px; font-size: 12px;",
+      onclick: () => {
+        const k = newKeyInput.value.trim();
+        if (!k) return;
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) {
+          toast("error", "Invalid key", "ENV var name must match [A-Za-z_][A-Za-z0-9_]*");
+          return;
+        }
+        editedOverrides[k] = newValInput.value;
+        newKeyInput.value = "";
+        newValInput.value = "";
+        redrawTable();
+      },
+    }, "+ Add override");
+    addRow.appendChild(h("div", { class: "muted", style: "font-size: 11.5px; margin-bottom: 6px;" },
+      "Add an override for a key not already in the effective env (e.g. a feature flag the manifest doesn't list)."));
+    addRow.appendChild(newKeyInput);
+    addRow.appendChild(newValInput);
+    addRow.appendChild(addBtn);
+    body.appendChild(addRow);
+
+    // Footer — Save / Save+Redeploy / Close. Save sends the full set of
+    // overrides; empty values are dropped, equivalent to "clear override".
+    const errEl = h("div", { style: "color: var(--danger); flex: 1; font-size: 12px;" });
+
+    async function doSave(redeploy) {
+      const cleaned = {};
+      for (const [k, v] of Object.entries(editedOverrides)) {
+        if (v === "" || v === undefined || v === null) continue;
+        cleaned[k] = v;
+      }
+      try {
+        await api("PUT",
+          `/api/services/${encodeURIComponent(serviceName)}/nodes/${encodeURIComponent(nodeName)}/config`,
+          { values: cleaned, redeploy: !!redeploy },
+        );
+        toast("success",
+          redeploy ? "Saved + redeploy queued" : "Saved",
+          `${serviceName} on ${nodeName}: ${Object.keys(cleaned).length} override${Object.keys(cleaned).length === 1 ? "" : "s"}`);
+        Modal.close();
+      } catch (err) {
+        errEl.textContent = err.message || String(err);
+      }
+    }
+
+    Modal.open({
+      title, body,
+      footer: h("div", { class: "row", style: "align-items: center; gap: 8px;" },
+        errEl,
+        h("button", { class: "btn", onclick: () => Modal.close() }, "Close"),
+        h("button", { class: "btn", onclick: () => doSave(false) }, "Save"),
+        h("button", { class: "btn btn-primary", onclick: () => doSave(true) }, "Save + Redeploy"),
+      ),
+    });
   }
 
 
@@ -9777,14 +10088,19 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
     // product-name tab strip at the top so the operator picks which
     // subscription's URL/content to view. With a single sub there's
     // nothing to switch between, so we skip the tab strip entirely.
+    // After the user-system unification (2026-05-06) the subscription
+    // URL is per-user, not per-subscription -- user-service surfaces
+    // it as detail.subscription_url, and also stamps each
+    // subscription entry with the same URL so the existing per-row
+    // controls keep working.
     const subCards = [];
     for (const s of subs) {
       const productLabel = (s.product_name && s.product_name["zh-CN"])
         ? `${s.product_code} · ${s.product_name["zh-CN"]}`
         : s.product_code;
-      const baseSubUrl = (baseUrl && s.subscription_token)
-        ? `${baseUrl}/sub/${s.subscription_token}`
-        : "";
+      const baseSubUrl = s.subscription_url
+        || (detail && detail.subscription_url)
+        || "";
       // Active format — toggled by the [base64] [yaml] tab strip below.
       // Single source of truth, mutated by tab clicks, read by URL +
       // Copy + content fetch helpers.
@@ -10904,14 +11220,14 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
     const assignPresetBtn = h("button", { class: "btn btn-sm btn-primary",
       title: "Assign a preset to the checked nodes (xout reads its preset assignment from the DB on every 30s tick)",
       onclick: () => bulkAssignPreset() }, "Assign preset");
-    const syncTrafficBtn = h("button", { class: "btn btn-sm",
-      title: "Pull live traffic stats from selected nodes (or all)",
-      onclick: () => bulkSyncTraffic() }, "Sync traffic");
+    // "Sync traffic" was removed alongside xout_traffic_daily in the
+    // user-system unification. Traffic now flows into usage_events /
+    // usage_quotas at user-service automatically; no manual pull needed.
     nodesCard.appendChild(h("div", { class: "card-header" },
       h("h2", null, "Deployed nodes"),
       h("div", { class: "row", style: "gap: 6px; flex: 1; justify-content: flex-end" },
         h("span", { class: "hint", id: "xout-nodes-count" }, ""),
-        assignPresetBtn, syncTrafficBtn)));
+        assignPresetBtn)));
     const nodesBody = h("div", { class: "card-body" });
     nodesCard.appendChild(nodesBody);
     root.appendChild(nodesCard);
@@ -10926,17 +11242,8 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
         .map((cb) => cb.dataset.node);
     }
 
-    async function bulkSyncTraffic() {
-      const nodes = selectedNodeNames();
-      try {
-        const r = await api("POST", "/api/xout/sync-traffic", { nodes });
-        const okCount = (r.results || []).filter((x) => x.ok).length;
-        toast("success", "Traffic synced", `${okCount}/${(r.results || []).length} nodes`);
-        refresh();
-      } catch (err) {
-        toast("error", "Sync traffic failed", err.message);
-      }
-    }
+    // bulkSyncTraffic was removed alongside xout_traffic_daily in the
+    // user-system unification.
 
     async function bulkAssignPreset() {
       // Pick nodes — explicit selection required so the operator
@@ -11132,10 +11439,6 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
               onclick: () => openXoutTestModal(n.node_name) },
               "Test"),
             h("button", { class: "btn btn-sm",
-              title: "Show this node's users, this-month traffic and residual quota",
-              onclick: () => openVerifyTrafficModal(n.node_name) },
-              "Verify traffic"),
-            h("button", { class: "btn btn-sm",
               title: "Get the subscription content for every user published to this node",
               onclick: () => openNodeSubscriptionModal(n.node_name) },
               "Subscription")),
@@ -11172,18 +11475,9 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
     refresh();
   }
 
-  // Pretty-print byte counts. GB threshold at 1024^3, MB at 1024^2 —
-  // we don't go below KB because xray traffic is always at least KB.
-  // Trailing .00 / .0 are stripped so whole-number readings (1000 GB)
-  // render cleanly without the noise of "1000.00 GB".
-  function fmtXoutBytes(b) {
-    const fmt = (n, d) => Number(n.toFixed(d)).toString();
-    if (!b || b < 1024) return (b || 0) + " B";
-    if (b < 1024 * 1024) return fmt(b / 1024, 1) + " KB";
-    if (b < 1024 * 1024 * 1024) return fmt(b / 1024 / 1024, 1) + " MB";
-    if (b < 1024 ** 4) return fmt(b / 1024 ** 3, 2) + " GB";
-    return fmt(b / 1024 ** 4, 2) + " TB";
-  }
+  // fmtXoutBytes was used only by openVerifyTrafficModal, which was
+  // removed alongside xout_traffic_daily. If a future xout-side traffic
+  // view is rebuilt against usage_events, restore this helper.
 
   // Modal: run end-to-end proxy traffic check on the actual node.
   // Hits POST /api/xout/nodes/{name}/test which sshes in and runs `curl`
@@ -11261,105 +11555,14 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
         h("button", { class: "btn btn-primary", onclick: () => Modal.close() }, "Close")) });
   }
 
-  // Modal: create or edit a token. UUID is auto-generated on create and
-  // shown read-only on edit (rotating it would break clients' subs).
+  // openVerifyTrafficModal was removed alongside xout_traffic_daily.
+  // Per-user, per-product traffic + quota lives in usage_quotas /
+  // usage_events at user-service now; the operator sees it on the
+  // user-detail page there.
 
-  // Modal: pick which nodes to publish a token to. Idempotent — re-publishing
-  // is safe; clients keep their subscription URL because UUID is stable.
-  // Modal: show this token's aggregated subscription content (raw URIs +
-  // base64 + Clash YAML). Each section has a copy button.
-
-  // Modal: per-node traffic rollup with per-token breakdown + this-month
-  // residual quota bar.
-  async function openVerifyTrafficModal(nodeName) {
-    const body = h("div");
-    body.appendChild(h("div", { class: "muted", style: "padding: 12px;" }, "Loading…"));
-    Modal.open({ title: `Verify traffic: ${nodeName}`, body, size: "wide" });
-
-    let r;
-    try {
-      r = await api("GET", `/api/xout/nodes/${encodeURIComponent(nodeName)}/traffic-summary`);
-    } catch (err) {
-      body.innerHTML = "";
-      body.appendChild(h("div", { class: "muted", style: "color: var(--danger); padding: 12px" },
-        "Load failed: " + (err.message || "")));
-      return;
-    }
-    body.innerHTML = "";
-
-    const monthBytes = Number(r.month_bytes || 0);
-    const quotaBytes = Number(r.month_quota_bytes || 0);
-    const monthPct = quotaBytes > 0 ? Math.min(100, (monthBytes / quotaBytes) * 100) : 0;
-    const overQuota = quotaBytes > 0 && monthBytes >= quotaBytes;
-
-    // 4-column grid for the summary stats — equal-width cells aligns
-    // labels and values regardless of their text length.
-    const statBlock = (label, value, opts = {}) => h("div",
-      { style: "display: block" },
-      h("div", { class: "muted", style: "font-size: 11px; margin-bottom: 2px" }, label),
-      h("div", { style: `font-family: monospace; font-size: 16px; ${opts.color ? "color: " + opts.color : ""}` }, value));
-    body.appendChild(h("div", {
-      style: "display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 10px",
-    },
-      statBlock("This month", fmtXoutBytes(monthBytes)),
-      statBlock("Quota",      fmtXoutBytes(quotaBytes)),
-      statBlock("Residual",   fmtXoutBytes(Math.max(0, Number(r.month_residual_bytes || 0))),
-                { color: overQuota ? "var(--danger)" : "" }),
-      statBlock("Lifetime",   fmtXoutBytes(Number(r.total_bytes || 0))),
-    ));
-    // Always show the bar; when empty it reads as "0 used". Border so
-    // the rail is visible even when surface-2 is close to the modal bg.
-    body.appendChild(h("div", {
-      style: "background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; height: 8px; margin-bottom: 16px"
-    }, h("div", {
-      style: `width: ${monthPct.toFixed(1)}%; height: 8px; background: ${overQuota ? "var(--danger)" : (monthPct > 80 ? "#d97706" : "var(--accent,#2563eb)")}; transition: width 200ms ease;`
-    })));
-
-    if (!(r.per_token || []).length) {
-      body.appendChild(h("div", { class: "muted", style: "padding: 12px" },
-        "No users recorded for this node yet. The xout container reports presence on its 30s tick — wait a minute and refresh, or run 'Sync traffic' to seed historical rows."));
-    } else {
-      const tbl = h("table", { class: "data" });
-      tbl.appendChild(h("thead", null, h("tr", null,
-        h("th", null, "User"),
-        h("th", { title: "Traffic since this user's reset day" }, "Cycle"),
-        h("th", null, "Total"), h("th", null, "Last seen"))));
-      const tb = h("tbody");
-      for (const pt of r.per_token) {
-        tb.appendChild(h("tr", null,
-          h("td", { class: "mono" }, pt.token_name || `#${pt.token_id}`),
-          h("td", { class: "mono", style: "font-size: 12px" }, fmtXoutBytes(Number(pt.month_bytes || 0))),
-          h("td", { class: "mono", style: "font-size: 12px" }, fmtXoutBytes(Number(pt.total_bytes || 0))),
-          h("td", { class: "muted", style: "font-size: 12px" },
-            pt.last_seen_at ? fmtRelative(pt.last_seen_at) : "never")));
-      }
-      tbl.appendChild(tb);
-      const wrap = h("div", { class: "table-wrap" });
-      wrap.appendChild(tbl);
-      body.appendChild(wrap);
-    }
-
-    Modal.open({ title: `Verify traffic: ${nodeName}`, body, size: "wide",
-      footer: h("div", { class: "row" },
-        h("button", { class: "btn", title: "Pull latest stats from this node",
-          onclick: async (e) => {
-            e.target.disabled = true;
-            e.target.textContent = "Syncing…";
-            try {
-              await api("POST", "/api/xout/sync-traffic", { nodes: [nodeName] });
-              openVerifyTrafficModal(nodeName);
-            } catch (err) {
-              toast("error", "Sync failed", err.message);
-              e.target.disabled = false;
-              e.target.textContent = "Sync this node";
-            }
-          }}, "Sync this node"),
-        h("div", { style: "flex: 1" }),
-        h("button", { class: "btn btn-primary", onclick: () => Modal.close() }, "Close")) });
-  }
-
-  // Modal: per-node subscription content. Aggregates URIs across every
-  // token published to this node, with a Base64 ↔ Clash YAML toggle.
+  // Modal: per-node subscription content. Aggregates VLESS URIs for
+  // every user currently provisioned on this node, with a Base64 ↔
+  // Clash YAML toggle.
   async function openNodeSubscriptionModal(nodeName) {
     const body = h("div");
     body.appendChild(h("div", { class: "muted", style: "padding: 12px;" },
