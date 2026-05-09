@@ -1,0 +1,352 @@
+"use client";
+
+import { useT } from "@/lib/i18n/i18n-provider";
+import { useI18n } from "@/lib/i18n/i18n-provider";
+import type { UsageInfo } from "@/lib/api/server";
+import { Badge } from "@/components/ui/badge";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+} from "@/components/ui/card";
+import { Separator } from "@/components/ui/separator";
+import { Button } from "@/components/ui/button";
+import { InfoIcon } from "lucide-react";
+
+// /api/products from user-service returns a mixed catalog (tier_* plus
+// other products like xout-*). Each entry currently looks like:
+//   { id, code, name (string OR locale map), kind, period_days, currency,
+//     price_cents, description, metadata?: { daily_allowance_cents?,
+//     lifetime_trial_cents?, tier_rank? } }
+// We filter to tier_* (the user-facing subscription plans) at render time.
+type Product = {
+  id?: number | string;
+  code?: string;
+  name?: string | Record<string, string>;
+  kind?: string;
+  period_days?: number | null;
+  currency?: string;
+  price_cents?: number;
+  description?: string;
+  metadata?: {
+    daily_allowance_cents?: number;
+    lifetime_trial_cents?: number;
+    tier_rank?: number;
+  };
+  active?: boolean;
+};
+
+function productLabel(p: Product, locale: string): string {
+  if (typeof p.name === "string") return p.name;
+  if (p.name && typeof p.name === "object") {
+    return p.name[locale] ?? p.name.en ?? Object.values(p.name)[0] ?? p.code ?? "";
+  }
+  return p.code ?? "";
+}
+
+// user-service /api/pricing returns rows shaped like
+//   { model_id, input_rate_per_1m_usd, cached_input_rate_per_1m_usd,
+//     output_rate_per_1m_usd, display_name?, modality?, … }
+// The legacy field names (`model`, `input_per_million`, …) are accepted
+// too as a safety net for any older deployments.
+type ModelPricing = {
+  // canonical (current shape)
+  model_id?: string;
+  display_name?: Record<string, string> | null;
+  modality?: string;
+  input_rate_per_1m_usd?: number;
+  cached_input_rate_per_1m_usd?: number;
+  output_rate_per_1m_usd?: number;
+  // legacy aliases
+  model?: string;
+  input_per_million?: number;
+  cached_per_million?: number;
+  output_per_million?: number;
+};
+
+function modelLabel(p: ModelPricing): string {
+  return p.model_id ?? p.model ?? "";
+}
+function modelInput(p: ModelPricing): number | null {
+  return p.input_rate_per_1m_usd ?? p.input_per_million ?? null;
+}
+function modelCached(p: ModelPricing): number | null {
+  return p.cached_input_rate_per_1m_usd ?? p.cached_per_million ?? null;
+}
+function modelOutput(p: ModelPricing): number | null {
+  return p.output_rate_per_1m_usd ?? p.output_per_million ?? null;
+}
+function fmtUsd(n: number | null | undefined): string {
+  return n == null ? "—" : `$${n.toFixed(2)}`;
+}
+
+function formatCents(cents: number): string {
+  return `$${(cents / 100).toFixed(2)}`;
+}
+
+function UsageBar({ consumed, limit }: { consumed: number; limit: number }) {
+  if (limit === 0) return null;
+  const pct = Math.min(100, Math.round((consumed / limit) * 100));
+  const barColor =
+    pct >= 90
+      ? "bg-destructive"
+      : pct >= 70
+        ? "bg-amber-500 dark:bg-amber-400"
+        : "bg-primary";
+  return (
+    <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+      <div
+        className={`h-full rounded-full transition-all ${barColor}`}
+        style={{ width: `${pct}%` }}
+        role="progressbar"
+        aria-valuenow={pct}
+        aria-valuemin={0}
+        aria-valuemax={100}
+      />
+    </div>
+  );
+}
+
+export function BillingClient({
+  usage,
+  products,
+  pricing,
+}: {
+  usage: UsageInfo | null;
+  products: Product[];
+  pricing: ModelPricing[];
+}) {
+  const t = useT();
+  const { locale } = useI18n();
+
+  function getTierName(tierName: Record<string, string>): string {
+    return tierName?.[locale] ?? tierName?.["en"] ?? "";
+  }
+
+  const discountPct = usage
+    ? Math.round((1 - usage.discount_factor) * 100)
+    : 0;
+
+  return (
+    <div className="p-4 md:p-8 max-w-2xl fade-up">
+      <div className="mb-6">
+        <h1 className="text-2xl font-semibold tracking-tight">
+          {t("billing.title")}
+        </h1>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {t("billing.subtitle")}
+        </p>
+      </div>
+
+      {/* Current plan + usage */}
+      {usage ? (
+        <Card className="mb-6">
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between">
+              <CardTitle>{t("billing.currentPlan")}</CardTitle>
+              {discountPct > 0 ? (
+                <Badge variant="success">
+                  {t("billing.discountBadge", { discount: discountPct })}
+                </Badge>
+              ) : null}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex items-baseline gap-2">
+              <span className="text-xl font-semibold">
+                {getTierName(usage.tier_name)}
+              </span>
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-muted-foreground">{t("billing.dailyAllowance")}</span>
+                <span className="font-medium tabular-nums">
+                  {usage.limit_cents === 0
+                    ? "∞"
+                    : formatCents(usage.limit_cents)}
+                </span>
+              </div>
+              <div className="mt-1 flex items-center justify-between text-sm">
+                <span className="text-muted-foreground">{t("billing.consumedToday")}</span>
+                <span className="tabular-nums">{formatCents(usage.consumed_cents)}</span>
+              </div>
+              <div className="mt-1 flex items-center justify-between text-sm">
+                <span className="text-muted-foreground">{t("billing.remainingToday")}</span>
+                <span className="tabular-nums font-medium">
+                  {usage.limit_cents === 0
+                    ? "∞"
+                    : formatCents(usage.remaining_cents)}
+                </span>
+              </div>
+              {usage.limit_cents > 0 ? (
+                <UsageBar
+                  consumed={usage.consumed_cents}
+                  limit={usage.limit_cents}
+                />
+              ) : null}
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {/* All plans table */}
+      {products.length > 0 ? (
+        <Card className="mb-6">
+          <CardHeader>
+            <CardTitle>{t("billing.allPlans")}</CardTitle>
+            <CardDescription>{t("billing.upgradeNote")}</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-border/60 text-muted-foreground text-xs uppercase tracking-wide">
+                    <th className="pb-2 text-left font-medium">{t("billing.planName")}</th>
+                    <th className="pb-2 text-right font-medium">{t("billing.planAllowance")}</th>
+                    <th className="pb-2 text-right font-medium">{t("billing.planDiscount")}</th>
+                    <th className="pb-2 text-right font-medium"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {products
+                    .filter((p) => (p.code ?? "").startsWith("tier_"))
+                    .slice()
+                    .sort(
+                      (a, b) =>
+                        (a.metadata?.tier_rank ?? 0) -
+                        (b.metadata?.tier_rank ?? 0)
+                    )
+                    .map((p) => {
+                      const isCurrent = usage?.tier_code === p.code;
+                      const allowanceCents =
+                        p.metadata?.daily_allowance_cents ??
+                        p.metadata?.lifetime_trial_cents;
+                      const allowanceLabel = allowanceCents
+                        ? p.metadata?.daily_allowance_cents
+                          ? formatCents(allowanceCents)
+                          : `${formatCents(allowanceCents)} (one-time)`
+                        : "—";
+                      const priceLabel =
+                        p.price_cents == null
+                          ? "—"
+                          : p.price_cents === 0
+                            ? t("billing.freePlanName")
+                            : `${formatCents(p.price_cents)}/mo`;
+                      return (
+                        <tr
+                          key={p.id ?? p.code}
+                          className="border-b border-border/40 last:border-0"
+                        >
+                          <td className="py-3 pr-4 font-medium">
+                            {productLabel(p, locale)}
+                            {isCurrent ? (
+                              <Badge
+                                variant="outline"
+                                className="ml-2 text-[10px]"
+                              >
+                                {t("billing.currentBadge")}
+                              </Badge>
+                            ) : null}
+                            <p className="mt-0.5 text-[11px] text-muted-foreground">
+                              {priceLabel}
+                            </p>
+                          </td>
+                          <td className="py-3 text-right tabular-nums">
+                            {allowanceLabel}
+                          </td>
+                          <td className="py-3 text-right tabular-nums">
+                            {discountPct > 0 ? `${discountPct}%` : "—"}
+                          </td>
+                          <td className="py-3 text-right">
+                            {isCurrent ? null : (
+                              <Button
+                                variant="outline"
+                                size="xs"
+                                disabled
+                              >
+                                {t("billing.upgradeButton")}
+                              </Button>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                </tbody>
+              </table>
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {/* Model pricing */}
+      {pricing.length > 0 ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>{t("billing.modelPricing")}</CardTitle>
+            <CardDescription>
+              {discountPct > 0
+                ? t("billing.pricingNote", { discount: discountPct })
+                : t("billing.pricingNoteNoDiscount")}
+              {" "}
+              <span className="text-muted-foreground/70">
+                ({t("billing.pricingUnit")})
+              </span>
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-border/60 text-muted-foreground text-xs uppercase tracking-wide">
+                    <th className="pb-2 text-left font-medium">{t("billing.modelName")}</th>
+                    <th className="pb-2 text-right font-medium">{t("billing.inputPrice")}</th>
+                    <th className="pb-2 text-right font-medium">{t("billing.cachedPrice")}</th>
+                    <th className="pb-2 text-right font-medium">{t("billing.outputPrice")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pricing.map((p) => {
+                    const label = modelLabel(p);
+                    return (
+                      <tr
+                        key={label}
+                        className="border-b border-border/40 last:border-0"
+                      >
+                        <td className="py-2.5 pr-4 font-mono text-xs">
+                          {label}
+                        </td>
+                        <td className="py-2.5 text-right tabular-nums text-xs">
+                          {fmtUsd(modelInput(p))}
+                        </td>
+                        <td className="py-2.5 text-right tabular-nums text-xs">
+                          {fmtUsd(modelCached(p))}
+                        </td>
+                        <td className="py-2.5 text-right tabular-nums text-xs">
+                          {fmtUsd(modelOutput(p))}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </CardContent>
+        </Card>
+      ) : (
+        <Card>
+          <CardContent className="py-8">
+            <div className="flex flex-col items-center gap-2 text-center">
+              <InfoIcon className="size-8 text-muted-foreground" />
+              <p className="text-sm text-muted-foreground">
+                {t("billing.pricingLoading")}
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}

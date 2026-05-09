@@ -1,0 +1,28 @@
+# docker-compose.yml for the `user-center` service.
+# ssl-service writes a fresh .env from defaults + secrets, then runs
+# `docker compose up -d --build`.
+
+services:
+  user-center:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: user-center
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-3211}:3211"
+    volumes:
+      - /opt/user-center/logs:/app/logs
+    mem_limit: 512m
+    cpus: "1.0"
+    extra_hosts:
+      # Allows the container to reach user-service (and other localhost
+      # services) on the Docker host at its internal address.
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

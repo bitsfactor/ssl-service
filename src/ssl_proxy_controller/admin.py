@@ -1668,13 +1668,23 @@ def create_service(ctx: AdminContext, payload: dict[str, Any]) -> dict[str, Any]
   if ctx.database.get_service(name) is not None:
     raise HttpError(HTTPStatus.CONFLICT, f"service already exists: {name}", code="service_exists")
   github = (payload.get("github_repo_url") or "").strip()
-  if not github:
-    raise HttpError(HTTPStatus.BAD_REQUEST, "github_repo_url is required", code="github_repo_required")
+  local_repo_dir = (payload.get("local_repo_dir") or "").strip()
+  # Either a GitHub URL (clone-on-deploy) or a local repo dir
+  # (tar+ssh-push-on-deploy) is required — the deploy step needs
+  # *some* source. Both empty = nothing to ship.
+  if not github and not local_repo_dir:
+    raise HttpError(
+      HTTPStatus.BAD_REQUEST,
+      "either github_repo_url or local_repo_dir is required",
+      code="service_no_source",
+    )
   record = ServiceRecord(
     name=name,
     display_name=(payload.get("display_name") or name).strip(),
     description=(payload.get("description") or None) or None,
-    github_repo_url=github,
+    github_repo_url=github or None,
+    local_repo_dir=local_repo_dir or None,
+    default_node_name=(payload.get("default_node_name") or None) or None,
     default_branch=(payload.get("default_branch") or "main").strip() or "main",
     compose_file=(payload.get("compose_file") or "docker-compose.yml").strip() or "docker-compose.yml",
     install_dir_template=(payload.get("install_dir_template") or "/opt/{name}").strip() or "/opt/{name}",

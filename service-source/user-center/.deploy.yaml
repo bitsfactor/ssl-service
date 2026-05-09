@@ -1,0 +1,47 @@
+# Deployment manifest for the `user-center` service (Develop Account Center).
+# Built locally on the deploy node from this repo's Dockerfile.
+# Read by ssl-service's admin platform on every deploy.
+#
+# Flow on a target node:
+#   1. git clone (or pull) bitsfactor/user-center into /opt/user-center
+#   2. write a fresh .env from `defaults` + per-deploy overrides + `secrets`
+#   3. run scripts/pre_deploy.sh (no-op for now — no DB schema to apply)
+#   4. docker compose up -d --build  (multi-stage Dockerfile)
+#   5. container's `node server.js` boots Next.js standalone on :3211
+#   6. poll /api/health until 200
+#   7. Caddy routes user.develop.cc -> :3211 via DB-driven sync
+
+service: user-center
+runtime: compose
+compose_file: docker-compose.yml
+install_dir_template: /opt/{name}
+
+required_env:
+  - USER_SERVICE_URL   # Internal URL of user-service, e.g. http://host.docker.internal:8200
+
+defaults:
+  PORT: "3211"
+  TZ: Asia/Shanghai
+  NODE_ENV: production
+  NEXT_TELEMETRY_DISABLED: "1"
+  USER_SERVICE_URL: http://host.docker.internal:8200
+
+secrets: []
+
+exposed_ports:
+  - 3211
+
+healthcheck:
+  url: http://localhost:3211/api/health
+  expect_status: 200
+  timeout_seconds: 180
+  retries: 36
+  interval_seconds: 5
+
+depends_on: []
+
+hooks:
+  pre_deploy: scripts/pre_deploy.sh
+
+volumes:
+  - /opt/{name}/logs
