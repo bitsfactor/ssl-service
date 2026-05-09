@@ -96,10 +96,14 @@ export type Subscription = {
   id: number;
   product_code: string;
   product_name: Record<string, string>;
+  product_description?: Record<string, string> | string;
+  /** Which platform service owns this product: 'chat' | 'xout' | 'platform' */
+  service_code?: string;
   kind: string;       // "recurring" | "one_time" | "lifetime" | …
   status: string;     // "active" | "past_due" | "canceled" | …
   starts_at: string;
-  ends_at: string | null;
+  /** API field name from user-service is expires_at (DB column name). */
+  expires_at: string | null;
 };
 
 export type UsageInfo = {
@@ -117,6 +121,8 @@ export type UsageInfo = {
 export type Product = {
   id?: number | string;
   code?: string;
+  /** Which platform service owns this product: 'chat' | 'xout' | 'platform' */
+  service_code?: string;
   name?: string | Record<string, string>;
   kind?: string;
   period_days?: number | null;
@@ -191,17 +197,37 @@ async function fetchUsage(): Promise<UsageInfo | null> {
   }
 }
 
+function _parseProductList(body: unknown): Product[] {
+  // New shape: { products: [...], products_by_service: {...} }
+  // Legacy shape: [...] or { products: [...] }
+  const list = Array.isArray(body)
+    ? body
+    : ((body as { products?: unknown[] })?.products ?? []);
+  return list as Product[];
+}
+
 async function fetchProducts(): Promise<Product[]> {
-  return cachedFetch<Product[]>(
-    "/api/products",
-    (body) => {
-      const list = Array.isArray(body)
-        ? body
-        : ((body as { products?: unknown[] })?.products ?? []);
-      return list as Product[];
-    },
-    []
-  );
+  // Products are locale-sensitive (names resolved per user locale server-side).
+  // Do NOT use the module-level _staticCache here — it would mix locales across
+  // concurrent users. React cache() already deduplicates within one request.
+  try {
+    const res = await serverFetch("/api/products");
+    if (!res.ok) return [];
+    return _parseProductList(await res.json());
+  } catch {
+    return [];
+  }
+}
+
+/** Fetch only products belonging to one service (avoids mixing concerns). */
+export async function fetchProductsByService(service: string): Promise<Product[]> {
+  try {
+    const res = await serverFetch(`/api/products?service=${encodeURIComponent(service)}`);
+    if (!res.ok) return [];
+    return _parseProductList(await res.json());
+  } catch {
+    return [];
+  }
 }
 
 async function fetchPricing(): Promise<ModelPricing[]> {

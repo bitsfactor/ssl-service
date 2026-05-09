@@ -10808,6 +10808,19 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
             h("code", null, "xout-basic"), "."));
           return;
         }
+        // Group by service_code; preserve deterministic order.
+        const SERVICE_ORDER_P = ["chat", "xout", "platform"];
+        const SERVICE_LABELS_P = { chat: "Chat AI", xout: "Xout VPN", platform: "Platform" };
+        const grouped = {};
+        for (const p of products) {
+          const svc = p.service_code || "platform";
+          grouped[svc] = grouped[svc] || [];
+          grouped[svc].push(p);
+        }
+        const svcKeys = [
+          ...SERVICE_ORDER_P.filter(s => grouped[s]),
+          ...Object.keys(grouped).filter(s => !SERVICE_ORDER_P.includes(s)),
+        ];
         const tbl = h("table", { class: "data" });
         tbl.appendChild(h("thead", null, h("tr", null,
           h("th", null, "Code"),
@@ -10818,25 +10831,34 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
           h("th", null, "Active"),
           h("th", null, ""))));
         const tbody = h("tbody");
-        for (const p of products) {
-          const tr = h("tr");
-          tr.appendChild(h("td", { class: "mono" }, p.code));
-          tr.appendChild(h("td", null,
-            (p.name || {})["zh-CN"] || h("span", { class: "muted" }, "—")));
-          tr.appendChild(h("td", null, h("span", { class: "badge" }, p.kind)));
-          tr.appendChild(h("td", { class: "mono" },
-            (p.price_cents > 0)
-              ? `${(p.price_cents / 100).toFixed(2)} ${p.currency || "USD"}`
-              : h("span", { class: "muted" }, "free")));
-          tr.appendChild(h("td", { class: "mono" },
-            p.period_days ? `${p.period_days}d` : "—"));
-          tr.appendChild(h("td", null, p.active
-            ? h("span", { class: "badge ok" }, "active")
-            : h("span", { class: "badge warn" }, "inactive")));
-          tr.appendChild(h("td", { class: "actions" },
-            h("button", { class: "btn btn-sm",
-              onclick: () => openProductModal(p, load) }, "Edit")));
-          tbody.appendChild(tr);
+        for (const svc of svcKeys) {
+          // Service separator row
+          const sepTr = h("tr", { style: "background: var(--bg-alt, #f5f5f5)" });
+          const sepTd = h("td", { colspan: "7",
+            style: "padding: 4px 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted, #666)" },
+            SERVICE_LABELS_P[svc] || svc);
+          sepTr.appendChild(sepTd);
+          tbody.appendChild(sepTr);
+          for (const p of grouped[svc]) {
+            const tr = h("tr");
+            tr.appendChild(h("td", { class: "mono" }, p.code));
+            tr.appendChild(h("td", null,
+              (p.name || {})["zh-CN"] || h("span", { class: "muted" }, "—")));
+            tr.appendChild(h("td", null, h("span", { class: "badge" }, p.kind)));
+            tr.appendChild(h("td", { class: "mono" },
+              (p.price_cents > 0)
+                ? `${(p.price_cents / 100).toFixed(2)} ${p.currency || "USD"}`
+                : h("span", { class: "muted" }, "free")));
+            tr.appendChild(h("td", { class: "mono" },
+              p.period_days ? `${p.period_days}d` : "—"));
+            tr.appendChild(h("td", null, p.active
+              ? h("span", { class: "badge ok" }, "active")
+              : h("span", { class: "badge warn" }, "inactive")));
+            tr.appendChild(h("td", { class: "actions" },
+              h("button", { class: "btn btn-sm",
+                onclick: () => openProductModal(p, load) }, "Edit")));
+            tbody.appendChild(tr);
+          }
         }
         tbl.appendChild(tbody);
         const wrap = h("div", { class: "table-wrap" });
@@ -10881,10 +10903,25 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
     const active = h("input", { type: "checkbox" });
     active.checked = existing ? !!existing.active : true;
 
+    // Service picker
+    const serviceSelect = h("select", { class: "select" });
+    const SERVICE_OPTS = [
+      { value: "chat",     label: "Chat AI" },
+      { value: "xout",     label: "Xout VPN" },
+      { value: "platform", label: "Platform" },
+    ];
+    for (const opt of SERVICE_OPTS) {
+      const o = h("option", { value: opt.value }, opt.label);
+      const currentSvc = existing ? (existing.service_code || "platform") : "platform";
+      if (opt.value === currentSvc) o.selected = true;
+      serviceSelect.appendChild(o);
+    }
+
     openModal({
       title: isNew ? "New product" : `Edit — ${existing.code}`,
       body: h("div", { class: "form-grid" },
         h("label", null, "Code"),         code,
+        h("label", null, "Service"),      serviceSelect,
         h("label", null, "Kind"),         kind,
         h("label", null, "Price (cents)"), price,
         h("label", null, "Currency"),     currency,
@@ -10897,6 +10934,7 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
         h("label", null, "Active"),       h("label", { class: "row", style: "gap: 6px" }, active, h("span", { class: "muted" }, "shown in /api/products"))),
       onSave: async () => {
         const payload = {
+          service_code: serviceSelect.value,
           kind: kind.value,
           price_cents: parseInt(price.value || "0", 10),
           currency: currency.value.trim() || "USD",

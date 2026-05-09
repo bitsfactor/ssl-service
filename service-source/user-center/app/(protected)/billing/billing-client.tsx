@@ -1,8 +1,8 @@
 "use client";
 
-import { useT } from "@/lib/i18n/i18n-provider";
-import { useI18n } from "@/lib/i18n/i18n-provider";
-import type { UsageInfo } from "@/lib/api/server";
+import { useT, useI18n } from "@/lib/i18n/i18n-provider";
+import type { UsageInfo, Product, ModelPricing } from "@/lib/api/server";
+import { resolveLocaleString } from "@/lib/products";
 import { Badge } from "@/components/ui/badge";
 import {
   Card,
@@ -11,60 +11,17 @@ import {
   CardTitle,
   CardDescription,
 } from "@/components/ui/card";
-import { Separator } from "@/components/ui/separator";
 import { Button } from "@/components/ui/button";
 import { InfoIcon } from "lucide-react";
-
-// /api/products from user-service returns a mixed catalog (tier_* plus
-// other products like xout-*). Each entry currently looks like:
-//   { id, code, name (string OR locale map), kind, period_days, currency,
-//     price_cents, description, metadata?: { daily_allowance_cents?,
-//     lifetime_trial_cents?, tier_rank? } }
-// We filter to tier_* (the user-facing subscription plans) at render time.
-type Product = {
-  id?: number | string;
-  code?: string;
-  name?: string | Record<string, string>;
-  kind?: string;
-  period_days?: number | null;
-  currency?: string;
-  price_cents?: number;
-  description?: string;
-  metadata?: {
-    daily_allowance_cents?: number;
-    lifetime_trial_cents?: number;
-    tier_rank?: number;
-  };
-  active?: boolean;
-};
 
 function productLabel(p: Product, locale: string): string {
   if (typeof p.name === "string") return p.name;
   if (p.name && typeof p.name === "object") {
-    return p.name[locale] ?? p.name.en ?? Object.values(p.name)[0] ?? p.code ?? "";
+    return resolveLocaleString(p.name as Record<string, string>, locale) || p.code || "";
   }
   return p.code ?? "";
 }
 
-// user-service /api/pricing returns rows shaped like
-//   { model_id, input_rate_per_1m_usd, cached_input_rate_per_1m_usd,
-//     output_rate_per_1m_usd, display_name?, modality?, … }
-// The legacy field names (`model`, `input_per_million`, …) are accepted
-// too as a safety net for any older deployments.
-type ModelPricing = {
-  // canonical (current shape)
-  model_id?: string;
-  display_name?: Record<string, string> | null;
-  modality?: string;
-  input_rate_per_1m_usd?: number;
-  cached_input_rate_per_1m_usd?: number;
-  output_rate_per_1m_usd?: number;
-  // legacy aliases
-  model?: string;
-  input_per_million?: number;
-  cached_per_million?: number;
-  output_per_million?: number;
-};
 
 function modelLabel(p: ModelPricing): string {
   return p.model_id ?? p.model ?? "";
@@ -122,7 +79,7 @@ export function BillingClient({
   const { locale } = useI18n();
 
   function getTierName(tierName: Record<string, string>): string {
-    return tierName?.[locale] ?? tierName?.["en"] ?? "";
+    return resolveLocaleString(tierName, locale);
   }
 
   const discountPct = usage
@@ -212,7 +169,10 @@ export function BillingClient({
                 </thead>
                 <tbody>
                   {products
-                    .filter((p) => (p.code ?? "").startsWith("tier_"))
+                    .filter((p) =>
+                      // Prefer authoritative service_code; fall back to prefix for older rows.
+                      (p.service_code ? p.service_code === "chat" : (p.code ?? "").startsWith("tier_"))
+                    )
                     .slice()
                     .sort(
                       (a, b) =>

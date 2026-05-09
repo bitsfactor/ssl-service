@@ -4,7 +4,7 @@ import Link from "next/link";
 import { ExternalLinkIcon, UserIcon, TrendingUpIcon, PackageIcon } from "lucide-react";
 import { useT, useI18n } from "@/lib/i18n/i18n-provider";
 import type { UserProfile, UsageInfo, Subscription, Product } from "@/lib/api/server";
-import { productLink } from "@/lib/products";
+import { productLink, productService, resolveLocaleString } from "@/lib/products";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -64,7 +64,7 @@ function statusBadgeClass(status: string): string {
 function productLabel(p: Product, locale: string): string {
   if (typeof p.name === "string") return p.name;
   if (p.name && typeof p.name === "object") {
-    return p.name[locale] ?? p.name["en"] ?? Object.values(p.name)[0] ?? p.code ?? "";
+    return resolveLocaleString(p.name as Record<string, string>, locale) || p.code || "";
   }
   return p.code ?? "";
 }
@@ -83,13 +83,10 @@ export function DashboardClient({
   const t = useT();
   const { locale } = useI18n();
 
-  // Resolve tier name for the user's locale (fallback chain: locale → en → tier_code)
+  // Resolve tier name for the user's locale. tier_name uses "zh-CN"/"en-US"
+  // keys from the DB; resolveLocaleString handles short→long code expansion.
   function getTierName(u: UsageInfo): string {
-    return (
-      u.tier_name?.[locale] ??
-      u.tier_name?.["en"] ??
-      u.tier_code
-    );
+    return resolveLocaleString(u.tier_name, locale) || u.tier_code;
   }
 
   // Cross-reference subscription with /api/products for description
@@ -99,20 +96,17 @@ export function DashboardClient({
   }
 
   function subProductLabel(sub: Subscription): string {
-    // Use locale-aware product_name from subscription
-    return (
-      sub.product_name?.[locale] ??
-      sub.product_name?.["en"] ??
-      sub.product_code
-    );
+    // product_name is a JSONB map with "zh-CN"/"en-US" keys from the backend.
+    // resolveLocaleString handles the short→long form expansion.
+    return resolveLocaleString(sub.product_name, locale) || sub.product_code;
   }
 
   function periodLabel(sub: Subscription): string {
-    if (sub.kind === "lifetime" || (!sub.ends_at && sub.kind !== "recurring")) {
+    if (sub.kind === "lifetime" || (!sub.expires_at && sub.kind !== "recurring")) {
       return t("dashboard.subscriptionLifetime");
     }
-    if (sub.ends_at) {
-      const d = new Date(sub.ends_at);
+    if (sub.expires_at) {
+      const d = new Date(sub.expires_at);
       return t("dashboard.subscriptionRenews", {
         date: d.toLocaleDateString(locale === "zh" ? "zh-CN" : locale, {
           year: "numeric",
@@ -121,7 +115,7 @@ export function DashboardClient({
         }),
       });
     }
-    // recurring with no ends_at = ongoing, no renewal date yet known
+    // recurring with no expires_at = ongoing, no renewal date yet known
     return t("dashboard.subscriptionLifetime");
   }
 
@@ -235,7 +229,7 @@ export function DashboardClient({
           ) : (
             <ul className="space-y-3">
               {subscriptions.map((sub) => {
-                const link = productLink(sub.product_code);
+                const link = productLink({ code: sub.product_code, service_code: sub.service_code });
                 const description = productDescriptionFor(sub);
                 return (
                   <li

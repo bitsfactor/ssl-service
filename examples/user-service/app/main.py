@@ -198,6 +198,22 @@ class AdminCreateUserRequest(BaseModel):
   is_admin: bool = False
 
 
+_VALID_SERVICE_CODES = frozenset(("chat", "xout", "platform"))
+
+
+def _infer_service_code(code: str) -> str:
+  """Best-effort service inference when caller omits service_code.
+
+  Used only for backward-compat create paths that don't supply a
+  service_code. Prefer explicit caller-supplied values.
+  """
+  if code.startswith("tier_"):
+    return "chat"
+  if code.startswith("xout-"):
+    return "xout"
+  return "platform"
+
+
 class ProductCreateRequest(BaseModel):
   code: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,40}$")
   kind: str = Field(pattern=r"^(one_time|recurring|period)$")
@@ -211,6 +227,10 @@ class ProductCreateRequest(BaseModel):
   description: dict[str, str] = Field(default_factory=dict)
   metadata: dict[str, Any] = Field(default_factory=dict)
   active: bool = True
+  # service_code groups the product by which platform service owns it.
+  # Defaults to code-prefix inference so old callers that omit the
+  # field continue to work correctly.
+  service_code: str = Field(default="", min_length=0, max_length=32)
 
   @field_validator("period_days")
   @classmethod
@@ -220,6 +240,16 @@ class ProductCreateRequest(BaseModel):
     # path silently produces an unbounded sub.
     if info.data.get("kind") == "period" and v is None:
       raise ValueError("period_days is required when kind is 'period'")
+    return v
+
+  @field_validator("service_code")
+  @classmethod
+  def _validate_service_code(cls, v: str, info) -> str:
+    if not v:
+      # Infer from code when omitted for backward compat.
+      return _infer_service_code(info.data.get("code", ""))
+    if v not in _VALID_SERVICE_CODES:
+      raise ValueError(f"service_code must be one of {sorted(_VALID_SERVICE_CODES)}")
     return v
 
 
@@ -233,6 +263,16 @@ class ProductPatchRequest(BaseModel):
   description: dict[str, str] | None = None
   metadata: dict[str, Any] | None = None
   active: bool | None = None
+  service_code: str | None = Field(default=None, min_length=0, max_length=32)
+
+  @field_validator("service_code")
+  @classmethod
+  def _validate_service_code(cls, v: str | None) -> str | None:
+    if v is None:
+      return None
+    if v not in _VALID_SERVICE_CODES:
+      raise ValueError(f"service_code must be one of {sorted(_VALID_SERVICE_CODES)}")
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -971,7 +1011,8 @@ def _list_user_subscriptions(user_id: str) -> list[dict]:
         """
         SELECT s.id, s.product_id, p.code AS product_code, p.kind,
                s.status, s.starts_at, s.expires_at, s.source,
-               p.name AS product_name, p.description AS product_description
+               p.name AS product_name, p.description AS product_description,
+               p.service_code
         FROM subscriptions s
         JOIN products p ON p.id = s.product_id
         WHERE s.user_id = %s
@@ -1534,6 +1575,8 @@ def me(user: dict = Depends(get_current_user)) -> dict:
         "id": s["id"],
         "product_code": s["product_code"],
         "product_name": s.get("product_name"),
+        "product_description": s.get("product_description"),
+        "service_code": s.get("service_code", "platform"),
         "kind": s["kind"],
         "status": s["status"],
         "starts_at": s["starts_at"],
@@ -1783,35 +1826,79 @@ def me_patch(req: MePatchRequest, user: dict = Depends(get_current_user)) -> dic
 def list_products(
   request: Request,
   user: dict | None = Depends(get_current_user_optional),
+  service: str | None = None,
 ) -> dict:
+  """Public product catalog.
+
+  Query params:
+    ?service=chat   — filter to products belonging to one service
+                      (used by billing pages that only care about one context)
+
+  Response shape (backward-compatible):
+    {
+      "locale": "en",
+      "products": [...],          # flat list — old clients read this
+      "products_by_service": {    # grouped — new consumers read this
+        "chat": [...],
+        "xout": [...],
+        ...
+      }
+    }
+
+  Each product object includes ``service_code`` so consumers can
+  decide per-item without inspecting the code prefix.
+  """
   # Logged-in users get content in their stored locale; anonymous
   # users fall back to Accept-Language → DEFAULT_LOCALE.
   locale = _request_locale(request, user)
+  # Validate ?service= value early so a typo returns 400, not an empty
+  # list that silently confuses the caller.
+  if service and service not in _VALID_SERVICE_CODES:
+    raise HTTPException(
+      status_code=400,
+      detail=f"unknown service '{service}'; valid values: {sorted(_VALID_SERVICE_CODES)}"
+    )
   with connect() as conn:
     with conn.cursor() as cur:
-      cur.execute(
-        """
-        SELECT id, code, kind, price_cents, currency, period_days,
-               name, description, metadata, active
-        FROM products WHERE active = TRUE ORDER BY id ASC
-        """
-      )
+      if service:
+        cur.execute(
+          """
+          SELECT id, code, kind, price_cents, currency, period_days,
+                 name, description, metadata, active, service_code
+          FROM products WHERE active = TRUE AND service_code = %s ORDER BY id ASC
+          """,
+          (service,),
+        )
+      else:
+        cur.execute(
+          """
+          SELECT id, code, kind, price_cents, currency, period_days,
+                 name, description, metadata, active, service_code
+          FROM products WHERE active = TRUE ORDER BY id ASC
+          """
+        )
       rows = cur.fetchall()
   out = []
+  by_service: dict[str, list[dict]] = {}
   for r in rows:
     name = (r["name"] or {})
     desc = (r["description"] or {})
-    out.append({
+    entry = {
       "id": r["id"],
       "code": r["code"],
+      "service_code": r["service_code"],
       "kind": r["kind"],
       "price_cents": r["price_cents"],
       "currency": r["currency"],
       "period_days": r["period_days"],
       "name": name.get(locale) or name.get(DEFAULT_LOCALE) or r["code"],
       "description": desc.get(locale) or desc.get(DEFAULT_LOCALE) or "",
-    })
-  return {"products": out, "locale": locale}
+      "metadata": r["metadata"] or {},
+    }
+    out.append(entry)
+    svc = r["service_code"] or "platform"
+    by_service.setdefault(svc, []).append(entry)
+  return {"products": out, "products_by_service": by_service, "locale": locale}
 
 
 # ---------------------------------------------------------------------------
@@ -2284,8 +2371,8 @@ def admin_list_products() -> dict:
         """
         SELECT id, code, kind, price_cents, currency, period_days,
                stripe_price_id, name, description, metadata, active,
-               created_at, updated_at
-        FROM products ORDER BY id ASC
+               service_code, created_at, updated_at
+        FROM products ORDER BY service_code, id ASC
         """
       )
       rows = cur.fetchall()
@@ -2294,20 +2381,23 @@ def admin_list_products() -> dict:
 
 @app.post("/api/admin/products", dependencies=[Depends(require_admin)])
 def admin_create_product(req: ProductCreateRequest) -> dict:
+  # service_code is always non-empty: _validate_service_code infers from
+  # the code prefix when the caller omits it. Just use it directly.
+  service_code = req.service_code
   with connect() as conn:
     with conn.cursor() as cur:
       cur.execute(
         """
         INSERT INTO products
           (code, kind, price_cents, currency, period_days, stripe_price_id,
-           name, description, metadata, active)
-        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
+           name, description, metadata, active, service_code)
+        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s)
         RETURNING id, code, kind, price_cents, currency, period_days,
-                  stripe_price_id, name, description, metadata, active
+                  stripe_price_id, name, description, metadata, active, service_code
         """,
         (req.code, req.kind, req.price_cents, req.currency, req.period_days,
          req.stripe_price_id, _to_jsonb(req.name), _to_jsonb(req.description),
-         _to_jsonb(req.metadata), req.active),
+         _to_jsonb(req.metadata), req.active, service_code),
       )
       row = cur.fetchone()
     conn.commit()
@@ -2460,17 +2550,24 @@ def admin_patch_product(product_id: int, req: ProductPatchRequest) -> dict:
   """Edit a generic product. Use admin_patch_xout_product for xout-specific
   fields (inbound_selector). Code and id are immutable -- delete + recreate
   if you need to rename."""
+  _PATCHABLE = frozenset({
+    "kind", "price_cents", "currency", "period_days", "stripe_price_id",
+    "name", "description", "metadata", "active", "service_code",
+  })
+  _JSONB_FIELDS = frozenset({"name", "description", "metadata"})
   fields: list[tuple[str, Any]] = []
   data = req.model_dump(exclude_unset=True)
   for k, v in data.items():
-    if k in ("name", "description", "metadata"):
+    if k not in _PATCHABLE:
+      continue  # silently skip unknown/non-patchable keys
+    if k in _JSONB_FIELDS:
       fields.append((k, _to_jsonb(v)))
     else:
       fields.append((k, v))
   if not fields:
     return admin_list_products()  # nothing to do; return current state
   set_clause = ", ".join(
-    f"{k} = %s::jsonb" if k in ("name", "description", "metadata") else f"{k} = %s"
+    f"{k} = %s::jsonb" if k in _JSONB_FIELDS else f"{k} = %s"
     for k, _ in fields
   )
   params = [v for _, v in fields] + [product_id]
@@ -2481,7 +2578,7 @@ def admin_patch_product(product_id: int, req: ProductPatchRequest) -> dict:
         UPDATE products SET {set_clause}, updated_at = NOW()
         WHERE id = %s
         RETURNING id, code, kind, price_cents, currency, period_days,
-                  stripe_price_id, name, description, metadata, active
+                  stripe_price_id, name, description, metadata, active, service_code
         """,
         params,
       )
@@ -2738,10 +2835,10 @@ def admin_create_xout_product(req: XoutProductCreateRequest) -> dict:
         """
         INSERT INTO products
           (code, kind, price_cents, currency, period_days,
-           name, description, metadata, active)
-        VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
+           name, description, metadata, active, service_code)
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, 'xout')
         RETURNING id, code, kind, price_cents, currency, period_days,
-                  name, description, metadata, active, created_at
+                  name, description, metadata, active, service_code, created_at
         """,
         (req.code, req.kind, req.price_cents, req.currency, req.period_days,
          _to_jsonb({**req.name, **{}} if req.name else {}),

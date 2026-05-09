@@ -1242,3 +1242,21 @@ BEGIN
   END LOOP;
 END;
 $$;
+
+-- Products: service_code column (2026-05-09) --------------------------------
+-- Each product now belongs to exactly one platform service:
+--   'chat'     — AI subscription tiers (tier_*)
+--   'xout'     — VPN/proxy packages (xout-*)
+--   'platform' — any other infra-level product
+-- Idempotent: ADD COLUMN IF NOT EXISTS + conditional UPDATE.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS service_code TEXT NOT NULL DEFAULT 'platform';
+
+-- Backfill existing rows based on code prefix.
+UPDATE products SET service_code = 'chat'
+  WHERE service_code = 'platform' AND code LIKE 'tier_%';
+
+UPDATE products SET service_code = 'xout'
+  WHERE service_code = 'platform' AND code LIKE 'xout-%';
+
+-- Index for service-filtered queries used by /api/products?service=chat.
+CREATE INDEX IF NOT EXISTS idx_products_service_code ON products (service_code);
