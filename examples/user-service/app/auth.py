@@ -84,8 +84,10 @@ def lookup_session(token: str) -> dict | None:
     with conn.cursor() as cur:
       cur.execute(
         """
-        SELECT u.id::text AS id, u.primary_email, u.locale, u.display_name,
-               u.is_admin, u.status, u.metadata, u.email_verified_at
+        SELECT u.id::text AS id, u.username, u.primary_email, u.locale,
+               u.display_name, u.is_admin, u.status, u.metadata,
+               u.email_verified_at,
+               u.subscription_token, u.vless_uuid::text AS vless_uuid
         FROM auth_sessions s
         JOIN auth_users u ON u.id = s.user_id
         WHERE s.token_hash = %s

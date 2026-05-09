@@ -5675,6 +5675,32 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
       pop.appendChild(row);
     }
     document.body.appendChild(pop);
+    // Vertical overflow guard — when the row anchoring the menu sits
+    // near the bottom of the viewport (last row of a long table), the
+    // ``top: rect.bottom + 4`` placement above runs the menu off-screen
+    // and the operator can't reach the items. Measure the rendered
+    // popover and:
+    //   * if it doesn't fit below, flip to anchor above the button
+    //     (``bottom = window.innerHeight - rect.top + 4``);
+    //   * if it fits neither above nor below, pin to the viewport
+    //     edge with a max-height + scrollbar so every item stays
+    //     reachable.
+    const popRect = pop.getBoundingClientRect();
+    const vh = window.innerHeight;
+    const margin = 8;
+    if (rect.bottom + 4 + popRect.height > vh - margin) {
+      // Try above.
+      if (rect.top - margin >= popRect.height + 4) {
+        pop.style.top = "auto";
+        pop.style.bottom = Math.round(vh - rect.top + 4) + "px";
+      } else {
+        // Doesn't fit above either — pin to viewport bottom + cap height.
+        pop.style.top = "auto";
+        pop.style.bottom = margin + "px";
+        pop.style.maxHeight = (vh - margin * 2) + "px";
+        pop.style.overflowY = "auto";
+      }
+    }
     const dismiss = (ev) => {
       if (ev && pop.contains(ev.target)) return;
       pop.remove();

@@ -43,6 +43,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import psycopg
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -85,8 +86,21 @@ PASSWORD_MIN_LEN = 8
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+  import asyncio
+  from . import billing
   init_pool()
-  yield
+  # Background flush task that drains the in-memory billing buffers
+  # to the DB every few seconds. Without this, all charges live in
+  # memory only — survives the request lifecycle but lost on restart.
+  flush_task = asyncio.create_task(billing.flush_loop())
+  try:
+    yield
+  finally:
+    flush_task.cancel()
+    try:
+      await flush_task
+    except asyncio.CancelledError:
+      pass
 
 
 app = FastAPI(title="user-service", lifespan=_lifespan)
@@ -179,6 +193,7 @@ class AdminCreateUserRequest(BaseModel):
   email: EmailStr
   password: str | None = Field(default=None, min_length=PASSWORD_MIN_LEN, max_length=200)
   display_name: str | None = None
+  username: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_.-]{0,63}$")
   locale: str | None = None
   is_admin: bool = False
 
@@ -196,6 +211,16 @@ class ProductCreateRequest(BaseModel):
   description: dict[str, str] = Field(default_factory=dict)
   metadata: dict[str, Any] = Field(default_factory=dict)
   active: bool = True
+
+  @field_validator("period_days")
+  @classmethod
+  def _period_required_for_period_kind(cls, v, info):
+    # period_days is the cycle length for kind=period; without it the
+    # /sub expiry calc has no way to compute expires_at and the grant
+    # path silently produces an unbounded sub.
+    if info.data.get("kind") == "period" and v is None:
+      raise ValueError("period_days is required when kind is 'period'")
+    return v
 
 
 class ProductPatchRequest(BaseModel):
@@ -375,10 +400,22 @@ def _normalize_email(email: str) -> str:
   return email.strip().lower()
 
 
+def _require_uuid(user_id: str) -> str:
+  """Reject malformed path params before they hit Postgres -- otherwise
+  ``SELECT ... WHERE id = 'abc'`` returns InvalidTextRepresentation
+  which surfaces as a 500 instead of a clean 400."""
+  import uuid as _uuid
+  try:
+    return str(_uuid.UUID(str(user_id)))
+  except (ValueError, AttributeError, TypeError):
+    raise HTTPException(status_code=400, detail="invalid user id")
+
+
 def _user_row_to_public(row: dict) -> dict:
   """Project an auth_users row to the shape we send back to clients."""
   return {
     "id": row["id"],
+    "username": row.get("username"),
     "email": row.get("primary_email"),
     "display_name": row.get("display_name"),
     "locale": row.get("locale") or DEFAULT_LOCALE,
@@ -409,6 +446,12 @@ def _next_period_start(reset_kind: str, anchor_day: int | None,
   """
   if reset_kind == "never":
     return current_start
+  if reset_kind == "daily":
+    # Reset to UTC midnight of from_dt's day. The billing engine
+    # mirrors this in-memory logic (see app/billing.py); keep them
+    # in sync.
+    return from_dt.replace(hour=0, minute=0, second=0,
+                           microsecond=0, tzinfo=timezone.utc)
   if reset_kind == "monthly_first":
     return from_dt.replace(day=1, hour=0, minute=0, second=0,
                            microsecond=0, tzinfo=timezone.utc)
@@ -555,15 +598,16 @@ def _list_user_quotas(user_id: str) -> list[dict]:
 # ===========================================================================
 # Plugin: xout — subscription URL + node-inbound resolution.
 #
-# Mental model:
+# Mental model (post-2026-05-06 user-system unification):
 #   - A "xout product" is a row in `xout_products` joined to `products`.
 #     It carries an `inbound_selector` JSONB describing which (node,
 #     inbound_tag) pairs the product offers.
-#   - When an admin grants an xout product to a user, the resulting
-#     `subscriptions` row gets a unique `subscription_token`. The
-#     public endpoint /sub/{token} returns a base64-encoded subscription
-#     containing one VLESS URI per matching inbound (live computed —
-#     adding/removing nodes flows through immediately).
+#   - Every user has ONE public subscription URL, built from
+#     ``auth_users.subscription_token``. Granting an xout product to
+#     a user is just an INSERT into `subscriptions`. The /sub/{token}
+#     endpoint aggregates VLESS URIs from EVERY active xout sub the
+#     user holds, rendered live -- adding / removing nodes / products
+#     flows through immediately, and the URL itself never rotates.
 #   - The xout container on each node periodically pulls "active xout
 #     users for products that include this node" from the DB and
 #     renders xray config with all of them. Per-user uplink/downlink
@@ -625,10 +669,11 @@ def _selector_includes(selector: dict, node_name: str, tag: str) -> bool:
   Selector schema v1:
     {"version": 1, "nodes": [{"name": "us01", "tags": ["美国","*"]}]}
 
-  ``tags=["*"]`` (or just no tags key) means all inbounds on that node.
-  Missing top-level ``nodes`` means the product is empty (no
-  inbounds), not "all nodes" — we want explicit opt-in to dodge
-  surprises.
+  ``"*"`` in tags means all inbounds on that node. Missing/empty
+  ``tags`` means the entry is malformed and matches nothing -- we
+  want explicit opt-in to dodge surprises (an empty admin form
+  should not silently grant blanket access to every inbound on
+  every node).
   """
   if not isinstance(selector, dict):
     LOGGER.warning("xout product selector is not a dict: %r", type(selector))
@@ -644,8 +689,8 @@ def _selector_includes(selector: dict, node_name: str, tag: str) -> bool:
       continue
     if n.get("name") != node_name:
       continue
-    tags = n.get("tags")
-    if not tags or "*" in tags:
+    tags = n.get("tags") or []
+    if "*" in tags:
       return True
     if tag in tags:
       return True
@@ -669,25 +714,38 @@ def _validate_xout_selector(selector: Any) -> None:
       raise HTTPException(status_code=400,
                           detail="each selector node must have a non-empty 'name'")
     tags = n.get("tags")
-    if tags is not None and not isinstance(tags, list):
+    if tags is None or not isinstance(tags, list) or len(tags) == 0:
       raise HTTPException(status_code=400,
-                          detail=f"selector node {n.get('name')} 'tags' must be a list")
+                          detail=(f"selector node {n.get('name')} 'tags' "
+                                  f"must be a non-empty list "
+                                  f"(use [\"*\"] for all inbounds)"))
 
 
 def _user_xout_subscriptions(user_id: str) -> list[dict]:
   """Return one row per active xout subscription for the user.
 
-  Each row carries the subscription_token, product info, and a
-  resolved list of (node, inbound) entries the user can connect to.
-  This is what /api/me uses to render the SPA cards and what /sub/<tok>
-  builds VLESS URIs from.
+  Each row carries product info plus a resolved list of (node,
+  inbound) entries the user can connect to. /api/me uses this to
+  render the SPA cards; /sub/<token> aggregates inbounds across
+  every row to build the unified subscription bundle.
+
+  The user's VLESS UUID is read from auth_users (one global UUID per
+  user, not per (user, node)) -- post-2026-05-06 user-system
+  unification. ``subscription_token`` is no longer stored on the
+  subscriptions row, so the public URL is built from the user's
+  ``auth_users.subscription_token`` instead.
   """
   with connect() as conn:
     with conn.cursor() as cur:
       cur.execute(
+        "SELECT vless_uuid::text AS vless_uuid FROM auth_users WHERE id = %s",
+        (user_id,),
+      )
+      ur = cur.fetchone()
+      vless_uuid = (ur or {}).get("vless_uuid")
+      cur.execute(
         """
-        SELECT s.id AS sub_id, s.subscription_token, s.expires_at,
-               s.starts_at, s.status,
+        SELECT s.id AS sub_id, s.expires_at, s.starts_at, s.status,
                p.id AS product_id, p.code AS product_code,
                p.name AS product_name, p.kind, p.period_days,
                xp.inbound_selector, xp.metadata AS xout_metadata
@@ -703,7 +761,7 @@ def _user_xout_subscriptions(user_id: str) -> list[dict]:
       subs = cur.fetchall()
       if not subs:
         return []
-      # Pre-fetch all node→inbounds for nodes mentioned in any selector.
+      # Pre-fetch host info for all nodes mentioned in any selector.
       node_names: set[str] = set()
       for s in subs:
         for n in (s["inbound_selector"] or {}).get("nodes") or []:
@@ -714,16 +772,6 @@ def _user_xout_subscriptions(user_id: str) -> list[dict]:
         (list(node_names) or [""],),
       )
       node_hosts = {r["name"]: r["host"] for r in cur.fetchall()}
-      cur.execute(
-        """
-        SELECT n.node_name, n.user_id::text AS user_id,
-               n.vless_uuid::text AS vless_uuid
-        FROM xout_node_users n
-        WHERE n.user_id = %s AND n.node_name = ANY(%s)
-        """,
-        (user_id, list(node_names) or [""]),
-      )
-      provisioning = {r["node_name"]: r["vless_uuid"] for r in cur.fetchall()}
 
   out = []
   for s in subs:
@@ -740,14 +788,13 @@ def _user_xout_subscriptions(user_id: str) -> list[dict]:
           "tag": ib.get("tag"),
           "port": ib.get("port"),
           "protocol": ib.get("protocol"),
-          "vless_uuid": provisioning.get(node_name),
+          "vless_uuid": vless_uuid,
           # Include reality for the URI builder. /api/me also returns
           # this so the SPA can display the SNI per-line if it wants.
           "reality": ib.get("reality"),
         })
     out.append({
       "subscription_id": s["sub_id"],
-      "subscription_token": s["subscription_token"],
       "expires_at": s["expires_at"],
       "product_id": s["product_id"],
       "product_code": s["product_code"],
@@ -885,11 +932,23 @@ def _xout_config_for_user(user_id: str) -> dict | None:
   Returns None when the user has no xout subscriptions. Otherwise
   returns one entry per subscription with subscription URL, product
   name, expiry, and per-node connection info.
+
+  All entries share the SAME subscription_url -- it's per-user, not
+  per-subscription, sourced from auth_users.subscription_token.
   """
   subs = _user_xout_subscriptions(user_id)
   if not subs:
     return None
   base = (os.getenv("PUBLIC_URL") or "https://user.develop.cc").rstrip("/")
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT subscription_token FROM auth_users WHERE id = %s",
+        (user_id,),
+      )
+      ur = cur.fetchone()
+      user_sub_token = (ur or {}).get("subscription_token")
+  user_sub_url = f"{base}/sub/{user_sub_token}" if user_sub_token else None
   out_subs = []
   for s in subs:
     uris = _build_subscription_uris(user_id, s["subscription_id"], s["inbounds"])
@@ -898,12 +957,11 @@ def _xout_config_for_user(user_id: str) -> dict | None:
       "product_code": s["product_code"],
       "product_name": s["product_name"],
       "expires_at": s["expires_at"],
-      "subscription_url": (f"{base}/sub/{s['subscription_token']}"
-                            if s["subscription_token"] else None),
+      "subscription_url": user_sub_url,
       "inbounds": s["inbounds"],
       "uri_count": len(uris),
     })
-  return {"subscriptions": out_subs}
+  return {"subscriptions": out_subs, "subscription_url": user_sub_url}
 
 
 def _list_user_subscriptions(user_id: str) -> list[dict]:
@@ -913,7 +971,6 @@ def _list_user_subscriptions(user_id: str) -> list[dict]:
         """
         SELECT s.id, s.product_id, p.code AS product_code, p.kind,
                s.status, s.starts_at, s.expires_at, s.source,
-               s.subscription_token,
                p.name AS product_name, p.description AS product_description
         FROM subscriptions s
         JOIN products p ON p.id = s.product_id
@@ -971,6 +1028,12 @@ def auth_signup(req: SignupRequest, request: Request, response: Response) -> dic
   # advisory lock — we'd end up with two admins or a unique-index
   # collision. The lock is transaction-scoped: held until commit, then
   # auto-released. Cheap (microseconds) and doesn't survive crashes.
+  # Derive username from the email's local part (matches both the
+  # admin-create flow and the migration backfill rule). Resolve any
+  # collision with a numeric suffix so signup never 500s on the
+  # auth_users.username NOT NULL constraint.
+  local = re.sub(r"[^a-z0-9_.-]", "", email.split("@", 1)[0].lower())
+  base_username = local or f"user_{int(datetime.now(timezone.utc).timestamp())}"
   with connect() as conn:
     with conn.cursor() as cur:
       cur.execute("SELECT pg_advisory_xact_lock(%s)", (_FIRST_USER_LOCK_KEY,))
@@ -981,19 +1044,72 @@ def auth_signup(req: SignupRequest, request: Request, response: Response) -> dic
       )
       if cur.fetchone() is not None:
         raise HTTPException(status_code=409, detail=t(locale, "auth.signup.email_taken"))
+      candidate = base_username
+      attempt = 0
+      while True:
+        cur.execute(
+          "SELECT 1 FROM auth_users WHERE LOWER(username) = LOWER(%s)",
+          (candidate,),
+        )
+        if cur.fetchone() is None:
+          break
+        attempt += 1
+        candidate = f"{base_username}_{attempt}"
+        if attempt > 99:
+          raise HTTPException(status_code=409,
+                              detail=t(locale, "auth.signup.email_taken"))
       cur.execute(
         """
-        INSERT INTO auth_users (primary_email, locale, is_admin, status)
-        VALUES (%s, %s, %s, 'active')
-        RETURNING id::text, primary_email, locale, is_admin, display_name, status
+        INSERT INTO auth_users (username, primary_email, locale, is_admin, status)
+        VALUES (%s, %s, %s, %s, 'active')
+        RETURNING id::text, username, primary_email, locale, is_admin, display_name, status
         """,
-        (email, locale, is_first),
+        (candidate, email, locale, is_first),
       )
       user_row = cur.fetchone()
       cur.execute(
         "INSERT INTO auth_passwords (user_id, argon2_hash) VALUES (%s, %s)",
         (user_row["id"], hash_password(req.password)),
       )
+      # Auto-grant the Free tier on signup: subscription row + a
+      # ``never``-reset usage_quota seeded with the lifetime trial
+      # amount (currently $2 = 200 cents). Whole flow is idempotent
+      # via the conditional INSERTs in case the user already has the
+      # rows from a backfill.
+      cur.execute(
+        """
+        SELECT id, COALESCE((metadata->>'lifetime_trial_cents')::int, 200)
+            AS trial_cents
+        FROM products WHERE code = 'tier_free' AND active = TRUE
+        LIMIT 1
+        """
+      )
+      _free = cur.fetchone()
+      if _free is not None:
+        _free_pid = _free["id"]
+        _trial_cents = _free["trial_cents"]
+        cur.execute(
+          """
+          INSERT INTO subscriptions (user_id, product_id, status,
+                                       starts_at, source)
+          SELECT %s, %s, 'active', NOW(), 'grant'
+          WHERE NOT EXISTS (
+            SELECT 1 FROM subscriptions
+            WHERE user_id = %s AND product_id = %s AND status = 'active'
+          )
+          """,
+          (user_row["id"], _free_pid, user_row["id"], _free_pid),
+        )
+        cur.execute(
+          """
+          INSERT INTO usage_quotas (user_id, product_id, limit_qty,
+                                     reset_kind, current_period_start,
+                                     current_period_consumed, updated_at)
+          VALUES (%s, %s, %s, 'never', NOW(), 0, NOW())
+          ON CONFLICT (user_id, product_id) DO NOTHING
+          """,
+          (user_row["id"], _free_pid, _trial_cents),
+        )
     conn.commit()
 
   token = issue_session(user_row["id"],
@@ -1432,9 +1548,202 @@ def me(user: dict = Depends(get_current_user)) -> dict:
 
 @app.get("/api/me/usage")
 def me_usage(user: dict = Depends(get_current_user)) -> dict:
-  """Per-product quota state for the logged-in user. Period-resets
-  happen lazily here too so the response is always fresh."""
-  return {"quotas": _list_user_quotas(user["id"])}
+  """Per-product quota state + AI billing summary for the logged-in
+  user. ``billing`` reflects the in-memory accumulator so the
+  response is fresh-to-the-second; ``quotas`` is a DB snapshot of
+  every product the user has a quota row for."""
+  from . import billing as _billing
+  return {
+    "quotas": _list_user_quotas(user["id"]),
+    "billing": _billing.get_usage_summary(user["id"]),
+  }
+
+
+# ---------------------------------------------------------------------------
+# AI billing: charge endpoint + public pricing
+# ---------------------------------------------------------------------------
+
+
+class ChargeRequest(BaseModel):
+  user_id: str
+  model: str
+  input_tokens: int = 0
+  cached_input_tokens: int = 0
+  output_tokens: int = 0
+  duration_seconds: float = 0
+  resource_id: str | None = None
+  metadata: dict | None = None
+
+
+@app.post("/api/usage/charge", dependencies=[Depends(require_service_token)])
+def usage_charge(req: ChargeRequest) -> dict:
+  """Service-to-service: deduct an AI op's cost from the user's
+  active-tier quota. Cost is computed from token counts × the
+  model's row in ``model_pricing`` × the global ``discount_factor``.
+
+  Returns 200 on success, 429 on quota exhaustion. The hot path is
+  in-memory; the DB write happens later on the flush schedule.
+  """
+  from . import billing as _billing
+  result = _billing.charge_usage(
+    req.user_id,
+    model=req.model,
+    input_tokens=req.input_tokens,
+    cached_input_tokens=req.cached_input_tokens,
+    output_tokens=req.output_tokens,
+    duration_seconds=req.duration_seconds,
+    resource_id=req.resource_id,
+    metadata=req.metadata,
+  )
+  if not result.ok:
+    if result.error == "quota_exhausted":
+      raise HTTPException(status_code=429, detail={
+        "code": "quota_exhausted",
+        "tier_code": result.tier_code,
+        "remaining_cents": result.remaining_cents,
+        "limit_cents": result.limit_cents,
+      })
+    raise HTTPException(status_code=400, detail={
+      "code": result.error or "charge_failed",
+    })
+  return {
+    "ok": True,
+    "charged_cents": result.charged_cents,
+    "openai_cents": result.openai_cents,
+    "remaining_cents": result.remaining_cents,
+    "limit_cents": result.limit_cents,
+    "tier_code": result.tier_code,
+    "tier_rank": result.tier_rank,
+  }
+
+
+def _resolve_user_id(ident: str) -> str | None:
+  """Accept either a UUID (user_id) or an email and return the
+  user-service auth_users.id. Return None if not found."""
+  if "@" in ident:
+    with connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute(
+          "SELECT id::text FROM auth_users WHERE LOWER(primary_email) = LOWER(%s)",
+          (ident,),
+        )
+        row = cur.fetchone()
+    return row["id"] if row else None
+  return ident
+
+
+@app.get("/api/internal/users/{ident}/usage-summary",
+         dependencies=[Depends(require_service_token)])
+def internal_usage_summary(ident: str) -> dict:
+  """Service-to-service: return billing summary for a user without
+  needing a session cookie. ``ident`` may be either the
+  ``auth_users.id`` UUID or the user's primary email — chatbot has
+  its own user table with a different id space, so it passes the
+  email."""
+  from . import billing as _billing
+  uid = _resolve_user_id(ident)
+  if not uid:
+    raise HTTPException(status_code=404, detail="user not found")
+  return _billing.get_usage_summary(uid)
+
+
+class InternalChargeRequest(BaseModel):
+  user_ident: str
+  model: str
+  input_tokens: int = 0
+  cached_input_tokens: int = 0
+  output_tokens: int = 0
+  duration_seconds: float = 0
+  resource_id: str | None = None
+  metadata: dict | None = None
+
+
+@app.post("/api/internal/usage/charge",
+          dependencies=[Depends(require_service_token)])
+def internal_usage_charge(req: InternalChargeRequest) -> dict:
+  """Service-to-service charge — same as /api/usage/charge but
+  accepts email-or-uuid in ``user_ident`` so chatbot doesn't need
+  to resolve the user-service uuid client-side."""
+  from . import billing as _billing
+  uid = _resolve_user_id(req.user_ident)
+  if not uid:
+    raise HTTPException(status_code=404, detail="user not found")
+  result = _billing.charge_usage(
+    uid,
+    model=req.model,
+    input_tokens=req.input_tokens,
+    cached_input_tokens=req.cached_input_tokens,
+    output_tokens=req.output_tokens,
+    duration_seconds=req.duration_seconds,
+    resource_id=req.resource_id,
+    metadata=req.metadata,
+  )
+  if not result.ok:
+    if result.error == "quota_exhausted":
+      raise HTTPException(status_code=429, detail={
+        "code": "quota_exhausted",
+        "tier_code": result.tier_code,
+        "remaining_cents": result.remaining_cents,
+        "limit_cents": result.limit_cents,
+      })
+    raise HTTPException(status_code=400, detail={
+      "code": result.error or "charge_failed",
+    })
+  return {
+    "ok": True,
+    "charged_cents": result.charged_cents,
+    "openai_cents": result.openai_cents,
+    "remaining_cents": result.remaining_cents,
+    "limit_cents": result.limit_cents,
+    "tier_code": result.tier_code,
+    "tier_rank": result.tier_rank,
+  }
+
+
+@app.get("/api/pricing")
+def public_pricing() -> dict:
+  """Public — list all active model_pricing rows + the current
+  discount factor. Frontend renders this on /center/billing and
+  in chatbot's model picker tooltip.
+
+  Rates are returned as both raw micro-USD ints AND human-friendly
+  USD-per-1M floats so consumers don't redo the conversion.
+  """
+  from . import billing as _billing
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        """
+        SELECT model_id, display_name, pricing_kind, modality,
+               input_rate_micros, cached_input_rate_micros, output_rate_micros,
+               per_unit_micros, per_unit_label, notes, source_url, updated_at
+        FROM model_pricing WHERE active = TRUE ORDER BY modality, model_id
+        """
+      )
+      rows = cur.fetchall()
+  discount = _billing.get_discount_factor()
+  models = []
+  for r in rows:
+    def _usd_per_1m(micros: int | None) -> float | None:
+      return None if micros is None else round(micros / 1_000_000, 6)
+    models.append({
+      "model_id": r["model_id"],
+      "display_name": r["display_name"],
+      "pricing_kind": r["pricing_kind"],
+      "modality": r["modality"],
+      "input_rate_per_1m_usd": _usd_per_1m(r["input_rate_micros"]),
+      "cached_input_rate_per_1m_usd": _usd_per_1m(r["cached_input_rate_micros"]),
+      "output_rate_per_1m_usd": _usd_per_1m(r["output_rate_micros"]),
+      "per_unit_usd": _usd_per_1m(r["per_unit_micros"]),
+      "per_unit_label": r["per_unit_label"],
+      "notes": r["notes"],
+      "source_url": r["source_url"],
+      "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+    })
+  return {
+    "discount_factor": discount,
+    "models": models,
+  }
 
 
 @app.patch("/api/me")
@@ -1615,16 +1924,18 @@ def admin_list_users(q: str | None = None, limit: int = 50, offset: int = 0) -> 
     # default; we still pass ESCAPE explicitly to make the contract obvious.
     escaped = q.strip().lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     where = ("WHERE LOWER(primary_email) LIKE %s ESCAPE '\\' "
+             "OR LOWER(username) LIKE %s ESCAPE '\\' "
              "OR LOWER(display_name) LIKE %s ESCAPE '\\'")
     needle = f"%{escaped}%"
-    params.extend([needle, needle])
+    params.extend([needle, needle, needle])
   list_params = list(params) + [limit, offset]
   with connect() as conn:
     with conn.cursor() as cur:
       cur.execute(
         f"""
-        SELECT id::text AS id, primary_email, display_name, locale, is_admin,
-               status, created_at,
+        SELECT id::text AS id, username, primary_email,
+               primary_email AS email,
+               display_name, locale, is_admin, status, created_at,
                (SELECT COUNT(*) FROM subscriptions s
                 WHERE s.user_id = u.id AND s.status = 'active') AS active_subs
         FROM auth_users u
@@ -1644,6 +1955,14 @@ def admin_list_users(q: str | None = None, limit: int = 50, offset: int = 0) -> 
 def admin_create_user(req: AdminCreateUserRequest) -> dict:
   email = _normalize_email(req.email)
   locale = req.locale if req.locale in SUPPORTED_LOCALES else DEFAULT_LOCALE
+  # username is NOT NULL on auth_users post user-system unification.
+  # If the operator didn't supply one, derive from the email's local
+  # part (matches the migration backfill rule). Append a numeric
+  # suffix on collision so we never 500 on the INSERT.
+  base_username = (req.username or "").strip().lower()
+  if not base_username:
+    local = re.sub(r"[^a-z0-9_.-]", "", email.split("@", 1)[0].lower())
+    base_username = local or f"user_{int(datetime.now(timezone.utc).timestamp())}"
   with connect() as conn:
     with conn.cursor() as cur:
       cur.execute(
@@ -1652,13 +1971,33 @@ def admin_create_user(req: AdminCreateUserRequest) -> dict:
       )
       if cur.fetchone() is not None:
         raise HTTPException(status_code=409, detail="email already registered")
+      # Resolve username collision.
+      candidate = base_username
+      attempt = 0
+      while True:
+        cur.execute(
+          "SELECT 1 FROM auth_users WHERE LOWER(username) = LOWER(%s)",
+          (candidate,),
+        )
+        if cur.fetchone() is None:
+          break
+        attempt += 1
+        candidate = f"{base_username}_{attempt}"
+        if attempt > 99:
+          raise HTTPException(status_code=409, detail="username unavailable")
+      # Auto-mint a placeholder argon2 hash if no password was passed
+      # (auth_passwords is 1:1 with auth_users post-migration; without
+      # a row the user has no path to log in, but that's fine for
+      # admin-provisioned accounts).
       cur.execute(
         """
-        INSERT INTO auth_users (primary_email, display_name, locale, is_admin, status)
-        VALUES (%s, %s, %s, %s, 'active')
-        RETURNING id::text, primary_email, display_name, locale, is_admin, status
+        INSERT INTO auth_users (username, primary_email, display_name, locale,
+                                 is_admin, status)
+        VALUES (%s, %s, %s, %s, %s, 'active')
+        RETURNING id::text, username, primary_email, display_name, locale,
+                  is_admin, status
         """,
-        (email, req.display_name, locale, req.is_admin),
+        (candidate, email, req.display_name, locale, req.is_admin),
       )
       row = cur.fetchone()
       if req.password:
@@ -1672,12 +2011,14 @@ def admin_create_user(req: AdminCreateUserRequest) -> dict:
 
 @app.get("/api/admin/users/{user_id}", dependencies=[Depends(require_admin)])
 def admin_user_detail(user_id: str) -> dict:
+  user_id = _require_uuid(user_id)
   with connect() as conn:
     with conn.cursor() as cur:
       cur.execute(
         """
-        SELECT id::text, primary_email, display_name, locale, is_admin,
-               status, metadata, created_at
+        SELECT id::text, username, primary_email, display_name, locale,
+               is_admin, status, metadata, created_at,
+               subscription_token, vless_uuid::text AS vless_uuid
         FROM auth_users WHERE id = %s
         """,
         (user_id,),
@@ -1686,15 +2027,39 @@ def admin_user_detail(user_id: str) -> dict:
       if row is None:
         raise HTTPException(status_code=404, detail="user not found")
   subs = _list_user_subscriptions(user_id)
-  return {"user": row, "subscriptions": subs}
+  # Build the per-user subscription URL once and propagate it down to
+  # each subscription entry too, so the operator UI can keep its
+  # row-level "Open" / "Copy URL" buttons working without a separate
+  # round-trip to /api/me. After the user-system unification one user
+  # has one /sub URL aggregating all their active xout subs.
+  base = (os.getenv("PUBLIC_URL") or "https://user.develop.cc").rstrip("/")
+  sub_url = (f"{base}/sub/{row['subscription_token']}"
+             if row.get("subscription_token") else None)
+  for s in subs:
+    s["subscription_url"] = sub_url
+  return {"user": row, "subscription_url": sub_url, "subscriptions": subs}
 
 
 @app.post("/api/admin/users/{user_id}/grant", dependencies=[Depends(require_admin)])
 def admin_grant_product(user_id: str, req: GrantRequest) -> dict:
+  """Grant a product to a user.
+
+  Post-2026-05-06 user-system unification: subscriptions no longer
+  carry their own ``subscription_token`` -- the public /sub URL is
+  per-user (built from auth_users.subscription_token), and one user
+  has one URL aggregating every active xout sub. xout_node_users is
+  also gone; the user's VLESS UUID is on auth_users and is used
+  globally across nodes.
+  """
+  user_id = _require_uuid(user_id)
   with connect() as conn:
     with conn.cursor() as cur:
-      cur.execute("SELECT id::text FROM auth_users WHERE id = %s", (user_id,))
-      if cur.fetchone() is None:
+      cur.execute(
+        "SELECT id::text, subscription_token FROM auth_users WHERE id = %s",
+        (user_id,),
+      )
+      user = cur.fetchone()
+      if user is None:
         raise HTTPException(status_code=404, detail="user not found")
       cur.execute("SELECT id, kind, period_days FROM products WHERE code = %s",
                   (req.product_code,))
@@ -1705,56 +2070,33 @@ def admin_grant_product(user_id: str, req: GrantRequest) -> dict:
       expires_at = req.expires_at
       if expires_at is None and product["kind"] == "period" and product["period_days"]:
         expires_at = datetime.now(timezone.utc) + timedelta(days=product["period_days"])
-      # Every active subscription gets a unique random token for the
-      # /sub/<token> endpoint. v1 reuses this for any product kind —
-      # non-xout products simply ignore the token.
-      import secrets as _secrets
-      sub_token = _secrets.token_urlsafe(24)
-      cur.execute(
-        """
-        INSERT INTO subscriptions
-          (user_id, product_id, status, starts_at, expires_at, source,
-           subscription_token)
-        VALUES (%s, %s, 'active', NOW(), %s, %s, %s)
-        RETURNING id, starts_at, expires_at, subscription_token
-        """,
-        (user_id, product["id"], expires_at, req.source, sub_token),
-      )
+      try:
+        cur.execute(
+          """
+          INSERT INTO subscriptions
+            (user_id, product_id, status, starts_at, expires_at, source)
+          VALUES (%s, %s, 'active', NOW(), %s, %s)
+          RETURNING id, starts_at, expires_at
+          """,
+          (user_id, product["id"], expires_at, req.source),
+        )
+      except psycopg.errors.UniqueViolation as exc:
+        # idx_subscriptions_one_active_per_user_product blocks duplicate
+        # non-terminal subs for the same (user, product). Tell the
+        # operator clearly so they don't refresh the form and try again.
+        raise HTTPException(
+          status_code=409,
+          detail=(f"user already has an active or pending subscription to "
+                  f"{req.product_code}; revoke it first to re-grant"),
+        ) from exc
       sub = cur.fetchone()
-
-      # If this is an xout product, eagerly provision xout_node_users
-      # for every node the selector targets so /sub/{token} can build
-      # URIs immediately. The agent on each node will pick up these
-      # rows on its next sync.
-      cur.execute(
-        "SELECT inbound_selector FROM xout_products WHERE product_id = %s",
-        (product["id"],),
-      )
-      xp_row = cur.fetchone()
-      if xp_row is not None:
-        import uuid as _uuid
-        selector = xp_row["inbound_selector"] or {}
-        for node_entry in selector.get("nodes") or []:
-          node_name = node_entry.get("name")
-          if not node_name:
-            continue
-          new_uuid = str(_uuid.uuid4())
-          cur.execute(
-            """
-            INSERT INTO xout_node_users
-              (node_name, user_id, vless_uuid, provisioned_at, last_seen_at)
-            VALUES (%s, %s, %s::uuid, NOW(), NOW())
-            ON CONFLICT (node_name, user_id) DO NOTHING
-            """,
-            (node_name, user_id, new_uuid),
-          )
     conn.commit()
   return {"subscription_id": sub["id"], "starts_at": sub["starts_at"],
           "expires_at": sub["expires_at"],
-          # Returning the token here lets the operator paste / preview the
-          # /sub/{token} URL right after granting, without a second
-          # round-trip to /api/admin/users/{id}.
-          "subscription_token": sub["subscription_token"]}
+          # The user's per-user subscription token. Operator can paste
+          # the resulting /sub/<token> URL into the SPA without a
+          # separate round-trip.
+          "subscription_token": user["subscription_token"]}
 
 
 @app.post("/api/admin/users/{user_id}/revoke", dependencies=[Depends(require_admin)])
@@ -1766,6 +2108,7 @@ def admin_revoke_subscription(user_id: str, body: dict) -> dict:
   state change and remove the user from xray. /sub/{token} starts
   returning 404 immediately.
   """
+  user_id = _require_uuid(user_id)
   product_code = (body or {}).get("product_code") or ""
   if not product_code:
     raise HTTPException(status_code=400, detail="product_code is required")
@@ -1796,6 +2139,7 @@ def admin_revoke_subscription(user_id: str, body: dict) -> dict:
 @app.get("/api/admin/users/{user_id}/quotas", dependencies=[Depends(require_admin)])
 def admin_user_quotas(user_id: str) -> dict:
   """Per-product quota state for one user, after lazy period reset."""
+  user_id = _require_uuid(user_id)
   with connect() as conn:
     with conn.cursor() as cur:
       cur.execute("SELECT id::text FROM auth_users WHERE id = %s", (user_id,))
@@ -1814,6 +2158,7 @@ def admin_upsert_quota(user_id: str, req: QuotaUpsertRequest) -> dict:
   when an admin is lowering a limit and wants the user to have a clean
   period instead of being instantly over-quota.
   """
+  user_id = _require_uuid(user_id)
   if req.reset_kind == "monthly_anchor" and req.reset_anchor_day is None:
     raise HTTPException(status_code=400,
                         detail="reset_anchor_day is required when reset_kind=monthly_anchor")
@@ -1889,6 +2234,7 @@ def admin_upsert_quota(user_id: str, req: QuotaUpsertRequest) -> dict:
 @app.delete("/api/admin/users/{user_id}/quota/{product_code}",
              dependencies=[Depends(require_admin)])
 def admin_delete_quota(user_id: str, product_code: str) -> dict:
+  user_id = _require_uuid(user_id)
   with connect() as conn:
     with conn.cursor() as cur:
       cur.execute("SELECT id FROM products WHERE code = %s", (product_code,))
@@ -1907,6 +2253,7 @@ def admin_delete_quota(user_id: str, product_code: str) -> dict:
 
 @app.post("/api/admin/users/{user_id}/admin")
 def admin_toggle_admin(user_id: str, body: dict, caller: dict = Depends(require_admin)) -> dict:
+  user_id = _require_uuid(user_id)
   is_admin = bool(body.get("is_admin", False))
   # Don't let an interactive admin demote themselves — they'd lock
   # themselves out and need DB access to recover. The service-token
@@ -1967,6 +2314,172 @@ def admin_create_product(req: ProductCreateRequest) -> dict:
   return {"product": row}
 
 
+@app.patch("/api/admin/products/{product_id}", dependencies=[Depends(require_admin)])
+def admin_patch_product(product_id: int, req: ProductPatchRequest) -> dict:
+  """Edit a generic product. Use admin_patch_xout_product for xout-specific
+  fields (inbound_selector). Code and id are immutable -- delete + recreate
+  if you need to rename."""
+  fields: list[tuple[str, Any]] = []
+  data = req.model_dump(exclude_unset=True)
+  for k, v in data.items():
+    if k in ("name", "description", "metadata"):
+      fields.append((k, _to_jsonb(v)))
+    else:
+      fields.append((k, v))
+  if not fields:
+    return admin_list_products()  # nothing to do; return current state
+  set_clause = ", ".join(
+    f"{k} = %s::jsonb" if k in ("name", "description", "metadata") else f"{k} = %s"
+    for k, _ in fields
+  )
+  params = [v for _, v in fields] + [product_id]
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        f"""
+        UPDATE products SET {set_clause}, updated_at = NOW()
+        WHERE id = %s
+        RETURNING id, code, kind, price_cents, currency, period_days,
+                  stripe_price_id, name, description, metadata, active
+        """,
+        params,
+      )
+      row = cur.fetchone()
+      if row is None:
+        raise HTTPException(status_code=404, detail="product not found")
+    conn.commit()
+  return {"product": row}
+
+
+@app.delete("/api/admin/products/{product_id}",
+             dependencies=[Depends(require_admin)])
+def admin_delete_product(product_id: int) -> dict:
+  """Hard-delete a product. Refuses when any non-terminal subscription
+  references it -- the operator must cancel those first. Canceled /
+  expired sub rows are also cleaned up (subscriptions.product_id has
+  ON DELETE RESTRICT, so we have to remove them before deleting the
+  product). Payments / usage_events use ON DELETE SET NULL so their
+  history is preserved with a NULL product_id."""
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT COUNT(*) AS n FROM subscriptions "
+        " WHERE product_id = %s AND status IN ('active', 'pending', 'over_quota')",
+        (product_id,),
+      )
+      n = (cur.fetchone() or {}).get("n", 0)
+      if n and n > 0:
+        raise HTTPException(
+          status_code=409,
+          detail=f"product has {n} active or pending subscription(s); cancel them first",
+        )
+      # Remove canceled/expired sub rows (FK ON DELETE RESTRICT would
+      # otherwise block the product DELETE).
+      cur.execute(
+        "DELETE FROM subscriptions WHERE product_id = %s "
+        " AND status IN ('canceled', 'expired')",
+        (product_id,),
+      )
+      cur.execute("DELETE FROM products WHERE id = %s RETURNING id", (product_id,))
+      row = cur.fetchone()
+    conn.commit()
+  if row is None:
+    raise HTTPException(status_code=404, detail="product not found")
+  return {"deleted": True, "id": row["id"]}
+
+
+@app.get("/api/admin/orders", dependencies=[Depends(require_admin)])
+def admin_list_orders(
+  user_id: str | None = None,
+  product_code: str | None = None,
+  status: str | None = None,
+  limit: int = 100,
+  offset: int = 0,
+) -> dict:
+  """Browse the payments + subscriptions ledger.
+
+  Joined view: each payment row carries the user (email + username),
+  the product (code + name), the subscription (id + status if any),
+  amount, currency, status, and Stripe identifiers. Optional filters
+  for the operator's audit workflows.
+  """
+  limit = max(1, min(int(limit or 100), 500))
+  offset = max(0, int(offset or 0))
+  conds: list[str] = []
+  params: list[Any] = []
+  if user_id:
+    conds.append("p.user_id = %s::uuid")
+    params.append(user_id)
+  if product_code:
+    conds.append("pr.code = %s")
+    params.append(product_code)
+  if status:
+    conds.append("p.status = %s")
+    params.append(status)
+  where = ("WHERE " + " AND ".join(conds)) if conds else ""
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        f"""
+        SELECT p.id, p.user_id::text AS user_id,
+               u.username, u.primary_email,
+               p.product_id, pr.code AS product_code, pr.name AS product_name,
+               p.amount_cents, p.currency, p.status,
+               p.stripe_payment_intent_id, p.stripe_event_id,
+               p.created_at, p.metadata,
+               (SELECT s.id FROM subscriptions s
+                 WHERE s.user_id = p.user_id AND s.product_id = p.product_id
+                 ORDER BY s.starts_at DESC LIMIT 1) AS subscription_id,
+               (SELECT s.status FROM subscriptions s
+                 WHERE s.user_id = p.user_id AND s.product_id = p.product_id
+                 ORDER BY s.starts_at DESC LIMIT 1) AS subscription_status,
+               (SELECT s.expires_at FROM subscriptions s
+                 WHERE s.user_id = p.user_id AND s.product_id = p.product_id
+                 ORDER BY s.starts_at DESC LIMIT 1) AS subscription_expires_at
+          FROM payments p
+          LEFT JOIN auth_users u ON u.id = p.user_id
+          LEFT JOIN products pr ON pr.id = p.product_id
+          {where}
+         ORDER BY p.created_at DESC
+         LIMIT %s OFFSET %s
+        """,
+        (*params, limit, offset),
+      )
+      rows = cur.fetchall()
+      cur.execute(
+        f"SELECT COUNT(*) AS n FROM payments p"
+        f" LEFT JOIN auth_users u ON u.id = p.user_id"
+        f" LEFT JOIN products pr ON pr.id = p.product_id {where}",
+        params,
+      )
+      total = (cur.fetchone() or {}).get("n", 0)
+  return {"orders": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/admin/users/{user_id}/payments", dependencies=[Depends(require_admin)])
+def admin_user_payments(user_id: str) -> dict:
+  """Per-user payment history -- shown on the admin user-detail page so
+  operators can quickly answer "what has this user paid for?" """
+  user_id = _require_uuid(user_id)
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        """
+        SELECT p.id, p.product_id, pr.code AS product_code, pr.name AS product_name,
+               p.amount_cents, p.currency, p.status,
+               p.stripe_payment_intent_id, p.stripe_event_id,
+               p.created_at, p.metadata
+          FROM payments p
+          LEFT JOIN products pr ON pr.id = p.product_id
+         WHERE p.user_id = %s::uuid
+         ORDER BY p.created_at DESC
+        """,
+        (user_id,),
+      )
+      rows = cur.fetchall()
+  return {"payments": rows}
+
+
 # ---------------------------------------------------------------------------
 # Xout product management — admin endpoints
 # ---------------------------------------------------------------------------
@@ -1992,7 +2505,15 @@ class XoutProductCreateRequest(BaseModel):
 
 
 class XoutProductPatchRequest(BaseModel):
+  # ``kind`` and ``currency`` are accepted (admin SPA's edit form sends
+  # them on every save). Without them in the model, pydantic silently
+  # dropped the values and the operator's edits looked like they
+  # saved but never reached the DB. Mirrors the shape of
+  # ``ProductPatchRequest`` so non-xout vs xout patch surfaces are
+  # consistent.
+  kind: str | None = Field(default=None, pattern=r"^(one_time|recurring|period)$")
   price_cents: int | None = Field(default=None, ge=0, le=100_000_000)
+  currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
   period_days: int | None = Field(default=None, ge=1, le=3650)
   name: dict[str, str] | None = None
   description: dict[str, str] | None = None
@@ -2107,7 +2628,7 @@ def admin_patch_xout_product(product_id: int, req: XoutProductPatchRequest) -> d
     _validate_xout_selector(req.inbound_selector)
   prod_fields: list[str] = []
   prod_params: list[Any] = []
-  for k in ("price_cents", "period_days", "active"):
+  for k in ("kind", "currency", "price_cents", "period_days", "active"):
     v = getattr(req, k, None)
     if v is not None:
       prod_fields.append(f"{k} = %s")
@@ -2172,14 +2693,14 @@ def admin_delete_xout_product(product_id: int) -> dict:
         raise HTTPException(status_code=404, detail="product not found")
       cur.execute(
         "SELECT count(*) AS n FROM subscriptions "
-        "WHERE product_id = %s AND status = 'active'",
+        " WHERE product_id = %s AND status IN ('active', 'pending', 'over_quota')",
         (product_id,),
       )
       active_n = (cur.fetchone() or {}).get("n", 0)
       if active_n:
         raise HTTPException(
           status_code=409,
-          detail=(f"product '{prod['code']}' has {active_n} active "
+          detail=(f"product '{prod['code']}' has {active_n} non-terminal "
                   f"subscription(s); cancel them first, or just set "
                   f"the product inactive instead of deleting it"),
         )
@@ -2219,8 +2740,11 @@ def subscription_qr(token: str, size: int = 196) -> Response:
   size = max(64, min(512, size))
   with connect() as conn:
     with conn.cursor() as cur:
-      cur.execute("SELECT 1 FROM subscriptions WHERE subscription_token = %s",
-                  (token,))
+      cur.execute(
+        "SELECT 1 FROM auth_users "
+        " WHERE subscription_token = %s AND status = 'active'",
+        (token,),
+      )
       if cur.fetchone() is None:
         raise HTTPException(status_code=404, detail="not found")
   base = (os.getenv("PUBLIC_URL") or "https://user.develop.cc").rstrip("/")
@@ -2248,54 +2772,74 @@ def subscription_qr(token: str, size: int = 196) -> Response:
 
 @app.get("/sub/{token}")
 def subscription(token: str, format: str = "base64", request: Request = None) -> Response:
+  """Public, token-gated subscription endpoint.
+
+  Post-2026-05-06 user-system unification: ``token`` is the user's
+  ``auth_users.subscription_token`` -- one URL per user, never per
+  subscription. The response aggregates VLESS URIs from EVERY active
+  xout subscription that user holds. Buying / cancelling a product
+  changes the URL's content; the URL itself never rotates unless the
+  operator manually rolls the user's subscription_token.
+  """
   if not token or len(token) > 200 or not _looks_like_token(token):
     raise HTTPException(status_code=404, detail="not found")
   with connect() as conn:
     with conn.cursor() as cur:
       cur.execute(
         """
-        SELECT s.id, s.user_id::text AS user_id, s.status, s.expires_at,
-               p.id AS product_id, p.code, xp.inbound_selector
-        FROM subscriptions s
-        JOIN products p ON p.id = s.product_id
-        LEFT JOIN xout_products xp ON xp.product_id = p.id
-        WHERE s.subscription_token = %s
+        SELECT id::text AS user_id, username, status
+        FROM auth_users WHERE subscription_token = %s
         """,
         (token,),
       )
       row = cur.fetchone()
-  # Treat missing tokens, inactive subs, AND past-expiry subs all as
-  # 404 — same response so an attacker can't tell which token state
-  # they hit. Without the expiry check, a period-product whose
-  # expires_at has passed but whose status is still 'active' would
-  # keep handing out URIs forever.
-  if (row is None
-      or row["status"] != "active"
-      or (row.get("expires_at") is not None
-          and row["expires_at"] <= datetime.now(timezone.utc))):
+  # Missing token, disabled / deleted user → 404 (uniform error so an
+  # attacker can't tell which state they hit).
+  if row is None or row["status"] != "active":
     raise HTTPException(status_code=404, detail="not found")
-  # Refuse to hand out URIs when the user is over their period quota
-  # — otherwise clients keep using a stale subscription against a
-  # server that's already kicked them out. 410 Gone is the right
-  # signal for client subscription updaters.
+  user_id = row["user_id"]
+
+  # Build the inbound list across every active xout sub the user holds.
+  subs = _user_xout_subscriptions(user_id)
+  if not subs:
+    # No active xout subs (none ever granted, all canceled, all
+    # expired). Same 404 as a bad token to avoid information leakage.
+    raise HTTPException(status_code=404, detail="not found")
+
+  # Accumulate inbounds across every sub that's still under quota. If
+  # every active sub is over quota, return 410 Gone so client
+  # subscription updaters know to back off rather than spam the
+  # endpoint. Single DB pass: _ensure_quota_period may roll the
+  # period_start, so we only want to call it once per sub.
+  all_inbounds: list[dict] = []
+  primary_product_id: int | None = None
+  # Dedup keyed by (node, tag, port) so two products that overlap on
+  # the same physical inbound don't produce two identical VLESS URIs
+  # in the bundle.
+  seen: set[tuple] = set()
   with connect() as conn:
     with conn.cursor() as cur:
-      q = _ensure_quota_period(cur, row["user_id"], row["product_id"])
+      for s in subs:
+        q = _ensure_quota_period(cur, user_id, s["product_id"])
+        over_quota = (q is not None and q.get("limit_qty")
+                      and float(q["current_period_consumed"])
+                      >= float(q["limit_qty"]))
+        if over_quota:
+          continue
+        if primary_product_id is None:
+          primary_product_id = s["product_id"]
+        for ib in s["inbounds"]:
+          key = (ib.get("node_name"), ib.get("tag"), ib.get("port"))
+          if key in seen:
+            continue
+          seen.add(key)
+          all_inbounds.append(ib)
     conn.commit()
-  if q is not None and q["limit_qty"] and \
-     float(q["current_period_consumed"]) >= float(q["limit_qty"]):
+  if primary_product_id is None:
     raise HTTPException(status_code=410,
                         detail="quota exceeded for current period")
-  # Build the inbound list using the same code path /api/me uses, then
-  # render to URIs.
-  subs = _user_xout_subscriptions(row["user_id"])
-  this_sub = next((s for s in subs if s["subscription_id"] == row["id"]), None)
-  if this_sub is None:
-    # Either the user_xout_subscriptions filter said no match (sub
-    # exists but xout_products row is missing) or the subscription
-    # isn't xout. Treat as 404 either way.
-    raise HTTPException(status_code=404, detail="not a xout subscription")
-  uris = _build_subscription_uris(row["user_id"], row["id"], this_sub["inbounds"])
+
+  uris = _build_subscription_uris(user_id, 0, all_inbounds)
   body = "\n".join(uris).encode("utf-8")
   # CORS: /sub/{token} is a public, token-gated endpoint. Allowing
   # cross-origin reads lets the operator's admin SPA fetch + preview
@@ -2306,19 +2850,16 @@ def subscription(token: str, format: str = "base64", request: Request = None) ->
                     "Subscription-Userinfo, Content-Disposition, "
                     "profile-update-interval"}
   # filename hint — Clash GUI clients display this as the subscription
-  # name. Without it they fall back to the URL's last segment, which is
-  # the opaque token (looks like noise to operators). Some clients
-  # (clash-party) display the filename verbatim including any
-  # extension, so we deliberately omit the .yaml suffix — the
-  # Content-Type already declares the format, and "oversea" reads
-  # cleaner than "oversea.yaml" in the sub list.
-  fname = (row.get("code") or "subscription").replace('"', "")
+  # name. Pick the username so the operator sees who the sub is for;
+  # if multiple products are aggregated this is more meaningful than
+  # any single product code.
+  fname = (row.get("username") or "subscription").replace('"', "")
   if format == "raw":
     return Response(content=body,
                     media_type="text/plain; charset=utf-8",
                     headers=base_headers)
   if format in ("clash", "yaml"):
-    yaml_text = _build_clash_yaml(this_sub["inbounds"])
+    yaml_text = _build_clash_yaml(all_inbounds)
     # profile-update-interval (hours) tells Clash clients how often to
     # auto-refresh the sub. 24h is the convention.
     return Response(content=yaml_text.encode("utf-8"),
@@ -2328,7 +2869,7 @@ def subscription(token: str, format: str = "base64", request: Request = None) ->
                                f'attachment; filename="{fname}"',
                              "profile-update-interval": "24",
                              "Subscription-Userinfo":
-                               _build_userinfo_header(row["user_id"], row["product_id"])})
+                               _build_userinfo_header(user_id, primary_product_id)})
   # Default: base64 (newline-separated URIs, then the whole thing
   # base64-encoded). v2rayN / Streisand / Shadowrocket all expect this.
   import base64 as _b64
@@ -2340,7 +2881,7 @@ def subscription(token: str, format: str = "base64", request: Request = None) ->
                              f'attachment; filename="{fname}"',
                            "profile-update-interval": "24",
                            "Subscription-Userinfo":
-                             _build_userinfo_header(row["user_id"], row["product_id"])})
+                             _build_userinfo_header(user_id, primary_product_id)})
 
 
 _TOKEN_RE = None
@@ -2390,9 +2931,9 @@ def _build_userinfo_header(user_id: str, product_id: int) -> str:
 
 # ---------------------------------------------------------------------------
 # /api/internal/xout/* endpoints removed in the xout-merge refactor.
-# xout now reads/writes the same tables (xout_node_users, usage_events,
-# xout_node_inbounds, usage_quotas) directly; user-service no longer
-# proxies for it.
+# xout now reads from auth_users + subscriptions + xout_products and
+# writes to usage_events / usage_quotas / xout_node_inbounds directly;
+# user-service no longer proxies for it.
 # ---------------------------------------------------------------------------
 
 
@@ -2513,6 +3054,83 @@ def create_checkout_session(req: CheckoutSessionRequest,
   return {"url": session.url, "session_id": session.id}
 
 
+@app.post("/api/me/billing/portal")
+def me_billing_portal(user: dict = Depends(get_current_user)) -> dict:
+  """Mint a Stripe customer-portal session URL for the current user.
+
+  The portal lets the user manage their saved payment methods, view
+  invoices, and cancel/upgrade subscriptions without us having to
+  reimplement those flows. We look up (or create) a stripe Customer
+  keyed off the user's UUID stored in metadata.
+  """
+  stripe = _stripe_client()
+  base = (os.getenv("PUBLIC_URL") or "https://user.develop.cc").rstrip("/")
+  return_url = base + "/?from=billing-portal"
+  email = (user.get("primary_email") or "").strip()
+  uid = str(user.get("id") or "")
+  if not uid:
+    raise HTTPException(status_code=400, detail="user not loaded")
+
+  # Reuse a customer that's already attached to this user. We tag
+  # ``metadata.user_id`` on every Customer we create, so search by
+  # that gives us O(1) lookup most of the time.
+  #
+  # Stripe's Customer.search isn't available on every API key/version
+  # (it depends on the account being on a search-enabled API version).
+  # If it raises, fall back to listing by email; that's eventually
+  # consistent and slower but it prevents us from creating a brand-new
+  # Customer every time the user clicks the billing-portal button --
+  # which would leak Customer rows on each click and confuse Stripe
+  # accounting.
+  customer_id: str | None = None
+  try:
+    found = stripe.Customer.search(
+      query=f"metadata['user_id']:'{uid}'", limit=1)
+    customer_id = (found and found.data and found.data[0].id) or None
+  except Exception:  # noqa: BLE001 -- search may be unavailable on dev keys
+    if email:
+      try:
+        listed = stripe.Customer.list(email=email, limit=10)
+        for c in (listed.data or []):
+          if (c.metadata or {}).get("user_id") == uid:
+            customer_id = c.id
+            break
+        # No metadata-tagged match? If exactly one Customer has this
+        # email, it's safe to claim it (avoids creating a duplicate
+        # for a real human who's been in the system without metadata).
+        # Re-stamp metadata on that Customer so future lookups hit
+        # the search-by-metadata fast path.
+        if customer_id is None and listed.data and len(listed.data) == 1:
+          claim = listed.data[0]
+          customer_id = claim.id
+          try:
+            stripe.Customer.modify(customer_id, metadata={"user_id": uid})
+          except Exception:  # noqa: BLE001
+            LOGGER.exception("could not stamp metadata on existing Customer %s",
+                             customer_id)
+      except Exception:  # noqa: BLE001
+        LOGGER.exception("stripe Customer.list fallback failed")
+  if not customer_id:
+    try:
+      customer = stripe.Customer.create(
+        email=email or None,
+        name=user.get("display_name") or user.get("username") or None,
+        metadata={"user_id": uid},
+      )
+      customer_id = customer.id
+    except Exception as exc:  # noqa: BLE001
+      LOGGER.exception("stripe Customer.create failed")
+      raise HTTPException(status_code=502, detail=f"stripe error: {exc}")
+
+  try:
+    session = stripe.billing_portal.Session.create(
+      customer=customer_id, return_url=return_url)
+  except Exception as exc:  # noqa: BLE001
+    LOGGER.exception("stripe billing_portal.Session.create failed")
+    raise HTTPException(status_code=502, detail=f"stripe error: {exc}")
+  return {"url": session.url}
+
+
 @app.post("/api/stripe/webhook")
 async def stripe_webhook(request: Request) -> dict:
   """Stripe → us. Verify signature, then handle the event idempotently.
@@ -2591,8 +3209,6 @@ async def stripe_webhook(request: Request) -> dict:
       # has), we *extend* expires_at instead of NO-OPing on conflict;
       # otherwise recurring subs would never expire AND never count
       # the renewal payment as anything that grants more access.
-      import secrets as _secrets
-      sub_token = _secrets.token_urlsafe(24)
       expires_at = None
       period = product["period_days"] or 30  # fallback for kind=recurring without period_days
       if product["kind"] in ("period", "recurring") and period:
@@ -2606,18 +3222,57 @@ async def stripe_webhook(request: Request) -> dict:
       )
       existing_sub = cur.fetchone()
       if existing_sub is None:
-        cur.execute(
-          """
-          INSERT INTO subscriptions
-            (user_id, product_id, status, starts_at, expires_at, source,
-             subscription_token, metadata)
-          VALUES (%s, %s, 'active', NOW(), %s, 'stripe', %s, %s::jsonb)
-          RETURNING id
-          """,
-          (user_id, product_id, expires_at, sub_token,
-           _to_jsonb({"stripe_payment_id": payment_row["id"]})),
-        )
-        sub_row = cur.fetchone()
+        # SAVEPOINT lets us catch a concurrent-webhook race (the partial
+        # unique index would block a duplicate active sub) without
+        # losing the payments row we just inserted in the same txn.
+        cur.execute("SAVEPOINT before_sub_insert")
+        try:
+          cur.execute(
+            """
+            INSERT INTO subscriptions
+              (user_id, product_id, status, starts_at, expires_at, source, metadata)
+            VALUES (%s, %s, 'active', NOW(), %s, 'stripe', %s::jsonb)
+            RETURNING id
+            """,
+            (user_id, product_id, expires_at,
+             _to_jsonb({"stripe_payment_id": payment_row["id"]})),
+          )
+          sub_row = cur.fetchone()
+          cur.execute("RELEASE SAVEPOINT before_sub_insert")
+        except psycopg.errors.UniqueViolation:
+          # Concurrent webhook delivery beat us to the INSERT. Roll back
+          # to the savepoint (keeps the payments row), re-read the
+          # winner's sub row, then -- for period/recurring products --
+          # apply the same expiry-extension as the regular renewal path
+          # so the second payment doesn't silently get a free ride. If
+          # we just took the winner's sub as-is, this user paid twice
+          # but only got one period of service.
+          cur.execute("ROLLBACK TO SAVEPOINT before_sub_insert")
+          cur.execute(
+            "SELECT id, expires_at FROM subscriptions "
+            " WHERE user_id=%s AND product_id=%s AND status='active'",
+            (user_id, product_id),
+          )
+          existing_sub = cur.fetchone()
+          if existing_sub is not None and expires_at is not None:
+            from_dt = max(datetime.now(timezone.utc),
+                          (existing_sub["expires_at"] or datetime.now(timezone.utc)))
+            new_exp = from_dt + timedelta(days=period)
+            cur.execute(
+              """
+              UPDATE subscriptions SET expires_at=%s, updated_at=NOW()
+              WHERE id=%s RETURNING id
+              """,
+              (new_exp, existing_sub["id"]),
+            )
+            sub_row = cur.fetchone()
+            LOGGER.info(
+              "stripe webhook extended sub (after concurrent-insert race) "
+              "user=%s product=%s to %s",
+              user_id, product_code, new_exp,
+            )
+          else:
+            sub_row = existing_sub
       elif expires_at is not None:
         # Renewal — extend expiry from the later of (now, current expiry)
         # so users who renew early don't lose remaining time.
@@ -2636,27 +3291,9 @@ async def stripe_webhook(request: Request) -> dict:
                      user_id, product_code, new_exp)
       else:
         sub_row = None
-      # If a subscription was just created and it's an xout product, eagerly
-      # provision xout_node_users so /sub/{token} works immediately.
-      if sub_row is not None:
-        cur.execute(
-          "SELECT inbound_selector FROM xout_products WHERE product_id = %s",
-          (product_id,),
-        )
-        xp = cur.fetchone()
-        if xp is not None:
-          import uuid as _uuid
-          for n in (xp["inbound_selector"] or {}).get("nodes") or []:
-            if not n.get("name"):
-              continue
-            cur.execute(
-              """
-              INSERT INTO xout_node_users (node_name, user_id, vless_uuid, provisioned_at, last_seen_at)
-              VALUES (%s, %s, %s::uuid, NOW(), NOW())
-              ON CONFLICT (node_name, user_id) DO NOTHING
-              """,
-              (n["name"], user_id, str(_uuid.uuid4())),
-            )
+      # No xout-side provisioning needed: xout containers read user
+      # state from auth_users + subscriptions + xout_products on every
+      # tick, and the user's VLESS UUID is on auth_users (not per node).
     conn.commit()
   LOGGER.info("stripe webhook handled event=%s user=%s product=%s",
                event_id, user_id, product_code)
@@ -2804,13 +3441,33 @@ async def oauth_callback(provider: str, code: str | None = None,
             synth_email = email
           else:
             synth_email = f"{provider}-{provider_user_id}@oauth.local"
+          # username is NOT NULL on auth_users. Derive from email's
+          # local part with collision suffix; OAuth signups must not
+          # 500 just because two providers happen to give us the
+          # same local part.
+          local = re.sub(r"[^a-z0-9_.-]", "",
+                         synth_email.split("@", 1)[0].lower())
+          base_username = local or f"{provider}_{provider_user_id}"
+          candidate = base_username
+          attempt = 0
+          while True:
+            cur.execute("SELECT 1 FROM auth_users WHERE LOWER(username) = LOWER(%s)",
+                        (candidate,))
+            if cur.fetchone() is None:
+              break
+            attempt += 1
+            candidate = f"{base_username}_{attempt}"
+            if attempt > 99:
+              raise HTTPException(status_code=503,
+                                  detail="could not allocate username")
           cur.execute(
             """
-            INSERT INTO auth_users (primary_email, display_name, locale, is_admin, status, metadata)
-            VALUES (%s, %s, %s, %s, 'active', %s::jsonb)
+            INSERT INTO auth_users (username, primary_email, display_name, locale,
+                                     is_admin, status, metadata)
+            VALUES (%s, %s, %s, %s, %s, 'active', %s::jsonb)
             RETURNING id::text
             """,
-            (synth_email, name or None, DEFAULT_LOCALE, is_first,
+            (candidate, synth_email, name or None, DEFAULT_LOCALE, is_first,
              _to_jsonb({"source": "oauth", "provider": provider,
                          "provider_email": email,
                          "provider_email_verified": email_verified})),
@@ -2892,31 +3549,8 @@ def list_oauth_providers() -> dict:
   return {"providers": available}
 
 
-@app.patch("/api/admin/products/{product_id}", dependencies=[Depends(require_admin)])
-def admin_patch_product(product_id: int, req: ProductPatchRequest) -> dict:
-  fields: list[str] = []
-  params: list[Any] = []
-  for k, v in req.model_dump(exclude_unset=True).items():
-    if k in ("name", "description", "metadata"):
-      fields.append(f"{k} = %s::jsonb")
-      params.append(_to_jsonb(v))
-    else:
-      fields.append(f"{k} = %s")
-      params.append(v)
-  if not fields:
-    raise HTTPException(status_code=400, detail="no fields to update")
-  fields.append("updated_at = NOW()")
-  params.append(product_id)
-  with connect() as conn:
-    with conn.cursor() as cur:
-      cur.execute(
-        f"UPDATE products SET {', '.join(fields)} WHERE id = %s "
-        f"RETURNING id, code, kind, price_cents, currency, period_days, "
-        f"stripe_price_id, name, description, metadata, active",
-        params,
-      )
-      row = cur.fetchone()
-      if row is None:
-        raise HTTPException(status_code=404, detail="product not found")
-    conn.commit()
-  return {"product": row}
+# NOTE: /api/admin/products/{product_id} PATCH handler lives near the
+# other product CRUD endpoints (search for ``admin_patch_product``).
+# An older second copy used to live here; it was unreachable (FastAPI
+# resolves to the first registered route) and has been removed to
+# avoid the next reader thinking it's the live code path.

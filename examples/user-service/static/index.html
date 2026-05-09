@@ -3,7 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>User Service</title>
+  <title>Develop · Account</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <style>
     :root {
       --bg: #faf8f5;
@@ -192,13 +196,80 @@
       font-size: 12px;
     }
     .hidden { display: none !important; }
+    /* Admin panel ----------------------------------------------------- */
+    .admin-tab {
+      background: transparent;
+      border: 0;
+      padding: 8px 14px;
+      font-size: 13px;
+      color: var(--muted);
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+      cursor: pointer;
+    }
+    .admin-tab:hover { color: var(--text); }
+    .admin-tab.active {
+      color: var(--primary);
+      border-bottom-color: var(--primary);
+      font-weight: 500;
+    }
+    .admin-pane { padding: 4px 0; }
+    .admin-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .admin-table th, .admin-table td {
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .admin-table th {
+      font-weight: 500;
+      font-size: 11px;
+      text-transform: uppercase;
+      color: var(--muted);
+      letter-spacing: 0.04em;
+    }
+    .admin-table tr:hover td { background: var(--bg); }
+    .admin-toolbar {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+      align-items: center;
+    }
+    .admin-toolbar input[type=text] {
+      flex: 1;
+      padding: 6px 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-size: 13px;
+    }
+    .admin-modal-bg {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.4);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 1000;
+    }
+    .admin-modal {
+      background: var(--surface); border-radius: 8px;
+      padding: 20px; width: 92%; max-width: 720px;
+      max-height: 90vh; overflow: auto;
+    }
+    .badge {
+      display: inline-block; padding: 2px 8px; font-size: 11px;
+      border-radius: 999px; background: var(--bg); color: var(--muted);
+    }
+    .badge.ok { background: #e8f4ea; color: var(--success); }
+    .badge.err { background: var(--error-bg); color: var(--error); }
+    .muted { color: var(--muted); }
   </style>
 </head>
 <body>
   <header>
-    <div>
-      <span class="brand">User Service</span>
-      <span class="brand-sub" id="brand-sub">— BitsFactor 平台账号</span>
+    <div style="display:flex; align-items:center; gap:8px;">
+      <img src="/favicon-32.png" alt="" style="width:20px; height:20px;">
+      <span class="brand">Develop</span>
+      <span class="brand-sub" id="brand-sub">— Account · BitsFactor LLC</span>
     </div>
     <button class="lang-toggle" id="lang-btn">EN</button>
   </header>
@@ -271,7 +342,7 @@
     <!-- ============ Signup form ============ -->
     <section id="signup-card" class="card hidden">
       <h1 data-i18n="signup.title">注册</h1>
-      <p class="subtitle" data-i18n="signup.subtitle">创建一个账号以使用 BitsFactor 平台的所有服务。</p>
+      <p class="subtitle" data-i18n="signup.subtitle">创建一个 Develop 账号,跨产品共享身份。</p>
       <div id="signup-error" class="alert alert-error hidden"></div>
       <form id="signup-form" autocomplete="on">
         <div class="field">
@@ -296,13 +367,31 @@
 
     <!-- ============ Account / "Me" view ============ -->
     <section id="me-card" class="card me-card hidden">
-      <h1 data-i18n="me.title">我的账号</h1>
-      <p class="subtitle" data-i18n="me.subtitle">账号详情和已订阅服务。</p>
+      <div class="row" style="justify-content: space-between; align-items: baseline; gap: 12px;">
+        <div>
+          <h1 data-i18n="me.title">我的账号</h1>
+          <p class="subtitle" data-i18n="me.subtitle">账号详情和已订阅服务。</p>
+        </div>
+        <a id="admin-nav" href="#admin" class="btn btn-ghost hidden"
+           style="padding: 6px 12px;" data-i18n="me.admin_panel">管理后台</a>
+      </div>
       <div id="me-success" class="alert alert-success hidden"></div>
       <div id="verify-banner" class="alert alert-warn hidden" style="background: #fdf2ec; color: #b34a25"></div>
+
+      <!-- Xout subscription URL (hoisted to the top — this is the most
+           operationally useful thing on this page for Xout users). -->
+      <div class="subs-section" id="xout-section" hidden>
+        <h2 data-i18n="me.xout">Xout 订阅</h2>
+        <div id="me-xout"></div>
+      </div>
+
       <div class="me-row">
         <span class="me-label" data-i18n="field.email">邮箱</span>
         <span class="me-value" id="me-email">—</span>
+      </div>
+      <div class="me-row">
+        <span class="me-label" data-i18n="me.username">用户名</span>
+        <span class="me-value" id="me-username">—</span>
       </div>
       <div class="me-row">
         <span class="me-label" data-i18n="me.display_name">显示名</span>
@@ -334,9 +423,12 @@
         <div id="me-quotas"></div>
       </div>
 
-      <div class="subs-section" id="xout-section" hidden>
-        <h2 data-i18n="me.xout">Xout 服务</h2>
-        <div id="me-xout"></div>
+      <div class="subs-section">
+        <h2 data-i18n="me.billing">付款管理</h2>
+        <p class="muted" style="font-size: 13px; margin: 6px 0 10px;"
+           data-i18n="me.billing_desc">管理保存的支付方式、查看账单、取消或升级订阅。</p>
+        <button class="btn btn-ghost" id="open-billing-portal-btn"
+                data-i18n="me.billing_open">打开 Stripe 客户中心</button>
       </div>
 
       <div class="subs-section">
@@ -360,6 +452,28 @@
                 data-i18n="me.save">保存修改</button>
       </div>
     </section>
+
+    <!-- ============ Admin panel ============ -->
+    <section id="admin-card" class="card hidden" style="max-width: 1100px;">
+      <div class="row" style="justify-content: space-between; align-items: baseline; gap: 12px;">
+        <div>
+          <h1 data-i18n="admin.title">管理后台</h1>
+          <p class="subtitle" data-i18n="admin.subtitle">用户、产品、订单与订阅。</p>
+        </div>
+        <a href="#" class="btn btn-ghost" id="admin-back-btn"
+           style="padding: 6px 12px;" data-i18n="admin.back">返回我的账号</a>
+      </div>
+      <div class="admin-tabs" style="display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin: 14px 0 16px;">
+        <button class="admin-tab" data-tab="users" data-i18n="admin.tab_users">用户</button>
+        <button class="admin-tab" data-tab="products" data-i18n="admin.tab_products">产品</button>
+        <button class="admin-tab" data-tab="xout" data-i18n="admin.tab_xout">Xout 商品</button>
+        <button class="admin-tab" data-tab="orders" data-i18n="admin.tab_orders">订单</button>
+      </div>
+      <div id="admin-pane-users" class="admin-pane hidden"></div>
+      <div id="admin-pane-products" class="admin-pane hidden"></div>
+      <div id="admin-pane-xout" class="admin-pane hidden"></div>
+      <div id="admin-pane-orders" class="admin-pane hidden"></div>
+    </section>
   </main>
 
   <footer>
@@ -371,14 +485,14 @@
   // ----- i18n catalog -----
   const I18N = {
     "zh-CN": {
-      "brand.sub": "— BitsFactor 平台账号",
+      "brand.sub": "— 账号 · BitsFactor LLC",
       "login.title": "登录",
       "login.subtitle": "登录到你的账号以访问已订阅的服务。",
       "login.submit": "登录",
       "login.no_account": "还没有账号?",
       "login.signup_link": "立即注册",
       "signup.title": "注册",
-      "signup.subtitle": "创建一个账号以使用 BitsFactor 平台的所有服务。",
+      "signup.subtitle": "创建一个 Develop 账号,跨产品共享身份。",
       "signup.submit": "创建账号",
       "signup.has_account": "已有账号?",
       "signup.login_link": "前往登录",
@@ -448,16 +562,28 @@
       "me.session_last_used": "最近活动",
       "err.network": "网络错误,请重试。",
       "err.unknown": "未知错误。",
+      "me.username": "用户名",
+      "me.admin_panel": "管理后台",
+      "me.billing": "付款管理",
+      "me.billing_desc": "管理保存的支付方式、查看账单、取消或升级订阅。",
+      "me.billing_open": "打开 Stripe 客户中心",
+      "admin.title": "管理后台",
+      "admin.subtitle": "用户、产品、订单与订阅。",
+      "admin.back": "返回我的账号",
+      "admin.tab_users": "用户",
+      "admin.tab_products": "产品",
+      "admin.tab_xout": "Xout 商品",
+      "admin.tab_orders": "订单",
     },
     "en-US": {
-      "brand.sub": "— BitsFactor platform account",
+      "brand.sub": "— Account · BitsFactor LLC",
       "login.title": "Sign in",
       "login.subtitle": "Sign in to access services you've subscribed to.",
       "login.submit": "Sign in",
       "login.no_account": "Don't have an account?",
       "login.signup_link": "Create one",
       "signup.title": "Sign up",
-      "signup.subtitle": "Create an account to use any service on the BitsFactor platform.",
+      "signup.subtitle": "Create a Develop account — one identity across our products.",
       "signup.submit": "Create account",
       "signup.has_account": "Already have an account?",
       "signup.login_link": "Sign in",
@@ -527,6 +653,18 @@
       "me.session_last_used": "Last activity",
       "err.network": "Network error. Please try again.",
       "err.unknown": "Something went wrong.",
+      "me.username": "Username",
+      "me.admin_panel": "Admin",
+      "me.billing": "Billing",
+      "me.billing_desc": "Manage saved payment methods, invoices, and subscriptions.",
+      "me.billing_open": "Open Stripe customer portal",
+      "admin.title": "Admin",
+      "admin.subtitle": "Users, products, orders, and subscriptions.",
+      "admin.back": "Back to my account",
+      "admin.tab_users": "Users",
+      "admin.tab_products": "Products",
+      "admin.tab_xout": "Xout products",
+      "admin.tab_orders": "Orders",
     },
   };
 
@@ -592,9 +730,14 @@
     login:  document.getElementById("login-card"),
     signup: document.getElementById("signup-card"),
     me:     document.getElementById("me-card"),
+    admin:  document.getElementById("admin-card"),
     forgot: document.getElementById("forgot-card"),
     reset:  document.getElementById("reset-card"),
   };
+
+  // Cached "me" payload — admin pane needs to know the current user
+  // is an admin before fetching admin endpoints (server enforces too).
+  let CURRENT_ME = null;
 
   function show(name) {
     for (const [k, el] of Object.entries(cards)) el.classList.toggle("hidden", k !== name);
@@ -602,6 +745,11 @@
     for (const id of ["login-error", "signup-error", "me-success"]) {
       const el = document.getElementById(id);
       if (el) el.classList.add("hidden");
+    }
+    if (name === "admin") {
+      // Lazy-init admin tabs on first entry.
+      if (!Admin.initialized) Admin.init();
+      Admin.openTab(Admin.currentTab || "users");
     }
   }
 
@@ -612,6 +760,33 @@
   }
 
   // ----- Login -----
+  // Cross-product deep-link helper: chatbot etc. send users here with
+  // `?return_to=https://<product>/<path>`. After a successful sign-in /
+  // sign-up we bounce them back. We only honour return_to when the URL
+  // resolves to a same-suffix domain (develop.cc / bitsfactor.com) so a
+  // crafted link can't redirect a logged-in user off-platform.
+  const RETURN_TO_ALLOWED_SUFFIXES = [".develop.cc", ".bitsfactor.com"];
+  function returnToUrlIfTrusted() {
+    try {
+      const raw = new URL(window.location.href).searchParams.get("return_to");
+      if (!raw) return null;
+      const target = new URL(raw, window.location.origin);
+      if (target.protocol !== "https:" && target.protocol !== "http:") return null;
+      const host = target.hostname.toLowerCase();
+      const trusted = RETURN_TO_ALLOWED_SUFFIXES.some(
+        (suf) => host === suf.slice(1) || host.endsWith(suf),
+      );
+      return trusted ? target.toString() : null;
+    } catch {
+      return null;
+    }
+  }
+  function maybeBounceBack() {
+    const dest = returnToUrlIfTrusted();
+    if (dest) window.location.href = dest;
+    return !!dest;
+  }
+
   document.getElementById("login-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -623,6 +798,7 @@
         password: fd.get("password"),
       });
       e.target.reset();
+      if (maybeBounceBack()) return;
       await loadMe();
     } catch (err) {
       showError("login-error", err.detail || t("err.unknown"));
@@ -644,6 +820,7 @@
         locale: LOCALE,
       });
       e.target.reset();
+      if (maybeBounceBack()) return;
       await loadMe();
     } catch (err) {
       showError("signup-error", err.detail || t("err.unknown"));
@@ -725,9 +902,58 @@
     }
   });
 
+  // ----- Stripe customer portal -----
+  const billingBtn = document.getElementById("open-billing-portal-btn");
+  if (billingBtn) {
+    billingBtn.addEventListener("click", async () => {
+      billingBtn.disabled = true;
+      const orig = billingBtn.textContent;
+      billingBtn.textContent = "…";
+      try {
+        const r = await api("POST", "/api/me/billing/portal");
+        if (r && r.url) window.location.href = r.url;
+        else throw { detail: "no portal URL" };
+      } catch (err) {
+        alert(err.detail || t("err.unknown"));
+      } finally {
+        billingBtn.disabled = false;
+        billingBtn.textContent = orig;
+      }
+    });
+  }
+
+  // ----- Hash-based router (admin/me) -----
+  function applyHashRoute() {
+    const h = (location.hash || "").replace(/^#\/?/, "").trim();
+    if (h === "admin") {
+      if (CURRENT_ME && CURRENT_ME.is_admin) {
+        show("admin");
+      } else {
+        // Non-admins shouldn't even see the panel; bounce back to me.
+        location.hash = "";
+      }
+    } else if (cards.me && !cards.me.classList.contains("hidden")) {
+      // already on me
+    } else if (CURRENT_ME) {
+      show("me");
+    }
+  }
+  window.addEventListener("hashchange", applyHashRoute);
+  const adminBackBtn = document.getElementById("admin-back-btn");
+  if (adminBackBtn) {
+    adminBackBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      location.hash = "";
+      show("me");
+    });
+  }
+
   // ----- "Me" rendering -----
   function renderMe(user, subs) {
+    CURRENT_ME = user;
     document.getElementById("me-email").textContent = user.email || "—";
+    const usernameEl = document.getElementById("me-username");
+    if (usernameEl) usernameEl.textContent = user.username || "—";
     document.getElementById("me-name").textContent  = user.display_name || t("me.empty_name");
     document.getElementById("me-locale").value      = user.locale || "zh-CN";
     document.getElementById("me-id").textContent    = user.id;
@@ -737,6 +963,9 @@
     pill.className = "pill" + (user.is_admin ? " pill-admin" : "");
     pill.textContent = user.is_admin ? t("me.role_admin") : t("me.role_user");
     roleEl.appendChild(pill);
+    // Admin nav button: visible only to admins.
+    const adminNav = document.getElementById("admin-nav");
+    if (adminNav) adminNav.classList.toggle("hidden", !user.is_admin);
 
     if (subs !== null) {
       const wrap = document.getElementById("me-subs");
@@ -1337,12 +1566,30 @@
   }
 
   // ----- URL token detection -----
-  // ?verify=TOK — auto-redeem on landing
-  // ?reset=TOK  — show reset form
+  // ?verify=TOK   — auto-redeem on landing
+  // ?reset=TOK    — show reset form
+  // ?view=signup  — open the signup card directly (for cross-product
+  //                 deep-links from chat.develop.cc / chatbot etc.)
+  // ?view=login   — open the login card (default behaviour, listed for
+  //                 symmetry — passing it just means we keep the URL
+  //                 around without changing the view)
   async function handleUrlTokens() {
     const url = new URL(window.location.href);
     const verifyTok = url.searchParams.get("verify");
     const resetTok = url.searchParams.get("reset");
+    const view = (url.searchParams.get("view") || "").toLowerCase();
+    if (view === "signup" || view === "login" || view === "forgot") {
+      // We don't strip the `view`/`return_to` params because the
+      // surrounding callers (e.g. chatbot's register page) need them
+      // to round-trip after sign-in / sign-up.
+      //
+      // Skip the loadMe() fallback that would otherwise force the
+      // login card on top: if the user is already signed in we still
+      // honour ?view=signup (their explicit intent), and if they're
+      // anon we want signup, not the default login card.
+      try { show(view); } catch (e) { /* show() not yet wired */ }
+      return true;
+    }
     if (verifyTok) {
       try {
         await api("POST", "/api/auth/verify-email", { token: verifyTok });
@@ -1364,12 +1611,575 @@
     return false;
   }
 
+  // ===========================================================================
+  // Admin panel — Users / Products / Xout / Orders
+  // ===========================================================================
+  const Admin = {
+    initialized: false,
+    currentTab: "users",
+    init() {
+      this.initialized = true;
+      const tabs = document.querySelectorAll(".admin-tab");
+      tabs.forEach((b) => b.addEventListener("click", () => this.openTab(b.dataset.tab)));
+    },
+    openTab(name) {
+      this.currentTab = name;
+      document.querySelectorAll(".admin-tab").forEach((b) =>
+        b.classList.toggle("active", b.dataset.tab === name));
+      document.querySelectorAll(".admin-pane").forEach((p) =>
+        p.classList.toggle("hidden", p.id !== `admin-pane-${name}`));
+      if (name === "users")    this.renderUsers();
+      if (name === "products") this.renderProducts();
+      if (name === "xout")     this.renderXoutProducts();
+      if (name === "orders")   this.renderOrders();
+    },
+
+    el(tag, attrs, ...kids) {
+      const e = document.createElement(tag);
+      if (attrs) for (const [k, v] of Object.entries(attrs)) {
+        if (k === "class") e.className = v;
+        else if (k === "style") e.style.cssText = v;
+        else if (k.startsWith("on") && typeof v === "function") e.addEventListener(k.slice(2), v);
+        else if (v != null) e.setAttribute(k, v);
+      }
+      for (const kid of kids) {
+        if (kid == null || kid === false) continue;
+        e.append(typeof kid === "string" ? document.createTextNode(kid) : kid);
+      }
+      return e;
+    },
+
+    // ---- Users ----
+    async renderUsers(query) {
+      const root = document.getElementById("admin-pane-users");
+      root.innerHTML = "";
+      const search = this.el("input", { type: "text", placeholder: "Search by email or name", value: query || "" });
+      search.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") this.renderUsers(search.value.trim());
+      });
+      const refresh = this.el("button", { class: "btn btn-ghost" }, "刷新");
+      refresh.addEventListener("click", () => this.renderUsers(query));
+      root.append(this.el("div", { class: "admin-toolbar" }, search, refresh));
+      const status = this.el("div", { class: "muted" }, "加载中…");
+      root.append(status);
+      let r;
+      try {
+        const qs = query ? `?q=${encodeURIComponent(query)}` : "";
+        r = await api("GET", "/api/admin/users" + qs);
+      } catch (err) { status.textContent = "加载失败:" + (err.detail || err.message || ""); return; }
+      status.remove();
+      const tbl = this.el("table", { class: "admin-table" });
+      tbl.append(this.el("thead", null, this.el("tr", null,
+        this.el("th", null, "Email"),
+        this.el("th", null, "Username"),
+        this.el("th", null, "Display"),
+        this.el("th", null, "Role"),
+        this.el("th", null, "Status"),
+        this.el("th", null, ""))));
+      const tb = this.el("tbody");
+      for (const u of (r.users || [])) {
+        const view = this.el("button", { class: "btn btn-ghost", style: "padding: 4px 10px" }, "查看");
+        view.addEventListener("click", () => this.openUserDetail(u.id));
+        tb.append(this.el("tr", null,
+          this.el("td", null, this.el("span", { style: "font-family: monospace; font-size: 12px" }, u.email || "—")),
+          this.el("td", null, u.username || "—"),
+          this.el("td", null, u.display_name || "—"),
+          this.el("td", null, this.el("span", { class: "badge " + (u.is_admin ? "ok" : "") }, u.is_admin ? "admin" : "user")),
+          this.el("td", null, this.el("span", { class: "badge " + (u.status === "active" ? "ok" : "err") }, u.status || "—")),
+          this.el("td", null, view),
+        ));
+      }
+      tbl.append(tb);
+      root.append(tbl);
+      const info = this.el("p", { class: "muted", style: "margin-top: 10px; font-size: 12px" },
+        `共 ${r.total ?? r.users.length} 位用户`);
+      root.append(info);
+    },
+
+    async openUserDetail(userId) {
+      const bg = this.el("div", { class: "admin-modal-bg" });
+      const mod = this.el("div", { class: "admin-modal" });
+      bg.append(mod);
+      bg.addEventListener("click", (e) => { if (e.target === bg) bg.remove(); });
+      mod.append(this.el("div", { class: "muted" }, "加载中…"));
+      document.body.append(bg);
+
+      let detail, payments;
+      try {
+        [detail, payments] = await Promise.all([
+          api("GET", `/api/admin/users/${userId}`),
+          api("GET", `/api/admin/users/${userId}/payments`).catch(() => ({ payments: [] })),
+        ]);
+      } catch (err) {
+        mod.innerHTML = "";
+        mod.append(this.el("div", { class: "alert alert-error" }, "加载失败:" + (err.detail || err.message || "")));
+        mod.append(this.el("div", { class: "row", style: "justify-content: flex-end; margin-top: 14px" },
+          this.el("button", { class: "btn btn-ghost", style: "padding: 6px 14px",
+                              onclick: () => bg.remove() }, "关闭")));
+        return;
+      }
+      mod.innerHTML = "";
+      const u = detail.user || {};
+      mod.append(this.el("div", { class: "row", style: "justify-content: space-between" },
+        this.el("h2", { style: "margin: 0" }, u.username || u.primary_email || "(unnamed)"),
+        this.el("button", { class: "btn btn-ghost", onclick: () => bg.remove() }, "关闭"),
+      ));
+      const info = this.el("div", { style: "display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 10px 0; font-size: 13px" });
+      const row = (k, v) => { info.append(this.el("span", { class: "muted" }, k));
+                              info.append(this.el("span", null, v)); };
+      row("ID", u.id || "—");
+      row("Email", u.primary_email || "—");
+      row("Username", u.username || "—");
+      row("Display name", u.display_name || "—");
+      row("Locale", u.locale || "—");
+      row("Status", u.status || "—");
+      row("Role", u.is_admin ? "admin" : "user");
+      row("Created", u.created_at || "—");
+      mod.append(info);
+
+      // Xout subscription URL — front and center.
+      if (detail.subscription_url) {
+        mod.append(this.el("h3", null, "Xout 订阅链接"));
+        const urlBox = this.el("div", { style: "display: flex; gap: 8px; align-items: center; padding: 8px 10px; background: var(--bg); border-radius: 5px" });
+        const urlInput = this.el("input", { type: "text", readonly: "readonly", value: detail.subscription_url, style: "flex: 1; font-family: monospace; font-size: 12px; background: transparent; border: 0; color: var(--text)" });
+        urlInput.addEventListener("focus", () => urlInput.select());
+        const copy = this.el("button", { class: "btn btn-ghost", style: "padding: 4px 12px" }, "复制");
+        copy.addEventListener("click", () => {
+          navigator.clipboard.writeText(detail.subscription_url);
+          copy.textContent = "已复制";
+          setTimeout(() => { copy.textContent = "复制"; }, 1200);
+        });
+        const open = this.el("a", { class: "btn btn-ghost", style: "padding: 4px 12px", href: detail.subscription_url, target: "_blank", rel: "noreferrer" }, "打开");
+        urlBox.append(urlInput, copy, open);
+        mod.append(urlBox);
+      }
+
+      // Subscriptions
+      mod.append(this.el("h3", null, "订阅"));
+      const subs = detail.subscriptions || [];
+      if (subs.length === 0) mod.append(this.el("p", { class: "muted" }, "(无)"));
+      else {
+        const stbl = this.el("table", { class: "admin-table" });
+        stbl.append(this.el("thead", null, this.el("tr", null,
+          this.el("th", null, "Product"),
+          this.el("th", null, "Status"),
+          this.el("th", null, "Starts"),
+          this.el("th", null, "Expires"),
+          this.el("th", null, "Source"))));
+        const stb = this.el("tbody");
+        for (const s of subs) {
+          stb.append(this.el("tr", null,
+            this.el("td", null, s.product_code),
+            this.el("td", null, this.el("span", { class: "badge " + (s.status === "active" ? "ok" : "err") }, s.status)),
+            this.el("td", { class: "muted", style: "font-size: 12px" }, s.starts_at || "—"),
+            this.el("td", { class: "muted", style: "font-size: 12px" }, s.expires_at || "—"),
+            this.el("td", { class: "muted", style: "font-size: 12px" }, s.source || "—"),
+          ));
+        }
+        stbl.append(stb);
+        mod.append(stbl);
+      }
+
+      // Payments
+      mod.append(this.el("h3", null, "付款"));
+      const pays = (payments && payments.payments) || [];
+      if (pays.length === 0) mod.append(this.el("p", { class: "muted" }, "(无付款记录)"));
+      else {
+        const ptbl = this.el("table", { class: "admin-table" });
+        ptbl.append(this.el("thead", null, this.el("tr", null,
+          this.el("th", null, "When"),
+          this.el("th", null, "Product"),
+          this.el("th", null, "Amount"),
+          this.el("th", null, "Status"),
+          this.el("th", null, "Stripe PI"))));
+        const ptb = this.el("tbody");
+        for (const p of pays) {
+          const amt = (p.amount_cents != null) ? `${(p.amount_cents/100).toFixed(2)} ${p.currency || ""}` : "—";
+          ptb.append(this.el("tr", null,
+            this.el("td", { class: "muted", style: "font-size: 12px" }, p.created_at || "—"),
+            this.el("td", null, p.product_code || `#${p.product_id || "?"}`),
+            this.el("td", { style: "font-family: monospace" }, amt),
+            this.el("td", null, this.el("span", { class: "badge " + (p.status === "paid" ? "ok" : "") }, p.status || "—")),
+            this.el("td", { class: "muted", style: "font-family: monospace; font-size: 11px" }, p.stripe_payment_intent_id || "—"),
+          ));
+        }
+        ptbl.append(ptb);
+        mod.append(ptbl);
+      }
+    },
+
+    // ---- Products ----
+    async renderProducts() {
+      const root = document.getElementById("admin-pane-products");
+      root.innerHTML = "";
+      const status = this.el("div", { class: "muted" }, "加载中…");
+      root.append(status);
+      let r;
+      try { r = await api("GET", "/api/admin/products"); }
+      catch (err) { status.textContent = "加载失败:" + (err.detail || err.message); return; }
+      status.remove();
+      const newBtn = this.el("button", { class: "btn btn-primary", style: "padding: 6px 14px" }, "+ 新建产品");
+      newBtn.addEventListener("click", () => this.openProductForm(null));
+      root.append(this.el("div", { class: "admin-toolbar", style: "justify-content: flex-end" }, newBtn));
+      const tbl = this.el("table", { class: "admin-table" });
+      tbl.append(this.el("thead", null, this.el("tr", null,
+        this.el("th", null, "Code"),
+        this.el("th", null, "Kind"),
+        this.el("th", null, "Price"),
+        this.el("th", null, "Period"),
+        this.el("th", null, "Active"),
+        this.el("th", null, ""))));
+      const tb = this.el("tbody");
+      for (const p of (r.products || [])) {
+        const edit = this.el("button", { class: "btn btn-ghost", style: "padding: 4px 10px" }, "编辑");
+        edit.addEventListener("click", () => this.openProductForm(p));
+        const del = this.el("button", { class: "btn btn-ghost", style: "padding: 4px 10px; color: var(--error)" }, "删除");
+        del.addEventListener("click", async () => {
+          if (!confirm(`确认删除产品 ${p.code}?`)) return;
+          try { await api("DELETE", `/api/admin/products/${p.id}`); this.renderProducts(); }
+          catch (err) { alert(err.detail || err.message); }
+        });
+        const amt = (p.price_cents != null) ? `${(p.price_cents/100).toFixed(2)} ${p.currency || ""}` : "—";
+        tb.append(this.el("tr", null,
+          this.el("td", null, this.el("strong", null, p.code)),
+          this.el("td", null, p.kind),
+          this.el("td", { style: "font-family: monospace" }, amt),
+          this.el("td", { class: "muted", style: "font-size: 12px" }, p.period_days != null ? `${p.period_days}d` : "—"),
+          this.el("td", null, this.el("span", { class: "badge " + (p.active ? "ok" : "err") }, p.active ? "active" : "off")),
+          this.el("td", null, this.el("div", { class: "row" }, edit, del)),
+        ));
+      }
+      tbl.append(tb);
+      root.append(tbl);
+    },
+
+    openProductForm(existing) {
+      const isNew = !existing;
+      const bg = this.el("div", { class: "admin-modal-bg" });
+      const mod = this.el("div", { class: "admin-modal", style: "max-width: 600px" });
+      bg.append(mod);
+      bg.addEventListener("click", (e) => { if (e.target === bg) bg.remove(); });
+      mod.append(this.el("h2", null, isNew ? "新建产品" : `编辑产品 · ${existing.code}`));
+      const fields = {};
+      const inputCss = "padding: 6px 10px; border: 1px solid var(--border); border-radius: 4px; width: 100%;";
+      const fieldRow = (label, input, hint) => {
+        mod.append(this.el("div", { style: "display: grid; grid-template-columns: 130px 1fr; gap: 10px; align-items: start; margin: 8px 0" },
+          this.el("span", { class: "muted", style: "font-size: 12px; padding-top: 8px" }, label),
+          this.el("div", null, input,
+            hint ? this.el("div", { class: "muted", style: "font-size: 11px; margin-top: 3px" }, hint) : null)));
+      };
+      fields.code = this.el("input", { type: "text", value: existing?.code || "", placeholder: "lower-case-slug",
+        style: inputCss, ...(existing ? { readonly: "readonly", disabled: "disabled" } : {}) });
+      fields.kind = this.el("select", { style: inputCss });
+      ["one_time", "period", "recurring"].forEach((k) => {
+        const opt = this.el("option", { value: k }, k);
+        if ((existing?.kind || "period") === k) opt.selected = true;
+        fields.kind.append(opt);
+      });
+      fields.price = this.el("input", { type: "number", step: "0.01",
+        value: ((existing?.price_cents || 0) / 100).toFixed(2), style: inputCss });
+      fields.currency = this.el("input", { type: "text", value: existing?.currency || "USD", style: inputCss });
+      fields.period = this.el("input", { type: "number", value: existing?.period_days ?? "30", style: inputCss });
+      fields.stripe = this.el("input", { type: "text", value: existing?.stripe_price_id || "",
+        placeholder: "price_xxx (optional)", style: inputCss });
+      fields.nameZh = this.el("input", { type: "text", value: (existing?.name?.["zh-CN"]) || "", style: inputCss });
+      fields.nameEn = this.el("input", { type: "text", value: (existing?.name?.["en-US"]) || "", style: inputCss });
+      fields.descZh = this.el("textarea", { rows: 2, style: inputCss + " font-family: inherit;" });
+      fields.descZh.value = (existing?.description?.["zh-CN"]) || "";
+      fields.descEn = this.el("textarea", { rows: 2, style: inputCss + " font-family: inherit;" });
+      fields.descEn.value = (existing?.description?.["en-US"]) || "";
+      fields.active = this.el("input", { type: "checkbox" });
+      if (existing?.active !== false) fields.active.checked = true;
+      fieldRow("Code", fields.code, isNew ? "Slug, lowercase. Cannot be changed later." : null);
+      fieldRow("Kind", fields.kind, "one_time = single payment · period = fixed window · recurring = Stripe subscription");
+      fieldRow("Price (USD)", fields.price);
+      fieldRow("Currency", fields.currency);
+      fieldRow("Period (days)", fields.period, "Used for kind=period. Ignored otherwise.");
+      fieldRow("Stripe price", fields.stripe, "price_… id from Stripe. Only required for paid products.");
+      fieldRow("Name (zh-CN)", fields.nameZh);
+      fieldRow("Name (en-US)", fields.nameEn);
+      fieldRow("Description (zh)", fields.descZh, "Shown on the user catalog card.");
+      fieldRow("Description (en)", fields.descEn);
+      fieldRow("Active", fields.active, "Inactive products are hidden from the user catalog.");
+
+      const save = this.el("button", { class: "btn btn-primary", style: "padding: 6px 14px" }, isNew ? "创建" : "保存");
+      save.addEventListener("click", async () => {
+        const body = {
+          kind: fields.kind.value,
+          price_cents: Math.round(Number(fields.price.value) * 100) || 0,
+          currency: (fields.currency.value || "USD").toUpperCase(),
+          period_days: fields.period.value ? Number(fields.period.value) : null,
+          stripe_price_id: fields.stripe.value.trim() || null,
+          name: { "zh-CN": fields.nameZh.value, "en-US": fields.nameEn.value },
+          description: { "zh-CN": fields.descZh.value, "en-US": fields.descEn.value },
+          active: fields.active.checked,
+        };
+        try {
+          if (isNew) {
+            body.code = fields.code.value.trim();
+            await api("POST", "/api/admin/products", body);
+          } else {
+            await api("PATCH", `/api/admin/products/${existing.id}`, body);
+          }
+          bg.remove();
+          this.renderProducts();
+        } catch (err) { alert(err.detail || err.message); }
+      });
+      const cancel = this.el("button", { class: "btn btn-ghost", style: "padding: 6px 14px" }, "取消");
+      cancel.addEventListener("click", () => bg.remove());
+      mod.append(this.el("div", { class: "row", style: "justify-content: flex-end; margin-top: 14px; gap: 8px" }, cancel, save));
+      document.body.append(bg);
+    },
+
+    // ---- Xout products (delegate to existing endpoints) ----
+    async renderXoutProducts() {
+      const root = document.getElementById("admin-pane-xout");
+      root.innerHTML = "";
+      const status = this.el("div", { class: "muted" }, "加载中…");
+      root.append(status);
+      let r;
+      try { r = await api("GET", "/api/admin/xout/products"); }
+      catch (err) { status.textContent = "加载失败:" + (err.detail || err.message); return; }
+      status.remove();
+      const newBtn = this.el("button", { class: "btn btn-primary", style: "padding: 6px 14px" }, "+ 新建 Xout 商品");
+      newBtn.addEventListener("click", () => this.openXoutProductForm(null));
+      root.append(this.el("div", { class: "admin-toolbar", style: "justify-content: flex-end" }, newBtn));
+      const tbl = this.el("table", { class: "admin-table" });
+      tbl.append(this.el("thead", null, this.el("tr", null,
+        this.el("th", null, "Code"),
+        this.el("th", null, "Name"),
+        this.el("th", null, "Period"),
+        this.el("th", null, "Price"),
+        this.el("th", null, "Subscribers"),
+        this.el("th", null, "Coverage"),
+        this.el("th", null, "Active"),
+        this.el("th", null, ""))));
+      const tb = this.el("tbody");
+      for (const p of (r.products || [])) {
+        const sel = p.inbound_selector || {};
+        const nodes = sel.nodes || [];
+        const nodeSummary = nodes.length === 0
+          ? "—"
+          : nodes.map((n) => `${n.name}: ${(n.tags || ["*"]).join("/")}`).join(", ");
+        const amt = (p.price_cents != null) ? `${(p.price_cents/100).toFixed(2)} ${p.currency || ""}` : "—";
+        const edit = this.el("button", { class: "btn btn-ghost", style: "padding: 4px 10px" }, "编辑");
+        edit.addEventListener("click", () => this.openXoutProductForm(p));
+        tb.append(this.el("tr", null,
+          this.el("td", null, this.el("strong", null, p.code)),
+          this.el("td", { style: "font-size: 12px" },
+            (p.name && (p.name["zh-CN"] || p.name["en-US"])) || "—"),
+          this.el("td", { class: "muted", style: "font-size: 12px" }, p.period_days != null ? `${p.period_days}d` : "—"),
+          this.el("td", { style: "font-family: monospace; font-size: 12px" }, amt),
+          this.el("td", { class: "muted" }, String(p.subscriber_count ?? 0)),
+          this.el("td", { class: "muted", style: "font-size: 11px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                          title: nodeSummary }, nodeSummary),
+          this.el("td", null, this.el("span", { class: "badge " + (p.active ? "ok" : "err") }, p.active ? "active" : "off")),
+          this.el("td", null, edit),
+        ));
+      }
+      tbl.append(tb);
+      root.append(tbl);
+    },
+
+    async openXoutProductForm(existing) {
+      const isNew = !existing;
+      const bg = this.el("div", { class: "admin-modal-bg" });
+      const mod = this.el("div", { class: "admin-modal", style: "max-width: 720px" });
+      bg.append(mod);
+      bg.addEventListener("click", (e) => { if (e.target === bg) bg.remove(); });
+      mod.append(this.el("h2", null, isNew ? "新建 Xout 商品" : `编辑 Xout 商品 · ${existing.code}`));
+      // Pull node→inbound list so the selector can be a checkbox grid
+      // instead of a freeform JSON edit.
+      let inbounds;
+      try { inbounds = await api("GET", "/api/admin/xout/inbounds"); }
+      catch (err) {
+        mod.innerHTML = "";
+        mod.append(this.el("div", { class: "alert alert-error" }, "无法读取节点 inbound 列表:" + (err.detail || err.message)));
+        document.body.append(bg);
+        return;
+      }
+      const fields = {};
+      const inputCss = "padding: 6px 10px; border: 1px solid var(--border); border-radius: 4px; width: 100%;";
+      const fieldRow = (label, input, hint) => mod.append(this.el("div",
+        { style: "display: grid; grid-template-columns: 130px 1fr; gap: 10px; align-items: start; margin: 8px 0" },
+        this.el("span", { class: "muted", style: "font-size: 12px; padding-top: 8px" }, label),
+        this.el("div", null, input,
+          hint ? this.el("div", { class: "muted", style: "font-size: 11px; margin-top: 3px" }, hint) : null)));
+      fields.code = this.el("input", { type: "text", value: existing?.code || "",
+        placeholder: "lower-case-slug", style: inputCss,
+        ...(existing ? { readonly: "readonly", disabled: "disabled" } : {}) });
+      fields.kind = this.el("select", { style: inputCss });
+      ["period", "one_time", "recurring"].forEach((k) => {
+        const opt = this.el("option", { value: k }, k);
+        if ((existing?.kind || "period") === k) opt.selected = true;
+        fields.kind.append(opt);
+      });
+      fields.price = this.el("input", { type: "number", step: "0.01",
+        value: ((existing?.price_cents || 0) / 100).toFixed(2), style: inputCss });
+      fields.currency = this.el("input", { type: "text", value: existing?.currency || "USD", style: inputCss });
+      fields.period = this.el("input", { type: "number", value: existing?.period_days ?? "30", style: inputCss });
+      fields.nameZh = this.el("input", { type: "text", value: (existing?.name?.["zh-CN"]) || "", style: inputCss });
+      fields.nameEn = this.el("input", { type: "text", value: (existing?.name?.["en-US"]) || "", style: inputCss });
+      fields.descZh = this.el("textarea", { rows: 2, style: inputCss + " font-family: inherit;" });
+      fields.descZh.value = (existing?.description?.["zh-CN"]) || "";
+      fields.descEn = this.el("textarea", { rows: 2, style: inputCss + " font-family: inherit;" });
+      fields.descEn.value = (existing?.description?.["en-US"]) || "";
+      fields.active = this.el("input", { type: "checkbox" });
+      if (existing?.active !== false) fields.active.checked = true;
+      fieldRow("Code", fields.code, isNew ? "Slug, lowercase." : null);
+      fieldRow("Kind", fields.kind);
+      fieldRow("Price (USD)", fields.price);
+      fieldRow("Currency", fields.currency);
+      fieldRow("Period (days)", fields.period);
+      fieldRow("Name (zh-CN)", fields.nameZh);
+      fieldRow("Name (en-US)", fields.nameEn);
+      fieldRow("Description (zh)", fields.descZh);
+      fieldRow("Description (en)", fields.descEn);
+      fieldRow("Active", fields.active);
+
+      // Inbound-selector picker. Build the existing tag set first so we
+      // can pre-tick the right checkboxes.
+      const existingTagsByNode = {};
+      const existingNodesAll = new Set();
+      const sel = (existing?.inbound_selector) || {};
+      for (const n of (sel.nodes || [])) {
+        const tags = n.tags || ["*"];
+        if (tags.includes("*")) existingNodesAll.add(n.name);
+        else existingTagsByNode[n.name] = new Set(tags);
+      }
+      const selectorWrap = this.el("div", { style: "border: 1px solid var(--border); border-radius: 4px; padding: 8px; max-height: 300px; overflow: auto;" });
+      const checkboxes = [];  // {nodeName, allCb, tagCbs: [{tag, cb}]}
+      for (const node of (inbounds.nodes || [])) {
+        const nodeRow = this.el("div", { style: "padding: 6px 4px; border-bottom: 1px dashed var(--border);" });
+        const allCb = this.el("input", { type: "checkbox" });
+        if (existingNodesAll.has(node.node_name)) allCb.checked = true;
+        const head = this.el("label", { style: "display: flex; gap: 6px; align-items: center; cursor: pointer; font-size: 12px;" },
+          allCb,
+          this.el("strong", null, node.node_name),
+          this.el("span", { class: "muted", style: "font-size: 11px" },
+            node.node_host ? `@ ${node.node_host}` : ""),
+          this.el("span", { class: "muted", style: "font-size: 11px; margin-left: auto" }, "all (*)"),
+        );
+        nodeRow.append(head);
+        const tagWrap = this.el("div", { style: "padding-left: 22px; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px;" });
+        const tagCbs = [];
+        for (const ib of (node.inbounds || [])) {
+          const cb = this.el("input", { type: "checkbox" });
+          if (existingTagsByNode[node.node_name]?.has(ib.tag)) cb.checked = true;
+          if (!ib.is_user_facing) cb.disabled = true;
+          const lbl = this.el("label", {
+            style: "display: inline-flex; gap: 4px; align-items: center; font-size: 11px;"
+                   + (ib.is_user_facing ? "" : "opacity: 0.5;"),
+            title: ib.is_user_facing ? "" : "Non-VLESS inbound — not user-facing",
+          },
+            cb,
+            this.el("span", null, ib.tag),
+            this.el("span", { class: "muted", style: "font-size: 10px" },
+              ` (${(ib.protocol || "?").toUpperCase()}:${ib.port})`));
+          tagWrap.append(lbl);
+          tagCbs.push({ tag: ib.tag, cb });
+        }
+        nodeRow.append(tagWrap);
+        selectorWrap.append(nodeRow);
+        checkboxes.push({ nodeName: node.node_name, allCb, tagCbs });
+        // "All" toggles flow down: ticking allCb dims the per-tag and
+        // implies "*"; ticking individual tags un-ticks all.
+        allCb.addEventListener("change", () => {
+          if (allCb.checked) tagCbs.forEach((t) => { t.cb.checked = false; });
+        });
+        tagCbs.forEach((t) => t.cb.addEventListener("change", () => {
+          if (t.cb.checked) allCb.checked = false;
+        }));
+      }
+      fieldRow("Coverage", selectorWrap, "Tick each inbound the product includes; or tick a node's 'all' to include every (vless) inbound on that node.");
+
+      const save = this.el("button", { class: "btn btn-primary", style: "padding: 6px 14px" }, isNew ? "创建" : "保存");
+      save.addEventListener("click", async () => {
+        const nodes = [];
+        for (const c of checkboxes) {
+          if (c.allCb.checked) {
+            nodes.push({ name: c.nodeName, tags: ["*"] });
+          } else {
+            const tags = c.tagCbs.filter((t) => t.cb.checked).map((t) => t.tag);
+            if (tags.length > 0) nodes.push({ name: c.nodeName, tags });
+          }
+        }
+        const body = {
+          kind: fields.kind.value,
+          price_cents: Math.round(Number(fields.price.value) * 100) || 0,
+          currency: (fields.currency.value || "USD").toUpperCase(),
+          period_days: fields.period.value ? Number(fields.period.value) : null,
+          name: { "zh-CN": fields.nameZh.value, "en-US": fields.nameEn.value },
+          description: { "zh-CN": fields.descZh.value, "en-US": fields.descEn.value },
+          active: fields.active.checked,
+          inbound_selector: { version: 1, nodes },
+        };
+        try {
+          if (isNew) {
+            body.code = fields.code.value.trim();
+            await api("POST", "/api/admin/xout/products", body);
+          } else {
+            await api("PATCH", `/api/admin/xout/products/${existing.id}`, body);
+          }
+          bg.remove();
+          this.renderXoutProducts();
+        } catch (err) { alert(err.detail || err.message); }
+      });
+      const cancel = this.el("button", { class: "btn btn-ghost", style: "padding: 6px 14px" }, "取消");
+      cancel.addEventListener("click", () => bg.remove());
+      mod.append(this.el("div", { class: "row", style: "justify-content: flex-end; margin-top: 14px; gap: 8px" }, cancel, save));
+      document.body.append(bg);
+    },
+
+    // ---- Orders ----
+    async renderOrders(filters) {
+      const root = document.getElementById("admin-pane-orders");
+      root.innerHTML = "";
+      const status = this.el("div", { class: "muted" }, "加载中…");
+      root.append(status);
+      const qs = new URLSearchParams();
+      if (filters?.status) qs.set("status", filters.status);
+      if (filters?.product_code) qs.set("product_code", filters.product_code);
+      let r;
+      try { r = await api("GET", "/api/admin/orders" + (qs.toString() ? "?" + qs : "")); }
+      catch (err) { status.textContent = "加载失败:" + (err.detail || err.message); return; }
+      status.remove();
+      const tbl = this.el("table", { class: "admin-table" });
+      tbl.append(this.el("thead", null, this.el("tr", null,
+        this.el("th", null, "When"),
+        this.el("th", null, "User"),
+        this.el("th", null, "Product"),
+        this.el("th", null, "Amount"),
+        this.el("th", null, "Status"),
+        this.el("th", null, "Sub"))));
+      const tb = this.el("tbody");
+      for (const o of (r.orders || [])) {
+        const amt = (o.amount_cents != null) ? `${(o.amount_cents/100).toFixed(2)} ${o.currency || ""}` : "—";
+        tb.append(this.el("tr", null,
+          this.el("td", { class: "muted", style: "font-size: 12px" }, o.created_at || "—"),
+          this.el("td", null, o.username || o.primary_email || (o.user_id || "").slice(0, 8)),
+          this.el("td", null, o.product_code || `#${o.product_id || "?"}`),
+          this.el("td", { style: "font-family: monospace" }, amt),
+          this.el("td", null, this.el("span", { class: "badge " + (o.status === "paid" ? "ok" : "") }, o.status || "—")),
+          this.el("td", null, this.el("span", { class: "badge " + (o.subscription_status === "active" ? "ok" : "") },
+                                       o.subscription_status || "—")),
+        ));
+      }
+      tbl.append(tb);
+      root.append(tbl);
+      root.append(this.el("p", { class: "muted", style: "margin-top: 10px; font-size: 12px" },
+        `共 ${r.total ?? (r.orders || []).length} 笔订单`));
+    },
+  };
+
   // Boot.
   applyLocale();
   loadOAuthButtonsForLogin();
   (async () => {
     if (await handleUrlTokens()) return;
-    loadMe();
+    await loadMe();
+    // Honor an initial #admin route if the user landed there directly.
+    if ((location.hash || "").startsWith("#admin")) applyHashRoute();
   })();
 })();
 </script>

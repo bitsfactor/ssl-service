@@ -30,12 +30,18 @@ defaults:
   PUBLIC_URL: "https://user.develop.cc"
 
 secrets:
+  # The DSN is referenced via the database registry; ssl-service's
+  # inline resolver expands ``database:<id>`` to the registry entry's
+  # full DSN at deploy time.
   - env: USER_SERVICE_PG_DSN
-    from: system_config:databases.entries[id=f499f7431634].dsn
+    from: database:f499f7431634
+  # system_config keys themselves contain dots (e.g. user_service.admin_token);
+  # the resolver walks the longest matching prefix and then descends through
+  # the JSON value's leaf key.
   - env: USAGE_INGEST_TOKEN
-    from: system_config:user_service.usage_ingest_token
+    from: system_config:user_service.usage_ingest_token.token
   - env: ADMIN_SERVICE_TOKEN
-    from: system_config:user_service.admin_token
+    from: system_config:user_service.admin_token.token
 
 exposed_ports:
   - 8200

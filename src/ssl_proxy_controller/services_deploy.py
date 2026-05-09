@@ -204,13 +204,24 @@ _GITHUB_REPO_RE = re.compile(
   r"^https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$",
   re.IGNORECASE,
 )
+# SSH form: ``git@github.com:owner/repo(.git)``. Per
+# `feedback_repo_urls_ssh_only.md`, services register their repo with the
+# SSH URL because the deploy node uses an SSH deploy key for `git clone`;
+# we still need to derive the raw.githubusercontent.com URL from it for
+# the manifest probe (raw.githubusercontent.com itself is fetched over
+# HTTPS without auth — works for public repos).
+_GITHUB_SSH_RE = re.compile(
+  r"^git@github\.com:(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$",
+  re.IGNORECASE,
+)
 
 
 def github_raw_url(repo_url: str, branch: str, path: str) -> str | None:
-  """Convert https://github.com/<owner>/<repo> + branch + path to
+  """Convert a GitHub URL (https or git@-SSH form) + branch + path to
   the raw.githubusercontent.com URL for that file. Returns None if
   ``repo_url`` doesn't look like a GitHub repo."""
-  m = _GITHUB_REPO_RE.match((repo_url or "").strip())
+  text = (repo_url or "").strip()
+  m = _GITHUB_REPO_RE.match(text) or _GITHUB_SSH_RE.match(text)
   if not m:
     return None
   owner = m.group("owner")
@@ -219,13 +230,27 @@ def github_raw_url(repo_url: str, branch: str, path: str) -> str | None:
 
 
 def fetch_deploy_yaml_from_github(
-  repo_url: str, branch: str = "main", *, timeout: float = 10.0
+  repo_url: str,
+  branch: str = "main",
+  *,
+  timeout: float = 10.0,
+  token: str | None = None,
 ) -> tuple[str, str]:
   """Try `branch` then `master`, looking for `.deploy.yaml` at the repo root.
 
   Returns ``(text, branch_used)``. Raises ``ValueError`` if neither branch
   has the file or the URL isn't a recognized GitHub URL.
+
+  ``token`` is an optional GitHub PAT — required when the repo is private
+  (raw.githubusercontent.com returns 404 to anonymous reads of private
+  repos, indistinguishable from a missing file). Pass the same token
+  ssl-service uses to create repos (system_config:github.api_token).
   """
+  headers = {"User-Agent": "ssl-service-platform-deploy/1.0"}
+  if token:
+    # raw.githubusercontent.com accepts either token form; "token <pat>"
+    # is the long-standing one.
+    headers["Authorization"] = f"token {token}"
   for candidate in (branch, "main", "master"):
     if not candidate:
       continue
@@ -233,10 +258,7 @@ def fetch_deploy_yaml_from_github(
     if url is None:
       raise ValueError(f"not a github URL: {repo_url}")
     try:
-      req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "ssl-service-platform-deploy/1.0"},
-      )
+      req = urllib.request.Request(url, headers=headers)
       with urllib.request.urlopen(req, timeout=timeout) as resp:
         if resp.status != 200:
           continue
@@ -427,10 +449,16 @@ fi
 cd "${{INSTALL_DIR}}"
 
 git fetch --all --tags --prune
-if git rev-parse --verify "${{REVISION}}" >/dev/null 2>&1; then
-  git checkout --detach "${{REVISION}}"
-elif git rev-parse --verify "origin/${{REVISION}}" >/dev/null 2>&1; then
+# DevChat fix: try `origin/${{REVISION}}` first when the name matches a
+# remote branch — the local branch ref (e.g. `main`) is stale until you
+# `git pull`, so the previous order (local first) silently deployed
+# whatever sha was in the local repo when it was last cloned. Now branch
+# names always pick up the latest remote tip; SHAs/tags still resolve
+# via the second clause unchanged.
+if git rev-parse --verify "origin/${{REVISION}}" >/dev/null 2>&1; then
   git checkout --detach "origin/${{REVISION}}"
+elif git rev-parse --verify "${{REVISION}}" >/dev/null 2>&1; then
+  git checkout --detach "${{REVISION}}"
 else
   echo "ERROR: revision '${{REVISION}}' not found in repo" >&2
   exit 2
