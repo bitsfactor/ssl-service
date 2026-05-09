@@ -1,10 +1,6 @@
-import { getServerUser } from "@/lib/api/server";
-import { ProfileClient } from "./profile-client";
+import { redirect } from "next/navigation";
 
-export const metadata = { title: "Profile" };
-
-export default async function ProfilePage() {
-  const user = await getServerUser();
-  if (!user) return null;
-  return <ProfileClient user={user} />;
+// Profile has merged into /account. Redirect for back-compat.
+export default function ProfilePage() {
+  redirect("/account");
 }

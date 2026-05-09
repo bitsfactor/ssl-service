@@ -47,7 +47,7 @@ export function SiteHeaderBridge({
       locales={LOCALE_ENTRIES}
       onLocaleSelect={(next) => setLocale(next as LocaleId)}
       onSignOut={handleSignOut}
-      preferencesUrl="/preferences"
+      preferencesUrl="/account"
       signInUrl="/login"
       signUpUrl="/register"
     />

@@ -1,7 +1,6 @@
-import { PreferencesClient } from "./preferences-client";
+import { redirect } from "next/navigation";
 
-export const metadata = { title: "Preferences" };
-
+// Preferences has merged into /account. Redirect for back-compat.
 export default function PreferencesPage() {
-  return <PreferencesClient />;
+  redirect("/account");
 }

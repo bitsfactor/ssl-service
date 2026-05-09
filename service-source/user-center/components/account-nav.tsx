@@ -7,17 +7,15 @@ import {
   UserIcon,
   ShieldIcon,
   CreditCardIcon,
-  SlidersHorizontalIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useT } from "@/lib/i18n/i18n-provider";
 
 const navItems = [
   { href: "/", icon: HomeIcon, key: "nav.dashboard" },
-  { href: "/profile", icon: UserIcon, key: "nav.profile" },
+  { href: "/account", icon: UserIcon, key: "nav.account" },
   { href: "/security", icon: ShieldIcon, key: "nav.security" },
   { href: "/billing", icon: CreditCardIcon, key: "nav.billing" },
-  { href: "/preferences", icon: SlidersHorizontalIcon, key: "nav.preferences" },
 ] as const;
 
 export function AccountNav() {

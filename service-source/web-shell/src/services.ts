@@ -32,9 +32,25 @@ export const DEFAULT_SERVICES: ServiceEntry[] = [
       de: "Willkommensseite und Produktübersicht",
     },
     url: "https://develop.cc",
-    // The home service is still being built — kept as a visible
-    // entry so users see what's coming, but not yet clickable.
     comingSoon: true,
+  },
+  {
+    id: "account",
+    label: {
+      en: "Account",
+      zh: "账户",
+      ja: "アカウント",
+      ko: "계정",
+      de: "Konto",
+    },
+    description: {
+      en: "Profile, billing, security, preferences",
+      zh: "个人资料、账单、安全、偏好设置",
+      ja: "プロフィール、請求、セキュリティ、設定",
+      ko: "프로필, 결제, 보안, 설정",
+      de: "Profil, Abrechnung, Sicherheit, Einstellungen",
+    },
+    url: "https://user.develop.cc",
   },
   {
     id: "chat",
@@ -53,5 +69,24 @@ export const DEFAULT_SERVICES: ServiceEntry[] = [
       de: "KI-Gespräche, Bildgenerierung, Vision",
     },
     url: "https://chat.develop.cc",
+  },
+  {
+    id: "xout",
+    label: {
+      en: "Xout",
+      zh: "Xout",
+      ja: "Xout",
+      ko: "Xout",
+      de: "Xout",
+    },
+    description: {
+      en: "Private networking and proxy services",
+      zh: "私人网络与代理服务",
+      ja: "プライベートネットワーキングとプロキシサービス",
+      ko: "프라이빗 네트워킹 및 프록시 서비스",
+      de: "Privates Netzwerk und Proxy-Dienste",
+    },
+    url: "https://xout.develop.cc",
+    comingSoon: true,
   },
 ];

@@ -1,39 +1,22 @@
 import { Suspense } from "react";
-import { getServerUser, serverFetch } from "@/lib/api/server";
-import type { UsageInfo } from "@/lib/api/server";
+import { getBootstrapData } from "@/lib/api/server";
 import { DashboardClient } from "./dashboard-client";
 import { Skeleton } from "@/components/ui/skeleton";
-
-async function getUsage(): Promise<UsageInfo | null> {
-  try {
-    const res = await serverFetch("/api/me/usage");
-    if (!res.ok) return null;
-    // user-service wraps usage as { quotas, billing } — unwrap to billing.
-    const body = (await res.json()) as { billing?: UsageInfo } | UsageInfo;
-    if (
-      body &&
-      typeof body === "object" &&
-      "billing" in body &&
-      body.billing
-    ) {
-      return body.billing as UsageInfo;
-    }
-    return body as UsageInfo;
-  } catch {
-    return null;
-  }
-}
 
 export const metadata = {
   title: "Dashboard",
 };
 
-export default async function DashboardPage() {
-  const [user, usage] = await Promise.all([getServerUser(), getUsage()]);
+export const dynamic = "force-dynamic";
 
-  // Auth guard is handled by the (protected) layout — user should always
+export default async function DashboardPage() {
+  // getBootstrapData is cached by React cache() — layout already called it,
+  // so this is a free dedup, not an extra network round-trip.
+  const data = await getBootstrapData();
+
+  // Auth guard is handled by the (protected) layout — data should always
   // be non-null here, but we type-narrow defensively.
-  if (!user) return null;
+  if (!data) return null;
 
   return (
     <Suspense
@@ -45,7 +28,12 @@ export default async function DashboardPage() {
         </div>
       }
     >
-      <DashboardClient user={user} usage={usage} />
+      <DashboardClient
+        user={data.user}
+        usage={data.usage}
+        subscriptions={data.subscriptions}
+        products={data.products}
+      />
     </Suspense>
   );
 }

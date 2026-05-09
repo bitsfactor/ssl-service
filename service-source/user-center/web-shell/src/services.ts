@@ -70,4 +70,23 @@ export const DEFAULT_SERVICES: ServiceEntry[] = [
     },
     url: "https://chat.develop.cc",
   },
+  {
+    id: "xout",
+    label: {
+      en: "Xout",
+      zh: "Xout",
+      ja: "Xout",
+      ko: "Xout",
+      de: "Xout",
+    },
+    description: {
+      en: "Private networking and proxy services",
+      zh: "私人网络与代理服务",
+      ja: "プライベートネットワーキングとプロキシサービス",
+      ko: "프라이빗 네트워킹 및 프록시 서비스",
+      de: "Privates Netzwerk und Proxy-Dienste",
+    },
+    url: "https://xout.develop.cc",
+    comingSoon: true,
+  },
 ];

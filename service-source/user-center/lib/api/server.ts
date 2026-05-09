@@ -1,5 +1,6 @@
 import "server-only";
 
+import { cache } from "react";
 import { cookies } from "next/headers";
 
 /**
@@ -50,29 +51,37 @@ export async function serverFetch(
   });
 }
 
-/**
- * Fetch the current user from user-service. Returns null if the user
- * is not authenticated or if the request fails.
- *
- * NB: user-service's `/api/me` returns `{user: {...}, subscriptions: [...]}`
- * (NOT a flat UserProfile). We unwrap `.user` here so callers can keep
- * working with a flat profile object.
- */
-export async function getServerUser(): Promise<UserProfile | null> {
+// ---------------------------------------------------------------------------
+// Static (module-level) cache for rarely-changing data.
+// Keys: "/api/products" | "/api/pricing". TTL: 30 seconds.
+// ---------------------------------------------------------------------------
+type CacheEntry<T> = { data: T; expiresAt: number };
+const _staticCache = new Map<string, CacheEntry<unknown>>();
+const STATIC_TTL_MS = 30_000;
+
+async function cachedFetch<T>(
+  path: string,
+  transform: (body: unknown) => T,
+  fallback: T
+): Promise<T> {
+  const now = Date.now();
+  const hit = _staticCache.get(path);
+  if (hit && hit.expiresAt > now) return hit.data as T;
   try {
-    const res = await serverFetch("/api/me");
-    if (!res.ok) return null;
-    const body = (await res.json()) as
-      | { user?: UserProfile }
-      | UserProfile;
-    if (body && typeof body === "object" && "user" in body && body.user) {
-      return body.user as UserProfile;
-    }
-    return body as UserProfile;
+    const res = await serverFetch(path);
+    if (!res.ok) return fallback;
+    const body: unknown = await res.json();
+    const data = transform(body);
+    _staticCache.set(path, { data, expiresAt: now + STATIC_TTL_MS });
+    return data;
   } catch {
-    return null;
+    return fallback;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 export type UserProfile = {
   id: string;
@@ -81,6 +90,16 @@ export type UserProfile = {
   locale: string | null;
   created_at: string;
   is_admin: boolean;
+};
+
+export type Subscription = {
+  id: number;
+  product_code: string;
+  product_name: Record<string, string>;
+  kind: string;       // "recurring" | "one_time" | "lifetime" | …
+  status: string;     // "active" | "past_due" | "canceled" | …
+  starts_at: string;
+  ends_at: string | null;
 };
 
 export type UsageInfo = {
@@ -94,3 +113,138 @@ export type UsageInfo = {
   current_period_start: string;
   discount_factor: number;
 };
+
+export type Product = {
+  id?: number | string;
+  code?: string;
+  name?: string | Record<string, string>;
+  kind?: string;
+  period_days?: number | null;
+  currency?: string;
+  price_cents?: number;
+  description?: string;
+  metadata?: {
+    daily_allowance_cents?: number;
+    lifetime_trial_cents?: number;
+    tier_rank?: number;
+  };
+  active?: boolean;
+};
+
+export type ModelPricing = {
+  // canonical (current shape)
+  model_id?: string;
+  display_name?: Record<string, string> | null;
+  modality?: string;
+  input_rate_per_1m_usd?: number;
+  cached_input_rate_per_1m_usd?: number;
+  output_rate_per_1m_usd?: number;
+  // legacy aliases
+  model?: string;
+  input_per_million?: number;
+  cached_per_million?: number;
+  output_per_million?: number;
+};
+
+export type BootstrapData = {
+  user: UserProfile;
+  subscriptions: Subscription[];
+  usage: UsageInfo | null;
+  products: Product[];
+  pricing: ModelPricing[];
+};
+
+// ---------------------------------------------------------------------------
+// Individual fetchers (used by getBootstrapData)
+// ---------------------------------------------------------------------------
+
+async function fetchMe(): Promise<{ user: UserProfile; subscriptions: Subscription[] } | null> {
+  try {
+    const res = await serverFetch("/api/me");
+    if (!res.ok) return null;
+    const body = (await res.json()) as
+      | { user?: UserProfile; subscriptions?: Subscription[] }
+      | UserProfile;
+    if (body && typeof body === "object" && "user" in body && body.user) {
+      return {
+        user: body.user as UserProfile,
+        subscriptions: ((body as { subscriptions?: Subscription[] }).subscriptions ?? []),
+      };
+    }
+    return { user: body as UserProfile, subscriptions: [] };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchUsage(): Promise<UsageInfo | null> {
+  try {
+    const res = await serverFetch("/api/me/usage");
+    if (!res.ok) return null;
+    const body = (await res.json()) as { billing?: UsageInfo } | UsageInfo;
+    if (body && typeof body === "object" && "billing" in body && body.billing) {
+      return body.billing as UsageInfo;
+    }
+    return body as UsageInfo;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchProducts(): Promise<Product[]> {
+  return cachedFetch<Product[]>(
+    "/api/products",
+    (body) => {
+      const list = Array.isArray(body)
+        ? body
+        : ((body as { products?: unknown[] })?.products ?? []);
+      return list as Product[];
+    },
+    []
+  );
+}
+
+async function fetchPricing(): Promise<ModelPricing[]> {
+  return cachedFetch<ModelPricing[]>(
+    "/api/pricing",
+    (body) => {
+      const list = Array.isArray(body)
+        ? body
+        : ((body as { models?: unknown[] })?.models ?? []);
+      return list as ModelPricing[];
+    },
+    []
+  );
+}
+
+// ---------------------------------------------------------------------------
+// getBootstrapData — single function for all protected pages.
+//
+// React cache() deduplicates concurrent awaits within the same request
+// so the layout + any page that calls it both get the same Promise.
+// ---------------------------------------------------------------------------
+export const getBootstrapData = cache(async (): Promise<BootstrapData | null> => {
+  const [meResult, usage, products, pricing] = await Promise.all([
+    fetchMe(),
+    fetchUsage(),
+    fetchProducts(),
+    fetchPricing(),
+  ]);
+  if (!meResult) return null;
+  return {
+    user: meResult.user,
+    subscriptions: meResult.subscriptions,
+    usage,
+    products,
+    pricing,
+  };
+});
+
+/**
+ * Convenience: get just the user (used by pages that only need auth guard).
+ * Falls through to getBootstrapData so it's still deduplicated.
+ */
+export async function getServerUser(): Promise<UserProfile | null> {
+  const data = await getBootstrapData();
+  return data?.user ?? null;
+}
