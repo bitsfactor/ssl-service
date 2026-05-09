@@ -2314,6 +2314,147 @@ def admin_create_product(req: ProductCreateRequest) -> dict:
   return {"product": row}
 
 
+# ---------------------------------------------------------------------------
+# Billing admin (model_pricing CRUD + global settings).  Surfaces in the
+# ssl-service admin SPA via /api/user-service/billing/* proxy routes.
+# ---------------------------------------------------------------------------
+
+
+class ModelPricingUpsertRequest(BaseModel):
+  model_id: str = Field(min_length=1, max_length=120)
+  display_name: dict | None = None
+  pricing_kind: str = Field(default="tokens")
+  modality: str = Field(default="text")
+  input_rate_micros: int | None = None
+  cached_input_rate_micros: int | None = None
+  output_rate_micros: int | None = None
+  per_unit_micros: int | None = None
+  per_unit_label: str | None = None
+  active: bool = True
+  notes: str | None = None
+  source_url: str | None = None
+
+
+@app.get("/api/admin/billing/pricing", dependencies=[Depends(require_admin)])
+def admin_billing_pricing_list() -> dict:
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        """
+        SELECT id, model_id, display_name, pricing_kind, modality,
+               input_rate_micros, cached_input_rate_micros, output_rate_micros,
+               per_unit_micros, per_unit_label, active, notes, source_url,
+               updated_by_admin, updated_at
+        FROM model_pricing
+        ORDER BY active DESC, modality, model_id
+        """
+      )
+      rows = cur.fetchall()
+  return {"models": rows}
+
+
+@app.post("/api/admin/billing/pricing", dependencies=[Depends(require_admin)])
+def admin_billing_pricing_upsert(req: ModelPricingUpsertRequest,
+                                  caller: dict = Depends(require_admin)) -> dict:
+  who = caller.get("email") if isinstance(caller, dict) else None
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        """
+        INSERT INTO model_pricing(model_id, display_name, pricing_kind, modality,
+            input_rate_micros, cached_input_rate_micros, output_rate_micros,
+            per_unit_micros, per_unit_label, active, notes, source_url,
+            updated_by_admin, updated_at)
+        VALUES (%s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        ON CONFLICT (model_id) DO UPDATE SET
+            display_name = EXCLUDED.display_name,
+            pricing_kind = EXCLUDED.pricing_kind,
+            modality = EXCLUDED.modality,
+            input_rate_micros = EXCLUDED.input_rate_micros,
+            cached_input_rate_micros = EXCLUDED.cached_input_rate_micros,
+            output_rate_micros = EXCLUDED.output_rate_micros,
+            per_unit_micros = EXCLUDED.per_unit_micros,
+            per_unit_label = EXCLUDED.per_unit_label,
+            active = EXCLUDED.active,
+            notes = EXCLUDED.notes,
+            source_url = EXCLUDED.source_url,
+            updated_by_admin = EXCLUDED.updated_by_admin,
+            updated_at = NOW()
+        RETURNING id, model_id, display_name, pricing_kind, modality,
+                  input_rate_micros, cached_input_rate_micros, output_rate_micros,
+                  per_unit_micros, per_unit_label, active, notes, source_url,
+                  updated_by_admin, updated_at
+        """,
+        (req.model_id, _to_jsonb(req.display_name or {}), req.pricing_kind,
+         req.modality, req.input_rate_micros, req.cached_input_rate_micros,
+         req.output_rate_micros, req.per_unit_micros, req.per_unit_label,
+         req.active, req.notes, req.source_url, who),
+      )
+      row = cur.fetchone()
+    conn.commit()
+  return {"model": row}
+
+
+@app.delete("/api/admin/billing/pricing/{pricing_id}",
+            dependencies=[Depends(require_admin)])
+def admin_billing_pricing_delete(pricing_id: int) -> dict:
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute("DELETE FROM model_pricing WHERE id = %s", (pricing_id,))
+      if cur.rowcount == 0:
+        raise HTTPException(status_code=404, detail="model_pricing row not found")
+    conn.commit()
+  return {"ok": True}
+
+
+class BillingSettingsRequest(BaseModel):
+  discount_factor: float | None = Field(default=None, ge=0, le=2)
+
+
+@app.get("/api/admin/billing/settings", dependencies=[Depends(require_admin)])
+def admin_billing_settings_get() -> dict:
+  cfg = _get_system_config("billing.discount_factor")
+  v = cfg.get("value", 0.8) if isinstance(cfg, dict) else 0.8
+  return {"discount_factor": float(v)}
+
+
+@app.put("/api/admin/billing/settings", dependencies=[Depends(require_admin)])
+def admin_billing_settings_put(req: BillingSettingsRequest) -> dict:
+  if req.discount_factor is None:
+    raise HTTPException(status_code=400, detail="discount_factor required")
+  import json as _json
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        """
+        INSERT INTO system_config(key, value, updated_at)
+        VALUES ('billing.discount_factor', %s::jsonb, NOW())
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+        """,
+        (_json.dumps({"value": float(req.discount_factor)}),),
+      )
+    conn.commit()
+  return {"discount_factor": float(req.discount_factor)}
+
+
+@app.get("/api/admin/billing/tiers", dependencies=[Depends(require_admin)])
+def admin_billing_tiers_list() -> dict:
+  """Return the tier_* products sorted by tier_rank (Free first)."""
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        """
+        SELECT id, code, kind, price_cents, currency, period_days,
+               stripe_price_id, name, description, metadata, active
+        FROM products
+        WHERE code LIKE 'tier_%'
+        ORDER BY COALESCE((metadata->>'tier_rank')::int, 0)
+        """
+      )
+      rows = cur.fetchall()
+  return {"tiers": rows}
+
+
 @app.patch("/api/admin/products/{product_id}", dependencies=[Depends(require_admin)])
 def admin_patch_product(product_id: int, req: ProductPatchRequest) -> dict:
   """Edit a generic product. Use admin_patch_xout_product for xout-specific

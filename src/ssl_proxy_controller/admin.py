@@ -7281,6 +7281,15 @@ def _build_router(ctx: AdminContext) -> _Router:
     ("POST",   "/api/user-service/xout/products",                        "xout/products"),
     ("PATCH",  "/api/user-service/xout/products/{product_id}",           "xout/products/{product_id}"),
     ("DELETE", "/api/user-service/xout/products/{product_id}",           "xout/products/{product_id}"),
+    # Billing — model_pricing CRUD + discount factor + tier list.
+    # The proxy prefixes /api/admin/ automatically; sub paths here
+    # are relative to that root so "billing/pricing" → /api/admin/billing/pricing.
+    ("GET",    "/api/user-service/billing/pricing",                      "billing/pricing"),
+    ("POST",   "/api/user-service/billing/pricing",                      "billing/pricing"),
+    ("DELETE", "/api/user-service/billing/pricing/{pricing_id}",         "billing/pricing/{pricing_id}"),
+    ("GET",    "/api/user-service/billing/settings",                     "billing/settings"),
+    ("PUT",    "/api/user-service/billing/settings",                     "billing/settings"),
+    ("GET",    "/api/user-service/billing/tiers",                        "billing/tiers"),
     # Operator maintenance
     ("POST",   "/api/user-service/admin/auth/cleanup-tokens",            "auth/cleanup-tokens"),
   ]

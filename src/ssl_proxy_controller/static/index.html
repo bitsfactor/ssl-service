@@ -9,6 +9,7 @@
     --bg: #f7f4ee;
     --surface: #ffffff;
     --surface-alt: #faf7f1;
+    --surface-2: #f0ebe2;
     --border: #e6e0d6;
     --border-strong: #d5ccbd;
     --text: #1a1915;
@@ -10463,7 +10464,310 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
   // ---------------------------------------------------------------
   // Products page — manage the catalog rows that user.develop.cc
   // /api/products lists publicly. Localised name/description live
-  // in JSONB columns keyed by locale.
+  // ===========================================================================
+  // SERVICE PLUGIN TEMPLATE (added 2026-05-09)
+  // ---------------------------------------------------------------------------
+  // Each downstream service registers ONE render function in NAV_REGISTRY and
+  // builds its UI inside the supplied root using the helpers below + the
+  // existing h(), Modal, toast(), api(). This keeps every service's admin
+  // page visually consistent.
+  //
+  // Helpers (all return DOM nodes, all use CSS vars from :root):
+  //   uiPageHeader(title, lede, ...actions)
+  //       Standard page header with H1 + descriptive lede + right-aligned
+  //       action buttons / inputs.
+  //   uiCard(...children)
+  //       Surface-colored block with the standard padding + border. Equivalent
+  //       to <div class="card"> but composable.
+  //   uiSection(title, ...children)
+  //       Card + a small uppercase label at the top. Use when a single page
+  //       has multiple logical sections.
+  //   uiKVRow(label, value)
+  //       Two-column row, dim label / regular value. Useful for inline
+  //       summaries.
+  //   uiToolbar(...children)
+  //       Flex row, wraps, gap of 8px. For a strip of inline form controls.
+  //
+  // Pattern recap (look at renderBillingView below for a worked example):
+  //   1. setActiveNav("<slug>")
+  //   2. root.innerHTML = "" (always — the SPA reuses the same root for
+  //      every view)
+  //   3. root.appendChild(uiPageHeader(...))
+  //   4. Async fetch via api()
+  //   5. Build sections with uiCard/uiSection
+  //   6. Wire events directly on the elements (no event delegation)
+  // ===========================================================================
+  function uiPageHeader(title, lede, ...actions) {
+    return h("div", { class: "page-header" },
+      h("div", null,
+        h("h1", null, title),
+        lede ? h("p", { class: "lede" }, lede) : null,
+      ),
+      actions.length ? h("div", { class: "row", style: "gap: 8px; flex-wrap: wrap;" }, ...actions) : null,
+    );
+  }
+  function uiCard(...children) {
+    return h("div", { class: "card" }, ...children);
+  }
+  function uiSection(title, ...children) {
+    return h("div", { class: "card", style: "margin-bottom: 12px;" },
+      title ? h("div", {
+        style: "font-size: 11px; font-weight: 600; letter-spacing: 0.6px; text-transform: uppercase; color: var(--text-soft); margin-bottom: 12px;"
+      }, title) : null,
+      ...children,
+    );
+  }
+  function uiKVRow(label, value) {
+    return h("div", { style: "display: grid; grid-template-columns: 200px 1fr; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px;" },
+      h("span", { style: "color: var(--text-dim);" }, label),
+      h("span", { style: "color: var(--text); font-family: var(--mono);" },
+        value === undefined || value === null || value === "" ? h("em", { class: "muted" }, "—") : value),
+    );
+  }
+  function uiToolbar(...children) {
+    return h("div", { class: "row", style: "gap: 8px; flex-wrap: wrap; align-items: center;" }, ...children);
+  }
+
+  // ===========================================================================
+  // Billing — model pricing + tier products + global discount.
+  // First example of the service-plugin template (see comments above).
+  // ===========================================================================
+  async function renderBillingView(root) {
+    setActiveNav("billing");
+    root.innerHTML = "";
+
+    root.appendChild(uiPageHeader(
+      "Billing",
+      "Per-model OpenAI rates, the global discount applied to user invoices, and the monthly tier products. Lives in user-service; edits hit /api/user-service/billing/* and propagate to chatbot on the next charge.",
+    ));
+
+    // Discount factor + tier summary in two columns
+    const settingsCard = uiSection("Global");
+    const tiersCard = uiSection("Tiers");
+    const layout = h("div", { style: "display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;" }, settingsCard, tiersCard);
+    root.appendChild(layout);
+
+    // Model pricing table
+    const pricingCard = uiSection("Model pricing (USD per 1M tokens)");
+    const pricingBody = h("div", null, h("p", { class: "muted" }, "Loading…"));
+    pricingCard.appendChild(pricingBody);
+    root.appendChild(pricingCard);
+
+    // ---- Settings ----
+    settingsCard.appendChild(h("p", { class: "muted", style: "margin-bottom: 12px;" },
+      "Discount factor multiplies OpenAI's official rate before deducting from the user's daily allowance. ",
+      h("strong", null, "0.8"), " means users pay 80% of the list price; ",
+      h("strong", null, "0.5"), " means 50%."));
+    const discountInput = h("input", {
+      class: "input", type: "number", step: "0.01", min: "0", max: "2", style: "width: 120px;"
+    });
+    const discountSaveBtn = h("button", { class: "btn btn-primary btn-sm" }, "Save");
+    settingsCard.appendChild(uiToolbar(
+      h("label", { style: "color: var(--text-dim); font-size: 13px;" }, "Discount factor"),
+      discountInput,
+      discountSaveBtn,
+    ));
+
+    try {
+      const settings = await api("GET", "/api/user-service/billing/settings");
+      discountInput.value = String(settings.discount_factor ?? 0.8);
+    } catch (e) {
+      toast("error", "Could not load billing settings", e.message);
+    }
+    discountSaveBtn.addEventListener("click", async () => {
+      const v = parseFloat(discountInput.value);
+      if (!Number.isFinite(v) || v < 0 || v > 2) {
+        toast("warning", "Discount must be between 0 and 2");
+        return;
+      }
+      discountSaveBtn.disabled = true;
+      try {
+        await api("PUT", "/api/user-service/billing/settings", { discount_factor: v });
+        toast("success", `Discount factor saved as ${v}× — chatbot picks up new rate within 30s`);
+      } catch (e) {
+        toast("error", "Save failed", e.message);
+      } finally {
+        discountSaveBtn.disabled = false;
+      }
+    });
+
+    // ---- Tiers ----
+    try {
+      const { tiers } = await api("GET", "/api/user-service/billing/tiers");
+      if (!tiers || !tiers.length) {
+        tiersCard.appendChild(h("p", { class: "muted" }, "No tier_* products yet. Run the billing seed migration."));
+      } else {
+        const table = h("table", { class: "data", style: "margin-top: 4px;" });
+        table.appendChild(h("thead", null, h("tr", null,
+          h("th", null, "Code"),
+          h("th", null, "Name"),
+          h("th", { style: "text-align: right;" }, "Price/mo"),
+          h("th", { style: "text-align: right;" }, "Daily / Trial"),
+          h("th", { style: "text-align: center;" }, "Active"),
+        )));
+        const tbody = h("tbody");
+        for (const t of tiers) {
+          const meta = t.metadata || {};
+          const dollar = (cents) => cents ? "$" + (cents / 100).toFixed(2) : "—";
+          const dailyOrTrial =
+            meta.daily_allowance_cents != null
+              ? dollar(meta.daily_allowance_cents) + " / day"
+              : meta.lifetime_trial_cents != null
+                ? dollar(meta.lifetime_trial_cents) + " trial"
+                : "—";
+          tbody.appendChild(h("tr", null,
+            h("td", null, h("code", { class: "mono" }, t.code)),
+            h("td", null, (t.name && (t.name.en || Object.values(t.name)[0])) || ""),
+            h("td", { style: "text-align: right; font-family: var(--mono);" }, dollar(t.price_cents)),
+            h("td", { style: "text-align: right; font-family: var(--mono);" }, dailyOrTrial),
+            h("td", { style: "text-align: center;" }, t.active ? "✓" : "—"),
+          ));
+        }
+        table.appendChild(tbody);
+        tiersCard.appendChild(table);
+        tiersCard.appendChild(h("p", { class: "muted", style: "margin-top: 8px; font-size: 12px;" },
+          "Edit tier prices/daily allowances on the ",
+          h("a", { href: "#/products" }, "Products"), " page."));
+      }
+    } catch (e) {
+      tiersCard.appendChild(h("p", { class: "muted danger" }, "Failed to load tiers: " + e.message));
+    }
+
+    // ---- Model pricing ----
+    pricingBody.innerHTML = "";
+    const addBtn = h("button", { class: "btn btn-primary btn-sm" }, "+ Add model");
+    pricingBody.appendChild(uiToolbar(addBtn));
+    const tableHost = h("div", { style: "margin-top: 12px;" });
+    pricingBody.appendChild(tableHost);
+
+    async function refreshPricing() {
+      tableHost.innerHTML = "";
+      tableHost.appendChild(h("p", { class: "muted" }, "Loading…"));
+      try {
+        const { models } = await api("GET", "/api/user-service/billing/pricing");
+        tableHost.innerHTML = "";
+        if (!models || !models.length) {
+          tableHost.appendChild(h("p", { class: "muted" }, "No model_pricing rows yet."));
+          return;
+        }
+        const usd = (m) => m == null ? "—" : "$" + (m / 1_000_000).toFixed(4);
+        const table = h("table", { class: "data" });
+        table.appendChild(h("thead", null, h("tr", null,
+          h("th", null, "Model"),
+          h("th", null, "Mode"),
+          h("th", { style: "text-align: right;" }, "Input"),
+          h("th", { style: "text-align: right;" }, "Cached"),
+          h("th", { style: "text-align: right;" }, "Output"),
+          h("th", { style: "text-align: center;" }, "Active"),
+          h("th", { style: "text-align: right;" }, ""),
+        )));
+        const tbody = h("tbody");
+        for (const m of models) {
+          const editBtn = h("button", { class: "btn btn-sm btn-ghost" }, "Edit");
+          editBtn.addEventListener("click", () => openPricingModal(m, refreshPricing));
+          const delBtn = h("button", { class: "btn btn-sm btn-danger" }, "Delete");
+          delBtn.addEventListener("click", async () => {
+            if (!await Modal.confirm(`Delete pricing for ${m.model_id}?`,
+                "Charges that reference this model will fail until you re-create it.")) return;
+            try {
+              await api("DELETE", `/api/user-service/billing/pricing/${m.id}`);
+              toast("success", "Deleted");
+              refreshPricing();
+            } catch (e) { toast("error", "Delete failed", e.message); }
+          });
+          tbody.appendChild(h("tr", null,
+            h("td", null, h("code", { class: "mono" }, m.model_id)),
+            h("td", null, h("span", { class: "muted" }, m.modality + "/" + m.pricing_kind)),
+            h("td", { style: "text-align: right; font-family: var(--mono);" }, usd(m.input_rate_micros)),
+            h("td", { style: "text-align: right; font-family: var(--mono);" }, usd(m.cached_input_rate_micros)),
+            h("td", { style: "text-align: right; font-family: var(--mono);" }, usd(m.output_rate_micros)),
+            h("td", { style: "text-align: center;" }, m.active ? "✓" : "—"),
+            h("td", { style: "text-align: right;" }, h("div", { class: "row", style: "gap: 4px; justify-content: flex-end;" }, editBtn, delBtn)),
+          ));
+        }
+        table.appendChild(tbody);
+        tableHost.appendChild(table);
+      } catch (e) {
+        tableHost.innerHTML = "";
+        tableHost.appendChild(h("p", { class: "muted danger" }, "Failed to load pricing: " + e.message));
+      }
+    }
+    addBtn.addEventListener("click", () => openPricingModal(null, refreshPricing));
+    refreshPricing();
+  }
+
+  function openPricingModal(existing, onSaved) {
+    const isNew = !existing;
+    const modelInput = h("input", { class: "input", value: existing?.model_id ?? "" });
+    const displayInput = h("input", { class: "input",
+      placeholder: "GPT-5.5",
+      value: existing?.display_name?.en ?? "" });
+    const modalitySel = h("select", { class: "input" },
+      h("option", { value: "text", selected: (existing?.modality ?? "text") === "text" }, "text"),
+      h("option", { value: "image", selected: existing?.modality === "image" }, "image"),
+      h("option", { value: "audio", selected: existing?.modality === "audio" }, "audio"),
+      h("option", { value: "video", selected: existing?.modality === "video" }, "video"),
+    );
+    const m = (n) => n == null ? "" : (n / 1_000_000).toFixed(4);
+    const inputRate = h("input", { class: "input", type: "number", step: "0.0001", min: "0", placeholder: "USD per 1M",
+      value: m(existing?.input_rate_micros) });
+    const cachedRate = h("input", { class: "input", type: "number", step: "0.0001", min: "0", placeholder: "USD per 1M",
+      value: m(existing?.cached_input_rate_micros) });
+    const outputRate = h("input", { class: "input", type: "number", step: "0.0001", min: "0", placeholder: "USD per 1M",
+      value: m(existing?.output_rate_micros) });
+    const activeChk = h("input", { type: "checkbox", checked: existing?.active !== false });
+    const notesArea = h("textarea", { class: "input", rows: 2, placeholder: "OpenAI standard tier, …" }, existing?.notes ?? "");
+
+    const field = (label, control) => h("div", { style: "margin-bottom: 12px;" },
+      h("label", { style: "display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 4px;" }, label),
+      control,
+    );
+
+    const body = h("div", { style: "display: grid; grid-template-columns: 1fr 1fr; gap: 12px;" },
+      field("Model id (e.g. gpt-5.4)", modelInput),
+      field("Display name (English)", displayInput),
+      field("Modality", modalitySel),
+      field("", h("label", { style: "display: flex; align-items: center; gap: 6px; font-size: 13px; padding-top: 22px;" }, activeChk, "Active")),
+      field("Input rate (USD per 1M tokens)", inputRate),
+      field("Cached-input rate", cachedRate),
+      field("Output rate", outputRate),
+      h("div", { style: "grid-column: 1/-1;" }, field("Notes", notesArea)),
+    );
+
+    Modal.open({
+      title: isNew ? "Add model pricing" : `Edit pricing — ${existing.model_id}`,
+      body,
+      primary: { label: "Save", onClick: async () => {
+        const toMicros = (v) => v === "" || v == null ? null : Math.round(parseFloat(v) * 1_000_000);
+        const payload = {
+          model_id: modelInput.value.trim(),
+          display_name: displayInput.value.trim() ? { en: displayInput.value.trim() } : {},
+          pricing_kind: "tokens",
+          modality: modalitySel.value,
+          input_rate_micros: toMicros(inputRate.value),
+          cached_input_rate_micros: toMicros(cachedRate.value),
+          output_rate_micros: toMicros(outputRate.value),
+          active: activeChk.checked,
+          notes: notesArea.value.trim() || null,
+          source_url: existing?.source_url ?? "https://developers.openai.com/api/docs/pricing",
+        };
+        if (!payload.model_id) {
+          toast("warning", "model_id is required");
+          return false;
+        }
+        try {
+          await api("POST", "/api/user-service/billing/pricing", payload);
+          toast("success", `Pricing saved for ${payload.model_id}`);
+          Modal.close();
+          if (onSaved) onSaved();
+        } catch (e) {
+          toast("error", "Save failed", e.message);
+        }
+      } },
+      secondary: { label: "Cancel" },
+    });
+  }
+
   // ---------------------------------------------------------------
   async function renderProductsView(root) {
     setActiveNav("products");
@@ -13156,6 +13460,7 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
     { slug: "xout",         label: "Xout",         render: renderXoutView,     icon: '<path d="M2 8h4M10 8h4M6 4l4 4-4 4M10 4l-4 4 4 4"/>' },
     { slug: "users",        label: "Users",        render: renderUsersView,    icon: '<circle cx="8" cy="5" r="2.5"/><path d="M3 14c0-2.8 2.2-5 5-5s5 2.2 5 5"/>' },
     { slug: "products",     label: "Products",     render: renderProductsView, icon: '<path d="M2 4l6-2 6 2v8l-6 2-6-2V4z"/><path d="M2 4l6 2 6-2"/><path d="M8 6v8"/>' },
+    { slug: "billing",      label: "Billing",      render: renderBillingView,  icon: '<path d="M2 4h12v8H2z"/><path d="M2 7h12"/><path d="M5 10h2M9 10h3"/>' },
     { slug: "databases",    label: "Databases",    render: renderDatabasesView, icon: '<ellipse cx="8" cy="3.5" rx="5" ry="1.5"/><path d="M3 3.5v9c0 .8 2.2 1.5 5 1.5s5-.7 5-1.5v-9"/><path d="M3 8c0 .8 2.2 1.5 5 1.5s5-.7 5-1.5"/>' },
     { slug: "logs",         label: "Logs",         render: renderLogsView,     icon: '<rect x="2" y="2" width="12" height="12" rx="2"/><path d="M5 6h6M5 9h6M5 12h3"/>' },
     { slug: "settings",     label: "Settings",     render: renderSettingsView, icon: '<circle cx="8" cy="8" r="2"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M3.2 12.8l1.4-1.4M11.4 4.6l1.4-1.4"/>' },

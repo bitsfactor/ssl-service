@@ -223,7 +223,12 @@ CREATE TABLE IF NOT EXISTS services (
   name TEXT PRIMARY KEY,
   display_name TEXT NOT NULL,
   description TEXT,
-  github_repo_url TEXT NOT NULL,
+  -- Nullable since 2026-05-09: services with `local_repo_dir` set
+  -- and no GitHub mirror are deployed via local-deploy mode (the
+  -- admin tars + ssh-pushes the source dir). The deploy code path
+  -- already treats empty github_repo_url as the "use local" trigger;
+  -- the column was previously NOT NULL purely by historical accident.
+  github_repo_url TEXT,
   default_branch TEXT NOT NULL DEFAULT 'main',
   compose_file TEXT NOT NULL DEFAULT 'docker-compose.yml',
   install_dir_template TEXT NOT NULL DEFAULT '/opt/{name}',
@@ -239,6 +244,8 @@ CREATE TABLE IF NOT EXISTS services (
 -- For already-existing tables (idempotent additive migration)
 ALTER TABLE services ADD COLUMN IF NOT EXISTS compose_template TEXT;
 ALTER TABLE services ADD COLUMN IF NOT EXISTS config_files JSONB NOT NULL DEFAULT '{}'::jsonb;
+-- Drop NOT NULL on github_repo_url for existing deployments (idempotent).
+ALTER TABLE services ALTER COLUMN github_repo_url DROP NOT NULL;
 
 DROP TRIGGER IF EXISTS services_touch_updated_at ON services;
 CREATE TRIGGER services_touch_updated_at

@@ -7,7 +7,38 @@ services:
     env_file:
       - .env
     ports:
+      # NB: 0.0.0.0 binding is required because Caddy on the edge node
+      # (us01) connects to user.develop.cc upstream → xcenter:8200 over
+      # the public network. A future iteration should put us01↔xcenter
+      # on a private network (Tailscale / WireGuard) and rebind to that
+      # private interface; until then, the port is internet-reachable.
+      # User-service handles its own auth (cookies + ADMIN_SERVICE_TOKEN)
+      # so direct hits without credentials are rejected.
       - "8200:${PORT}"
     volumes:
       - /opt/user/data:/app/data
       - /opt/user/logs:/app/logs
+    # ---- Isolation hardening (xcenter is shared host) ----
+    # Cap memory so a runaway request can't OOM-kill the host. 512m
+    # is comfortable headroom over user-service's measured ~80m
+    # working set; raise this if profiling shows otherwise.
+    mem_limit: 512m
+    mem_reservation: 128m
+    # Cap CPU at 1 core. user-service is I/O-bound (Postgres + HTTP)
+    # so 1 CPU is plenty; this stops a hot loop from eating all cores.
+    cpus: "1.0"
+    # Bound the json-file logger so a chatty error doesn't fill /var.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # No NEW_PRIV: drop the bit that lets a setuid binary inside the
+    # container regain privileges if compromised.
+    security_opt:
+      - no-new-privileges:true
+    # Read-only root FS would be ideal, but FastAPI + uvicorn occasionally
+    # write to /tmp (multipart parsing). We keep root writable but
+    # mount /tmp as a tmpfs of bounded size as a compromise.
+    tmpfs:
+      - /tmp:size=64m
