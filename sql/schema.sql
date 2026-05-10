@@ -1260,3 +1260,243 @@ UPDATE products SET service_code = 'xout'
 
 -- Index for service-filtered queries used by /api/products?service=chat.
 CREATE INDEX IF NOT EXISTS idx_products_service_code ON products (service_code);
+
+-- Commands palette ---------------------------------------------------------
+-- Operator-facing button catalog for the admin SPA's #/commands page.
+-- Replaces the old "write a .command shell script, double-click via
+-- Finder, screenshot the terminal" loop with one-click forms backed by
+-- audited backend endpoints. Lives on the home schema (the registry is
+-- per-operator, not per-tenant).
+--
+-- ``schema``  — JSONB array of ``{name, label, type, required?, options?,
+--               default?}`` entries describing the form the SPA renders.
+-- ``exec``    — JSONB ``{kind: 'local-run' | 'service-deploy' | 'node-run'
+--               | 'db-apply-schema' | 'db-run-sql' | 'admin-restart'
+--               | 'local-git-commit-push' | 'local-repo-sync', args: {...},
+--               timeout_s?: int}``. ``args`` is merged with the operator's
+--               form values at run time (form values take precedence).
+-- ``is_builtin`` — true for rows seeded from this file. Custom rows added
+--               via the UI default to false. Builtins re-seed on every
+--               apply-schema via INSERT ... ON CONFLICT (id) DO NOTHING,
+--               so their definitions evolve over time without overwriting
+--               operator edits.
+CREATE TABLE IF NOT EXISTS commands_catalog (
+  id            TEXT PRIMARY KEY,
+  title         TEXT NOT NULL,
+  description   TEXT,
+  category      TEXT NOT NULL,
+  schema        JSONB NOT NULL DEFAULT '[]'::jsonb,
+  exec          JSONB NOT NULL,
+  is_builtin    BOOLEAN NOT NULL DEFAULT FALSE,
+  sort_order    INTEGER NOT NULL DEFAULT 100,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_commands_catalog_category
+  ON commands_catalog (category, sort_order, id);
+
+-- One row per command invocation. Used for the "history" modal and the
+-- "re-run with same args" affordance. ``stdout_head`` / ``stderr_head``
+-- store the first 64 KiB of output (operator can see the full output in
+-- the response of the original run, not in the audit log).
+-- ON DELETE SET NULL preserves audit history when a catalog row is
+-- removed: the historical run still tells the operator "something
+-- ran with these args at this time", which matters for incident
+-- review even after the command_id has been reaped.
+CREATE TABLE IF NOT EXISTS command_runs (
+  id            BIGSERIAL PRIMARY KEY,
+  command_id    TEXT REFERENCES commands_catalog(id) ON DELETE SET NULL,
+  args_json     JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status        TEXT NOT NULL,
+  exit_code     INTEGER,
+  stdout_head   TEXT,
+  stderr_head   TEXT,
+  error_message TEXT,
+  started_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  finished_at   TIMESTAMPTZ
+);
+
+-- Idempotent FK upgrade for command_runs tables created before the
+-- ON DELETE SET NULL constraint was added (initial drop).
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'command_runs_command_id_fkey'
+      AND conrelid = 'command_runs'::regclass
+  ) THEN
+    ALTER TABLE command_runs
+      ADD CONSTRAINT command_runs_command_id_fkey
+      FOREIGN KEY (command_id) REFERENCES commands_catalog(id)
+      ON DELETE SET NULL;
+  END IF;
+END;
+$$;
+
+CREATE INDEX IF NOT EXISTS idx_command_runs_recent
+  ON command_runs (command_id, started_at DESC);
+
+-- Builtin command seed. Idempotent: ``ON CONFLICT (id) DO NOTHING`` keeps
+-- operator edits to a builtin row intact. To roll out an updated builtin
+-- definition, bump the id (e.g. ``deploy-service-v2``) or have the
+-- operator delete the old row.
+INSERT INTO commands_catalog (id, title, description, category, schema, exec, is_builtin, sort_order)
+VALUES
+  -- Quick actions ---------------------------------------------------------
+  ('restart-admin',
+   'Restart admin',
+   'os.execv the admin process. The SPA re-connects within ~5s.',
+   'quick',
+   '[]'::jsonb,
+   '{"kind":"admin-restart","args":{}}'::jsonb,
+   TRUE, 10),
+
+  ('apply-schema',
+   'Apply schema',
+   'Run sql/schema.sql against a registered database. Idempotent — safe to re-run.',
+   'quick',
+   '[{"name":"db_id","label":"Database","type":"db_id","required":true}]'::jsonb,
+   '{"kind":"db-apply-schema","args":{}}'::jsonb,
+   TRUE, 20),
+
+  ('run-sql',
+   'Run SQL',
+   'Execute a SQL statement against a registered database. Multiple statements separated by semicolons are allowed.',
+   'db',
+   '[{"name":"db_id","label":"Database","type":"db_id","required":true},
+     {"name":"sql","label":"SQL","type":"textarea","required":true,"placeholder":"SELECT now();"}]'::jsonb,
+   '{"kind":"db-run-sql","args":{}}'::jsonb,
+   TRUE, 30),
+
+  -- Free-form -------------------------------------------------------------
+  ('free-form-run',
+   'Free-form shell (host)',
+   'Run a shell command on the host where admin runs (the operator''s Mac). 60s default timeout.',
+   'free',
+   '[{"name":"cmd","label":"Command","type":"textarea","required":true,"placeholder":"git log --oneline -5"},
+     {"name":"cwd","label":"Working dir","type":"text","required":false,"placeholder":"defaults to repo root"}]'::jsonb,
+   '{"kind":"local-run","args":{}}'::jsonb,
+   TRUE, 100),
+
+  ('node-run',
+   'Free-form shell (remote node)',
+   'Run a shell command on a managed node via the platform''s SSH mux.',
+   'remote',
+   '[{"name":"node_name","label":"Node","type":"node_name","required":true},
+     {"name":"cmd","label":"Command","type":"textarea","required":true,"placeholder":"docker ps"}]'::jsonb,
+   '{"kind":"node-run","args":{}}'::jsonb,
+   TRUE, 110),
+
+  -- Git workflows ---------------------------------------------------------
+  ('git-commit-push-ssl-service',
+   'Commit + push (ssl-service)',
+   'Stage everything in the ssl-service main checkout, commit with the given message, and push to origin/main.',
+   'git',
+   '[{"name":"message","label":"Commit message","type":"text","required":true,"placeholder":"chore: …"},
+     {"name":"paths","label":"Paths (blank = all)","type":"text","required":false,"placeholder":"src/foo.py docs/"}]'::jsonb,
+   '{"kind":"local-git-commit-push","args":{"repo_path":"."}}'::jsonb,
+   TRUE, 200),
+
+  ('git-commit-push-chatbot',
+   'Commit + push (chatbot submodule)',
+   'Stage everything in service-source/chatbot, commit, and push to origin/main of the chatbot.git remote.',
+   'git',
+   '[{"name":"message","label":"Commit message","type":"text","required":true,"placeholder":"feat(chat): …"},
+     {"name":"paths","label":"Paths (blank = all)","type":"text","required":false}]'::jsonb,
+   '{"kind":"local-git-commit-push","args":{"repo_path":"service-source/chatbot"}}'::jsonb,
+   TRUE, 210),
+
+  ('git-bump-chatbot-submodule',
+   'Bump chatbot submodule pointer',
+   'cd into ssl-service, ``git add service-source/chatbot``, commit "chore: bump chatbot submodule to <sha>", push.',
+   'git',
+   '[]'::jsonb,
+   '{"kind":"local-run","args":{"cmd":"set -e; cd service-source/chatbot && SHA=$(git rev-parse --short HEAD) && cd ../.. && git add service-source/chatbot && git commit -m \"chore: bump chatbot submodule to ${SHA}\" && git push origin main","cwd":"."}}'::jsonb,
+   TRUE, 220),
+
+  ('git-discard-and-pull-ssl-service',
+   'Discard local + pull (ssl-service)',
+   'Reset and clean the ssl-service working tree, then pull origin/main. Recovers from "uncommitted changes block deploy".',
+   'git',
+   '[]'::jsonb,
+   '{"kind":"local-repo-sync","args":{"repo_path":".","branch":"main"}}'::jsonb,
+   TRUE, 230),
+
+  -- Service deploys -------------------------------------------------------
+  ('deploy-service',
+   'Deploy service (parametrised)',
+   'Trigger a full deploy of a service. Optionally restrict to specific nodes; default uses the service''s default_node.',
+   'deploy',
+   '[{"name":"service_name","label":"Service","type":"service_name","required":true},
+     {"name":"nodes","label":"Nodes (comma-separated, blank = default)","type":"text","required":false,"placeholder":"xcenter,us01"},
+     {"name":"force_rebuild","label":"Force rebuild (--build --force-recreate)","type":"checkbox","required":false}]'::jsonb,
+   '{"kind":"service-deploy","args":{}}'::jsonb,
+   TRUE, 300),
+
+  ('deploy-chat',
+   'Deploy chat',
+   'Deploy the chat service to its default node (xcenter).',
+   'deploy',
+   '[{"name":"force_rebuild","label":"Force rebuild","type":"checkbox","required":false}]'::jsonb,
+   '{"kind":"service-deploy","args":{"service_name":"chat"}}'::jsonb,
+   TRUE, 310),
+
+  ('deploy-chatbot',
+   'Deploy chatbot',
+   'Deploy the chatbot service to its default node (xcenter).',
+   'deploy',
+   '[{"name":"force_rebuild","label":"Force rebuild","type":"checkbox","required":false}]'::jsonb,
+   '{"kind":"service-deploy","args":{"service_name":"chatbot"}}'::jsonb,
+   TRUE, 320),
+
+  ('deploy-user',
+   'Deploy user-service',
+   'Deploy the user-service backend to xcenter.',
+   'deploy',
+   '[{"name":"force_rebuild","label":"Force rebuild","type":"checkbox","required":false}]'::jsonb,
+   '{"kind":"service-deploy","args":{"service_name":"user"}}'::jsonb,
+   TRUE, 330),
+
+  ('deploy-user-center',
+   'Deploy user-center',
+   'Deploy the Next.js user-center frontend to xcenter.',
+   'deploy',
+   '[{"name":"force_rebuild","label":"Force rebuild","type":"checkbox","required":false}]'::jsonb,
+   '{"kind":"service-deploy","args":{"service_name":"user-center"}}'::jsonb,
+   TRUE, 340),
+
+  ('deploy-xout',
+   'Deploy xout',
+   'Deploy the xout product loop to its default node.',
+   'deploy',
+   '[{"name":"nodes","label":"Nodes (comma-separated, blank = default)","type":"text","required":false}]'::jsonb,
+   '{"kind":"service-deploy","args":{"service_name":"xout"}}'::jsonb,
+   TRUE, 350),
+
+  -- Remote node ops -------------------------------------------------------
+  ('xcenter-docker-ps',
+   'xcenter docker ps',
+   'List running containers on xcenter.',
+   'remote',
+   '[]'::jsonb,
+   '{"kind":"node-run","args":{"node_name":"xcenter","cmd":"docker ps --format ''table {{.Names}}\\t{{.Status}}\\t{{.Ports}}''"}}'::jsonb,
+   TRUE, 400),
+
+  ('xcenter-docker-logs',
+   'xcenter docker logs',
+   'Tail the last N lines of a container''s logs on xcenter.',
+   'remote',
+   '[{"name":"container","label":"Container","type":"text","required":true,"placeholder":"chat / chatbot / user / user-center / xout"},
+     {"name":"tail","label":"Lines","type":"text","required":false,"placeholder":"100"}]'::jsonb,
+   '{"kind":"node-run","args":{"node_name":"xcenter","cmd":"docker logs --tail ${tail:-100} ${container}"},"timeout_s":30}'::jsonb,
+   TRUE, 410),
+
+  ('xcenter-clear-orphan-chat',
+   'xcenter: stop + remove orphan ''chat'' (lobehub) container',
+   'Tear down the legacy lobehub ``chat`` container that was retired when chatbot took over chat.develop.cc.',
+   'remote',
+   '[]'::jsonb,
+   '{"kind":"node-run","args":{"node_name":"xcenter","cmd":"docker stop chat 2>/dev/null; docker rm chat 2>/dev/null; echo done"}}'::jsonb,
+   TRUE, 420)
+ON CONFLICT (id) DO NOTHING;

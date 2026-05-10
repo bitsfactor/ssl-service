@@ -55,6 +55,7 @@ from . import nodes_init as nodes_init_mod
 from . import db_sync as db_sync_mod
 from . import db_registry as db_registry_mod
 from . import services_create as services_create_mod
+from . import commands as commands_mod
 
 LOGGER = logging.getLogger("ssl_proxy_controller.admin")
 
@@ -6990,6 +6991,311 @@ def _build_router(ctx: AdminContext) -> _Router:
     return _json_response(HTTPStatus.OK,
                           refresh_service_nodes(ctx, request.path_params["name"]))
 
+  # ---- Commands palette --------------------------------------------------
+  # Backs the admin SPA's #/commands page. Three executor endpoints
+  # (/api/local/run, /api/local/git/commit-push, /api/local/repo-sync) plus
+  # the catalog CRUD/dispatch endpoints (/api/commands*). Every run lands
+  # an audit row in command_runs.
+  #
+  # The local-* endpoints widen the attack surface from "shell on managed
+  # nodes via SSH" to "shell on the host where admin runs (operator's Mac)".
+  # Trust level is unchanged — the operator already has a terminal there
+  # and the same admin token already lets them shell out to every managed
+  # node — but the explicit acknowledgement matters.
+
+  def _dispatch_command(exec_spec: dict[str, Any], merged_args: dict[str, Any]) -> commands_mod.CommandResult:
+    """Dispatch a parsed catalog ``exec`` spec onto the right executor.
+
+    NOTE: audit logging is the caller's responsibility — this function
+    must NEVER call ``commands_mod.run_with_audit``. The
+    ``commands_run_handler`` brackets each call with insert_run_start +
+    update_run_finish, and the direct ``/api/local/*`` handlers do the
+    same via ``run_with_audit``. Wrapping here would double-write rows.
+    """
+    kind = (exec_spec.get("kind") or "").strip() if isinstance(exec_spec, dict) else ""
+    if kind == "local-run":
+      return commands_mod.run_local_shell(merged_args)
+    if kind == "local-git-commit-push":
+      return commands_mod.run_local_git_commit_push(merged_args)
+    if kind == "local-repo-sync":
+      return commands_mod.run_local_repo_sync(merged_args)
+    if kind == "service-deploy":
+      service_name = (merged_args.get("service_name") or "").strip()
+      if not service_name:
+        return commands_mod.CommandResult(ok=False, error="service_name is required")
+      payload: dict[str, Any] = {}
+      nodes_raw = merged_args.get("nodes")
+      if isinstance(nodes_raw, str) and nodes_raw.strip():
+        payload["nodes"] = [n.strip() for n in nodes_raw.split(",") if n.strip()]
+      elif isinstance(nodes_raw, list):
+        payload["nodes"] = [str(n).strip() for n in nodes_raw if str(n).strip()]
+      if merged_args.get("force_rebuild"):
+        payload["force_rebuild"] = True
+      payload["triggered_by"] = "commands"
+      try:
+        out = deploy_service_to_nodes(ctx, service_name, payload)
+      except HttpError as exc:
+        return commands_mod.CommandResult(ok=False, exit_code=None, error=exc.message)
+      except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("commands: service-deploy raised")
+        return commands_mod.CommandResult(ok=False, error=f"{type(exc).__name__}: {exc}")
+      summary_lines = [
+        f"service={service_name}",
+        f"nodes={','.join(out.get('nodes', [])) if isinstance(out.get('nodes'), list) else ''}",
+      ]
+      results = out.get("results") if isinstance(out, dict) else None
+      if isinstance(results, list):
+        for r in results:
+          if isinstance(r, dict):
+            summary_lines.append(f"  {r.get('node')}: {r.get('status')}")
+      ok = True
+      if isinstance(out, dict) and out.get("errors"):
+        ok = False
+      return commands_mod.CommandResult(
+        ok=ok, exit_code=0 if ok else 1,
+        stdout="\n".join(summary_lines),
+        command=f"deploy {service_name}",
+        extra={"deploy_result": out},
+      )
+    if kind == "node-run":
+      node_name = (merged_args.get("node_name") or "").strip()
+      cmd = (merged_args.get("cmd") or "").strip()
+      if not node_name:
+        return commands_mod.CommandResult(ok=False, error="node_name is required")
+      if not cmd:
+        return commands_mod.CommandResult(ok=False, error="cmd is required")
+      # Use the same coerce helper as local-run so timeout_s=0/negative/oversize
+      # behaves consistently across executor kinds.
+      timeout_s = commands_mod._coerce_timeout(
+        merged_args, commands_mod._DEFAULT_TIMEOUT_S["node-run"],
+      )
+      try:
+        out = run_node_command_action(ctx, node_name, {
+          "command": cmd,
+          "timeout": timeout_s,
+        })
+      except HttpError as exc:
+        return commands_mod.CommandResult(ok=False, exit_code=None, error=exc.message)
+      return commands_mod.CommandResult(
+        ok=(out.get("exit_code") == 0),
+        exit_code=out.get("exit_code"),
+        stdout=commands_mod._trim(out.get("stdout") or ""),
+        stderr=commands_mod._trim(out.get("stderr") or ""),
+        duration_ms=int(float(out.get("duration_seconds") or 0) * 1000),
+        command=out.get("command"),
+        extra={"node": node_name},
+      )
+    if kind == "db-apply-schema":
+      db_id = (merged_args.get("db_id") or "").strip()
+      if not db_id:
+        return commands_mod.CommandResult(ok=False, error="db_id is required")
+      try:
+        dsn = _resolve_dsn_or_400(db_id)
+      except HttpError as exc:
+        return commands_mod.CommandResult(ok=False, error=exc.message)
+      schema_path = Path(__file__).resolve().parent.parent.parent / "sql" / "schema.sql"
+      if not schema_path.is_file():
+        return commands_mod.CommandResult(ok=False, error="schema.sql not found on this admin's filesystem")
+      sql_text = schema_path.read_text()
+      try:
+        out = db_sync_mod.apply_schema(dsn, sql_text)
+      except Exception as exc:  # noqa: BLE001
+        return commands_mod.CommandResult(ok=False, error=f"apply schema failed: {exc}")
+      missing = out.get("missing_tables") or []
+      summary = (f"schema applied to {db_id}; missing_after={len(missing)}"
+                 + (f" ({', '.join(missing)})" if missing else ""))
+      return commands_mod.CommandResult(
+        ok=True, exit_code=0, stdout=summary,
+        command=f"apply schema → {db_id}",
+        extra={"apply_result": out},
+      )
+    if kind == "db-run-sql":
+      db_id = (merged_args.get("db_id") or "").strip()
+      sql = (merged_args.get("sql") or "").strip()
+      if not db_id:
+        return commands_mod.CommandResult(ok=False, error="db_id is required")
+      if not sql:
+        return commands_mod.CommandResult(ok=False, error="sql is required")
+      try:
+        dsn = _resolve_dsn_or_400(db_id)
+      except HttpError as exc:
+        return commands_mod.CommandResult(ok=False, error=exc.message)
+      try:
+        import psycopg
+        from psycopg.rows import dict_row as _dict_row
+        # connect_timeout caps how long we'll wait for the TCP+TLS+auth
+        # handshake; the per-statement clock starts after that. We also
+        # set statement_timeout so a runaway query can't pin the admin
+        # process forever — the operator can override via timeout_s for
+        # legitimately long migrations.
+        sql_timeout_ms = int(commands_mod._coerce_timeout(
+          merged_args, commands_mod._DEFAULT_TIMEOUT_S["db-run-sql"],
+        ) * 1000)
+        t0 = time.monotonic()
+        rows: list[Any] = []
+        rowcount: int | None = None
+        with psycopg.connect(dsn, row_factory=_dict_row, connect_timeout=10) as conn:
+          with conn.cursor() as cur:
+            cur.execute(f"SET statement_timeout = {sql_timeout_ms}")
+            cur.execute(sql)
+            rowcount = cur.rowcount
+            try:
+              rows = list(cur.fetchall() or [])
+            except psycopg.ProgrammingError:
+              rows = []  # statement returned no rows (DDL / UPDATE / etc.)
+        duration_ms = int((time.monotonic() - t0) * 1000)
+      except Exception as exc:  # noqa: BLE001
+        return commands_mod.CommandResult(ok=False, error=f"sql failed: {exc}")
+      stdout = json.dumps(_to_jsonable(rows), ensure_ascii=False, indent=2) if rows else ""
+      return commands_mod.CommandResult(
+        ok=True, exit_code=0,
+        stdout=stdout or f"(no rows; rowcount={rowcount})",
+        duration_ms=duration_ms,
+        command=f"sql → {db_id}",
+        extra={"rows": _to_jsonable(rows), "rowcount": rowcount},
+      )
+    if kind == "admin-restart":
+      # We can't actually restart synchronously and return a result —
+      # the caller's response would be cut short. Reuse the existing
+      # restart path which schedules an exec on a background thread
+      # after a short delay.
+      _require_readwrite(ctx)
+      delay = 1.5
+      def _do_restart() -> None:
+        try: time.sleep(delay)
+        except Exception: pass
+        try: ctx.database.close()
+        except Exception: LOGGER.exception("commands: admin-restart database.close failed")
+        argv0 = sys.argv[0] or ""
+        rest = list(sys.argv[1:])
+        pkg_root = Path(__file__).resolve().parent
+        if Path(argv0).resolve().parent == pkg_root and Path(argv0).name == "__main__.py":
+          new_argv = [sys.executable, "-m", pkg_root.name, *rest]
+        else:
+          new_argv = [sys.executable, argv0, *rest]
+        try:
+          os.execv(new_argv[0], new_argv)
+        except Exception:
+          LOGGER.exception("commands: admin-restart os.execv failed")
+      threading.Thread(target=_do_restart, name="admin-restart-from-commands", daemon=True).start()
+      return commands_mod.CommandResult(
+        ok=True, exit_code=0,
+        stdout=f"admin will re-exec in {delay:.1f}s; SPA should reconnect within ~5s",
+        command="os.execv(self)",
+      )
+    return commands_mod.CommandResult(ok=False, error=f"unknown executor kind: {kind!r}")
+
+  def local_run_handler(request: _Request) -> _Response:
+    """POST /api/local/run — shell on the host where admin runs."""
+    _require_readwrite(ctx)
+    payload = request.json_body() if request.body else {}
+    result = commands_mod.run_with_audit(
+      ctx.database, None, payload,
+      commands_mod.run_local_shell,
+    )
+    return _json_response(HTTPStatus.OK, result.to_dict())
+
+  def local_git_commit_push_handler(request: _Request) -> _Response:
+    """POST /api/local/git/commit-push — git add/commit/push wrapper."""
+    _require_readwrite(ctx)
+    payload = request.json_body() if request.body else {}
+    result = commands_mod.run_with_audit(
+      ctx.database, None, payload,
+      commands_mod.run_local_git_commit_push,
+    )
+    return _json_response(HTTPStatus.OK, result.to_dict())
+
+  def local_repo_sync_handler(request: _Request) -> _Response:
+    """POST /api/local/repo-sync — fetch + reset --hard origin/branch + clean -fdx."""
+    _require_readwrite(ctx)
+    payload = request.json_body() if request.body else {}
+    result = commands_mod.run_with_audit(
+      ctx.database, None, payload,
+      commands_mod.run_local_repo_sync,
+    )
+    return _json_response(HTTPStatus.OK, result.to_dict())
+
+  def commands_list_handler(_request: _Request) -> _Response:
+    rows = commands_mod.list_catalog(ctx.database)
+    return _json_response(HTTPStatus.OK, {
+      "commands": [_to_jsonable(r) for r in rows],
+    })
+
+  def commands_run_handler(request: _Request) -> _Response:
+    _require_readwrite(ctx)
+    command_id = request.path_params["id"]
+    row = commands_mod.get_catalog_row(ctx.database, command_id)
+    if row is None:
+      raise HttpError(HTTPStatus.NOT_FOUND,
+                      f"command not found: {command_id}",
+                      code="command_not_found")
+    body = request.json_body() if request.body else {}
+    form_args = body.get("args") if isinstance(body.get("args"), dict) else body
+    if not isinstance(form_args, dict):
+      form_args = {}
+    exec_spec = row.get("exec") or {}
+    if isinstance(exec_spec, str):
+      try:
+        exec_spec = json.loads(exec_spec)
+      except (json.JSONDecodeError, TypeError) as exc:
+        # A malformed exec column is a catalog-row authoring bug. Surface
+        # it to the operator instead of silently degrading to "unknown
+        # executor kind" — they need to know to fix the row, not retry
+        # the form.
+        LOGGER.warning("commands: catalog row %s has invalid exec JSON: %s", command_id, exc)
+        return _json_response(HTTPStatus.OK, commands_mod.CommandResult(
+          ok=False, exit_code=None,
+          error=f"catalog row {command_id!r} has invalid exec JSON: {exc}",
+        ).to_dict())
+    base_args = dict((exec_spec.get("args") or {})) if isinstance(exec_spec, dict) else {}
+    # The catalog row's cmd may be a template like
+    # ``docker logs --tail ${tail:-100} ${container}`` — those need
+    # ${var} expansion against the merged form values. But if the
+    # operator typed the cmd themselves in a free-form-run card, we
+    # MUST NOT expand: a legitimate ${VAR} in their input (e.g. a
+    # Terraform command) would get replaced with empty. Track the
+    # cmd's origin so we only template-expand when the catalog row
+    # supplied it.
+    cmd_is_from_catalog = "cmd" in base_args and isinstance(base_args["cmd"], str)
+    # Form values override catalog args, except when the form leaves the
+    # field blank (so a catalog row can pre-fill required args).
+    merged: dict[str, Any] = dict(base_args)
+    cmd_from_form = False
+    for k, v in (form_args or {}).items():
+      if v is None:
+        continue
+      if isinstance(v, str) and v.strip() == "":
+        continue
+      if k == "cmd":
+        cmd_from_form = True
+      merged[k] = v
+    if cmd_is_from_catalog and not cmd_from_form and isinstance(merged.get("cmd"), str) \
+       and "${" in merged["cmd"]:
+      merged["cmd"] = commands_mod._expand_template(
+        merged["cmd"], commands_mod._stringify_args_for_shell(merged),
+      )
+    if isinstance(exec_spec, dict) and exec_spec.get("timeout_s") and "timeout_s" not in merged:
+      merged["timeout_s"] = exec_spec["timeout_s"]
+    run_id = commands_mod.insert_run_start(ctx.database, command_id, merged)
+    try:
+      result = _dispatch_command(exec_spec or {}, merged)
+    except Exception as exc:  # noqa: BLE001
+      LOGGER.exception("commands: dispatch raised")
+      result = commands_mod.CommandResult(ok=False, error=f"{type(exc).__name__}: {exc}")
+    commands_mod.update_run_finish(ctx.database, run_id, result)
+    payload_out = result.to_dict()
+    payload_out["command_id"] = command_id
+    payload_out["run_id"] = run_id
+    return _json_response(HTTPStatus.OK, payload_out)
+
+  def commands_runs_handler(request: _Request) -> _Response:
+    command_id = request.query_str("command_id") or None
+    limit = request.query_int("limit", 25)
+    rows = commands_mod.list_recent_runs(ctx.database, command_id, limit)
+    return _json_response(HTTPStatus.OK, {
+      "runs": [_to_jsonable(r) for r in rows],
+    })
+
   router.add("GET", "/api/services-summary", with_auth(services_summary_handler))
   router.add("GET",    "/api/databases", with_auth(databases_list_handler))
   router.add("POST",   "/api/databases", with_auth(databases_create_handler))
@@ -7006,6 +7312,13 @@ def _build_router(ctx: AdminContext) -> _Router:
   router.add("POST",   "/api/sync/apply", with_auth(sync_apply_handler))
   router.add("POST",   "/api/admin/restart", with_auth(admin_restart_handler))
   router.add("GET",    "/api/admin/version", with_auth(admin_version_handler))
+  # Commands palette — see _dispatch_command above.
+  router.add("POST",   "/api/local/run",                    with_auth(local_run_handler))
+  router.add("POST",   "/api/local/git/commit-push",        with_auth(local_git_commit_push_handler))
+  router.add("POST",   "/api/local/repo-sync",              with_auth(local_repo_sync_handler))
+  router.add("GET",    "/api/commands",                     with_auth(commands_list_handler))
+  router.add("POST",   "/api/commands/{id}/run",            with_auth(commands_run_handler))
+  router.add("GET",    "/api/commands/runs",                with_auth(commands_runs_handler))
   router.add("GET", "/api/services/{name}/nodes", with_auth(service_nodes_handler))
   router.add("POST", "/api/services/{name}/refresh", with_auth(service_refresh_handler))
   # New Service flow — distinct path so it doesn't collide with
