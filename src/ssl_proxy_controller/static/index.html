@@ -374,6 +374,111 @@
   }
   .tab:hover { color: var(--text); }
   .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* Commands page (#/commands) — tool-palette layout
+     Two-column: cards on the left, sticky output drawer on the right.
+     Collapses to a single column with a fixed-bottom drawer below 1100px. */
+  .commands-layout { display: flex; gap: 16px; align-items: flex-start; }
+  .commands-main { flex: 1; min-width: 0; }
+  .commands-drawer-wrap {
+    flex: 0 0 420px;
+    position: sticky; top: 16px;
+  }
+  .commands-drawer {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    max-height: calc(100vh - 32px);
+    overflow: auto;
+  }
+  @media (max-width: 1100px) {
+    .commands-layout { flex-direction: column; }
+    .commands-drawer-wrap {
+      flex: 0 0 auto; width: 100%; position: sticky; top: auto; bottom: 0;
+      z-index: 50;
+    }
+    .commands-drawer { max-height: 50vh; border-radius: 8px 8px 0 0; box-shadow: 0 -2px 12px rgba(0,0,0,0.08); }
+  }
+
+  .commands-recent {
+    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+    padding: 6px 0 10px 0; margin-bottom: 8px;
+    border-bottom: 1px dashed var(--border);
+  }
+  .commands-recent-label {
+    font-size: 11px; color: var(--text-dim); text-transform: uppercase;
+    letter-spacing: 0.4px; margin-right: 4px;
+  }
+  .commands-recent-pill {
+    background: var(--surface-alt); border: 1px solid var(--border);
+    border-radius: 999px; padding: 4px 10px;
+    font-size: 12px; color: var(--text); cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: inherit;
+  }
+  .commands-recent-pill:hover { background: var(--surface-2); border-color: var(--border-strong); }
+  .commands-recent-pill .when { color: var(--text-dim); font-size: 11px; }
+  .commands-recent-pill .dot {
+    width: 6px; height: 6px; border-radius: 50%; display: inline-block;
+    background: var(--success);
+  }
+  .commands-recent-pill .dot.failed { background: var(--danger); }
+
+  .commands-tabs { display: flex; gap: 2px; flex-wrap: wrap; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+  .commands-tab {
+    padding: 8px 14px; font-weight: 600; font-size: 13px;
+    color: var(--text-dim); cursor: pointer; border: 0; background: transparent;
+    border-bottom: 2px solid transparent; font-family: inherit;
+  }
+  .commands-tab:hover { color: var(--text); }
+  .commands-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .commands-tab .count {
+    margin-left: 6px; font-size: 11px; color: var(--text-soft);
+    background: var(--surface-2); border-radius: 10px; padding: 1px 6px;
+  }
+  .commands-tab.active .count { color: var(--accent); background: var(--accent-bg); }
+
+  .commands-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 12px;
+    align-items: stretch;
+  }
+  .commands-card {
+    display: flex; flex-direction: column; gap: 8px;
+    padding: 12px;
+    background: var(--surface-alt);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .commands-card .form-area { flex: 1; display: flex; flex-direction: column; gap: 6px; }
+  .commands-card .footer {
+    display: flex; gap: 8px; justify-content: flex-end;
+    margin-top: auto; padding-top: 4px;
+  }
+  .commands-card.is-active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-bg); }
+
+  .commands-drawer .drawer-empty {
+    color: var(--text-dim); font-size: 13px; text-align: center; padding: 24px 8px;
+  }
+  .commands-drawer .drawer-header {
+    display: flex; flex-direction: column; gap: 4px;
+    padding-bottom: 8px; border-bottom: 1px solid var(--border); margin-bottom: 8px;
+  }
+  .commands-drawer .drawer-title { font-weight: 600; font-size: 14px; }
+  .commands-drawer .drawer-meta { font-size: 11px; color: var(--text-dim); font-family: var(--mono); }
+  .commands-drawer .drawer-body {
+    font-family: var(--mono); font-size: 12px; white-space: pre-wrap;
+    max-height: 50vh; overflow: auto;
+  }
+  .commands-drawer .drawer-cmd { color: var(--text-dim); margin-bottom: 4px; }
+  .commands-drawer .drawer-stdout { color: var(--text); }
+  .commands-drawer .drawer-stderr { color: var(--warning); margin-top: 4px; }
+  .commands-drawer .drawer-tools {
+    display: flex; gap: 6px; margin-top: 8px; padding-top: 6px;
+    border-top: 1px dashed var(--border); flex-wrap: wrap;
+  }
 </style>
 </head>
 <body>
@@ -10991,13 +11096,24 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
   // executor kind. No client-side switch on kind; new builtin kinds
   // surface automatically as long as the backend dispatcher knows them.
   // ===========================================================================
+  // Category metadata used by the Commands page (tabs + grouping).
+  const COMMANDS_CATEGORY_ORDER = ["quick", "git", "deploy", "db", "remote", "free"];
+  const COMMANDS_CATEGORY_LABEL = {
+    quick:  "Quick",
+    git:    "Git",
+    deploy: "Deploy",
+    db:     "Database",
+    remote: "Remote",
+    free:   "Free-form",
+  };
+
   async function renderCommandsView(root) {
     setActiveNav("commands");
     root.innerHTML = "";
 
     root.appendChild(uiPageHeader(
       "Commands",
-      "Run common imperative actions on your host or remote nodes. Each card is a button-backed form; output streams inline.",
+      "Run common imperative actions on your host or remote nodes. Output streams into the right-hand drawer.",
     ));
 
     const status = h("p", { class: "muted" }, "Loading…");
@@ -11035,49 +11151,239 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
     }
 
     // ---- Group commands by category ----
-    const CATEGORY_ORDER = ["quick", "git", "deploy", "db", "remote", "free"];
-    const CATEGORY_LABEL = {
-      quick:  "Quick actions",
-      git:    "Git workflows",
-      deploy: "Service deploys",
-      db:     "Database",
-      remote: "Remote node ops",
-      free:   "Free-form",
-    };
     const grouped = {};
     for (const c of commands) {
       const cat = c.category || "free";
       (grouped[cat] = grouped[cat] || []).push(c);
     }
     const orderedCategories = [
-      ...CATEGORY_ORDER.filter((k) => grouped[k]),
-      ...Object.keys(grouped).filter((k) => !CATEGORY_ORDER.includes(k)),
+      ...COMMANDS_CATEGORY_ORDER.filter((k) => grouped[k]),
+      ...Object.keys(grouped).filter((k) => !COMMANDS_CATEGORY_ORDER.includes(k)),
     ];
 
+    // ---- Layout: left = main (recent + tabs + grids), right = drawer ----
+    const drawer = buildCommandsDrawer();
+    const main = h("div", { class: "commands-main" });
+    const layout = h("div", { class: "commands-layout" },
+      main,
+      h("aside", { class: "commands-drawer-wrap" }, drawer.el),
+    );
+    root.appendChild(layout);
+
+    // Recent strip (placeholder — populated below)
+    const recentStrip = h("div", { class: "commands-recent" });
+    main.appendChild(recentStrip);
+
+    // Tabs
+    const tabsBar = h("div", { class: "commands-tabs" });
+    main.appendChild(tabsBar);
+
+    // One grid per category. We keep all in DOM and toggle visibility so
+    // form state survives tab switches.
+    const gridByCategory = {};
+    const cardsById = new Map();           // cmd.id -> { card, applyArgs, triggerRun, category }
     for (const cat of orderedCategories) {
-      const section = uiSection(CATEGORY_LABEL[cat] || cat.toUpperCase());
-      const grid = h("div", { style: "display: grid; grid-template-columns: 1fr 1fr; gap: 12px;" });
-      section.appendChild(grid);
+      const grid = h("div", { class: "commands-grid" });
+      grid.style.display = "none";
+      gridByCategory[cat] = grid;
       for (const cmd of grouped[cat]) {
-        grid.appendChild(buildCommandCard(cmd, { dbs, nodes, services }));
+        const built = buildCommandCard(cmd, { dbs, nodes, services }, drawer);
+        cardsById.set(cmd.id, { ...built, category: cat });
+        grid.appendChild(built.card);
       }
-      root.appendChild(section);
+      main.appendChild(grid);
     }
+
+    function activateTab(cat) {
+      for (const c of orderedCategories) {
+        gridByCategory[c].style.display = c === cat ? "" : "none";
+      }
+      for (const btn of tabsBar.querySelectorAll(".commands-tab")) {
+        btn.classList.toggle("active", btn.dataset.cat === cat);
+      }
+    }
+
+    for (const cat of orderedCategories) {
+      const btn = h("button", { class: "commands-tab", "data-cat": cat },
+        COMMANDS_CATEGORY_LABEL[cat] || cat,
+        h("span", { class: "count" }, String(grouped[cat].length)),
+      );
+      btn.addEventListener("click", () => activateTab(cat));
+      tabsBar.appendChild(btn);
+    }
+    activateTab(orderedCategories[0]);
+
+    // Recent strip — last 5 runs across all commands; click to re-run.
+    async function refreshRecent() {
+      try {
+        const r = await api("GET", "/api/commands/runs?limit=5");
+        recentStrip.innerHTML = "";
+        recentStrip.appendChild(h("span", { class: "commands-recent-label" }, "Recent"));
+        const runs = r.runs || [];
+        if (!runs.length) {
+          recentStrip.appendChild(h("span", { class: "muted", style: "font-size: 12px;" },
+            "No runs yet."));
+          return;
+        }
+        for (const run of runs) {
+          const built = cardsById.get(run.command_id);
+          const title = (built && built.cmd && (built.cmd.title || built.cmd.id))
+                     || run.command_id;
+          const dotClass = run.status === "success" ? "dot" : "dot failed";
+          const pill = h("button", { class: "commands-recent-pill", title: run.command_id },
+            h("span", { class: dotClass }),
+            h("span", null, title),
+            h("span", { class: "when" }, fmtRelative(run.started_at)),
+          );
+          if (built) {
+            pill.addEventListener("click", () => {
+              activateTab(built.category);
+              built.applyArgs(run.args_json || {});
+              setTimeout(() => built.triggerRun(), 50);
+            });
+          } else {
+            pill.disabled = true;
+            pill.title = run.command_id + " — command no longer in catalog";
+          }
+          recentStrip.appendChild(pill);
+        }
+      } catch (_err) {
+        // Silent — Recent is a nice-to-have, don't block the page.
+      }
+    }
+    drawer.onAfterRun = refreshRecent;
+    refreshRecent();
   }
 
-  // Build one card for a commands_catalog row. Each card is self-contained:
-  // its own form state, its own output panel, its own history button.
-  function buildCommandCard(cmd, ctx) {
-    const card = h("div", {
-      class: "card",
-      style: "padding: 12px; display: flex; flex-direction: column; gap: 8px; background: var(--surface-alt);",
-    });
+  // Build the sticky output drawer. Returns an object with:
+  //   el          — the DOM element to mount
+  //   start({cmd, args, applyArgs, triggerRun})  — switch into "running" state
+  //   finish({cmd, result, durationMs, applyArgs, triggerRun})
+  //   error({cmd, err, applyArgs, triggerRun})
+  //   onAfterRun  — optional callback invoked after a run completes
+  //                 (used by Recent strip to refresh).
+  function buildCommandsDrawer() {
+    const el = h("div", { class: "commands-drawer" });
+    let activeCardEl = null;
+
+    function setActiveCard(card) {
+      if (activeCardEl) activeCardEl.classList.remove("is-active");
+      activeCardEl = card || null;
+      if (activeCardEl) activeCardEl.classList.add("is-active");
+    }
+
+    function showEmpty() {
+      el.innerHTML = "";
+      el.appendChild(h("div", { class: "drawer-empty" },
+        "Run any command to see its output here."));
+      setActiveCard(null);
+    }
+
+    function showRunning(cmd, ctxBits) {
+      el.innerHTML = "";
+      const header = h("div", { class: "drawer-header" },
+        h("div", { class: "drawer-title" }, cmd.title || cmd.id),
+        h("div", { class: "drawer-meta" }, "running…"),
+      );
+      el.appendChild(header);
+      el.appendChild(h("div", { class: "drawer-body muted" }, "Running…"));
+      setActiveCard(ctxBits && ctxBits.cardEl);
+    }
+
+    function showResult(cmd, result, durationMs, ctxBits) {
+      el.innerHTML = "";
+      const ok = !!result.ok;
+      const exit = result.exit_code != null ? `exit ${result.exit_code}` : (ok ? "ok" : "—");
+      const dur = result.duration_ms != null ? `${result.duration_ms}ms` : `${durationMs}ms`;
+      const ts = new Date().toLocaleTimeString();
+      const meta = `${ts} · ${dur} · ${exit}` + (result.cwd ? ` · ${result.cwd}` : "");
+      const header = h("div", { class: "drawer-header" },
+        h("div", { class: "drawer-title" }, cmd.title || cmd.id),
+        h("div", { class: "drawer-meta", style: `color: ${ok ? "var(--success)" : "var(--danger)"};` },
+          (ok ? "✓ " : "✗ ") + meta),
+      );
+      el.appendChild(header);
+
+      const body = h("div", { class: "drawer-body" });
+      if (result.command) {
+        body.appendChild(h("div", { class: "drawer-cmd" }, "$ " + result.command));
+      }
+      if (result.error) {
+        body.appendChild(h("div", { style: "color: var(--danger); margin-bottom: 4px;" },
+          result.error));
+      }
+      if (result.stdout) {
+        body.appendChild(h("div", { class: "drawer-stdout" }, result.stdout));
+      }
+      if (result.stderr) {
+        body.appendChild(h("div", { class: "drawer-stderr" }, result.stderr));
+      }
+      if (!result.stdout && !result.stderr && !result.error && !result.command) {
+        body.appendChild(h("div", { class: "muted" }, "(no output)"));
+      }
+      el.appendChild(body);
+
+      const tools = h("div", { class: "drawer-tools" });
+      if (result.stdout) {
+        const b = h("button", { class: "btn btn-sm" }, "Copy stdout");
+        b.addEventListener("click", () => navigator.clipboard.writeText(result.stdout).then(
+          () => toast("success", "stdout copied"),
+          () => toast("error", "copy failed"),
+        ));
+        tools.appendChild(b);
+      }
+      if (result.stderr) {
+        const b = h("button", { class: "btn btn-sm" }, "Copy stderr");
+        b.addEventListener("click", () => navigator.clipboard.writeText(result.stderr).then(
+          () => toast("success", "stderr copied"),
+          () => toast("error", "copy failed"),
+        ));
+        tools.appendChild(b);
+      }
+      if (ctxBits && ctxBits.triggerRun) {
+        const rb = h("button", { class: "btn btn-sm" }, "Re-run");
+        rb.addEventListener("click", () => ctxBits.triggerRun());
+        tools.appendChild(rb);
+      }
+      el.appendChild(tools);
+      setActiveCard(ctxBits && ctxBits.cardEl);
+    }
+
+    function showError(cmd, err, ctxBits) {
+      el.innerHTML = "";
+      const header = h("div", { class: "drawer-header" },
+        h("div", { class: "drawer-title" }, cmd.title || cmd.id),
+        h("div", { class: "drawer-meta", style: "color: var(--danger);" }, "request failed"),
+      );
+      el.appendChild(header);
+      el.appendChild(h("div", { class: "drawer-body", style: "color: var(--danger);" },
+        err && err.message ? err.message : String(err)));
+      setActiveCard(ctxBits && ctxBits.cardEl);
+    }
+
+    showEmpty();
+    return {
+      el,
+      start: showRunning,
+      finish: showResult,
+      error: showError,
+      onAfterRun: null,
+      _afterRun() { if (typeof this.onAfterRun === "function") this.onAfterRun(); },
+    };
+  }
+
+  // Build one card for a commands_catalog row. Returns { card, applyArgs,
+  // triggerRun, cmd } so the parent view can populate from history /
+  // recent runs and trigger Run programmatically. Output goes into the
+  // shared drawer, not back into the card itself.
+  function buildCommandCard(cmd, ctx, drawer) {
+    const card = h("div", { class: "commands-card" });
     card.appendChild(h("div", null,
       h("div", { style: "font-weight: 600; font-size: 14px;" }, cmd.title || cmd.id),
       h("div", { class: "muted", style: "font-size: 12px; margin-top: 2px;" },
         cmd.description || ""),
     ));
-    const form = h("div", { style: "display: flex; flex-direction: column; gap: 6px;" });
+    const form = h("div", { class: "form-area" });
     const inputs = {};
     const schema = Array.isArray(cmd.schema) ? cmd.schema
                  : (typeof cmd.schema === "string" ? JSON.parse(cmd.schema || "[]") : []);
@@ -11137,64 +11443,8 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
 
     const runBtn = h("button", { class: "btn btn-primary btn-sm" }, "Run");
     const historyBtn = h("button", { class: "btn btn-sm" }, "History");
-    card.appendChild(uiToolbar(runBtn, historyBtn));
+    card.appendChild(h("div", { class: "footer" }, historyBtn, runBtn));
 
-    const outputPanel = h("div", {
-      style: "display: none; margin-top: 4px; border: 1px solid var(--border); border-radius: 6px;"
-           + " background: var(--surface); padding: 8px; max-height: 320px; overflow: auto;"
-           + " font-family: var(--mono); font-size: 12px; white-space: pre-wrap;",
-    });
-    card.appendChild(outputPanel);
-
-    runBtn.addEventListener("click", async () => {
-      // Collect form values
-      const args = {};
-      for (const [name, info] of Object.entries(inputs)) {
-        if (info.type === "checkbox") {
-          args[name] = info.el.checked;
-        } else {
-          const v = (info.el.value || "").trim();
-          if (info.required && !v) {
-            toast("warning", `${name} is required`);
-            info.el.focus();
-            return;
-          }
-          if (v !== "") args[name] = v;
-        }
-      }
-      // Footgun-protect git-commit-push when paths is blank — the
-      // backend will run `git add -A` which sweeps the entire working
-      // tree, including unrelated pending edits. Force the operator to
-      // explicitly opt-in to that.
-      if (cmd.id && cmd.id.startsWith("git-commit-push") && !args.paths) {
-        const ok = window.confirm(
-          "No paths provided — this will stage EVERYTHING in the working tree "
-          + "(including any unrelated edits) and commit + push it. Continue?"
-        );
-        if (!ok) return;
-      }
-      runBtn.disabled = true;
-      runBtn.textContent = "Running…";
-      outputPanel.style.display = "block";
-      outputPanel.innerHTML = "";
-      outputPanel.appendChild(h("div", { class: "muted" }, "Running…"));
-      const t0 = Date.now();
-      try {
-        const result = await api("POST", `/api/commands/${encodeURIComponent(cmd.id)}/run`, { args });
-        renderResult(outputPanel, result, Date.now() - t0);
-      } catch (err) {
-        outputPanel.innerHTML = "";
-        outputPanel.appendChild(h("div", { style: "color: var(--danger);" },
-          "Request failed: " + (err.message || String(err))));
-      } finally {
-        runBtn.disabled = false;
-        runBtn.textContent = "Run";
-      }
-    });
-
-    // Helpers exposed to the history modal so a "Re-run" row can put
-    // the historical args back into THIS card's form and trigger Run
-    // — avoids the operator hand-typing the same payload again.
     function applyArgs(args) {
       if (!args || typeof args !== "object") return;
       for (const [name, info] of Object.entries(inputs)) {
@@ -11209,6 +11459,48 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
     }
     function triggerRun() { runBtn.click(); }
 
+    runBtn.addEventListener("click", async () => {
+      const args = {};
+      for (const [name, info] of Object.entries(inputs)) {
+        if (info.type === "checkbox") {
+          args[name] = info.el.checked;
+        } else {
+          const v = (info.el.value || "").trim();
+          if (info.required && !v) {
+            toast("warning", `${name} is required`);
+            info.el.focus();
+            return;
+          }
+          if (v !== "") args[name] = v;
+        }
+      }
+      // Footgun-protect git-commit-push when paths is blank — backend's
+      // `git add -A` will sweep the whole working tree including unrelated
+      // edits. Force the operator to opt in.
+      if (cmd.id && cmd.id.startsWith("git-commit-push") && !args.paths) {
+        const ok = window.confirm(
+          "No paths provided — this will stage EVERYTHING in the working tree "
+          + "(including any unrelated edits) and commit + push it. Continue?"
+        );
+        if (!ok) return;
+      }
+      runBtn.disabled = true;
+      runBtn.textContent = "Running…";
+      const ctxBits = { cardEl: card, applyArgs, triggerRun };
+      drawer.start(cmd, ctxBits);
+      const t0 = Date.now();
+      try {
+        const result = await api("POST", `/api/commands/${encodeURIComponent(cmd.id)}/run`, { args });
+        drawer.finish(cmd, result, Date.now() - t0, ctxBits);
+      } catch (err) {
+        drawer.error(cmd, err, ctxBits);
+      } finally {
+        runBtn.disabled = false;
+        runBtn.textContent = "Run";
+        drawer._afterRun();
+      }
+    });
+
     historyBtn.addEventListener("click", async () => {
       try {
         const r = await api("GET", `/api/commands/runs?command_id=${encodeURIComponent(cmd.id)}&limit=25`);
@@ -11218,56 +11510,7 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
       }
     });
 
-    return card;
-  }
-
-  function renderResult(panel, result, wallClockMs) {
-    panel.innerHTML = "";
-    const ok = !!result.ok;
-    const dur = result.duration_ms != null ? `${result.duration_ms}ms` : `${wallClockMs}ms`;
-    const exit = result.exit_code != null ? `exit ${result.exit_code}` : (ok ? "ok" : "—");
-    const header = h("div", {
-      style: `font-size: 11px; margin-bottom: 6px; color: ${ok ? "var(--success)" : "var(--danger)"};`,
-    },
-      `${ok ? "✓" : "✗"}  ${dur} · ${exit}` + (result.cwd ? ` · ${result.cwd}` : ""),
-    );
-    panel.appendChild(header);
-    if (result.command) {
-      panel.appendChild(h("div", { style: "color: var(--text-dim); margin-bottom: 4px;" },
-        "$ " + result.command));
-    }
-    if (result.error) {
-      panel.appendChild(h("div", { style: "color: var(--danger); margin-bottom: 4px;" },
-        result.error));
-    }
-    if (result.stdout) {
-      panel.appendChild(h("div", { style: "color: var(--text);" }, result.stdout));
-    }
-    if (result.stderr) {
-      panel.appendChild(h("div", { style: "color: var(--warning); margin-top: 4px;" },
-        result.stderr));
-    }
-    // Copy buttons
-    const tools = h("div", {
-      style: "display: flex; gap: 6px; margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--border);",
-    });
-    if (result.stdout) {
-      const b = h("button", { class: "btn btn-sm" }, "Copy stdout");
-      b.addEventListener("click", () => navigator.clipboard.writeText(result.stdout).then(
-        () => toast("success", "stdout copied"),
-        () => toast("error", "copy failed"),
-      ));
-      tools.appendChild(b);
-    }
-    if (result.stderr) {
-      const b = h("button", { class: "btn btn-sm" }, "Copy stderr");
-      b.addEventListener("click", () => navigator.clipboard.writeText(result.stderr).then(
-        () => toast("success", "stderr copied"),
-        () => toast("error", "copy failed"),
-      ));
-      tools.appendChild(b);
-    }
-    panel.appendChild(tools);
+    return { card, applyArgs, triggerRun, cmd };
   }
 
   // ``controls`` (optional) = { applyArgs(args), triggerRun() } closures
