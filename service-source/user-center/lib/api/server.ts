@@ -116,6 +116,31 @@ export type UsageInfo = {
   reset_kind: "daily" | "monthly" | "never";
   current_period_start: string;
   discount_factor: number;
+  /** Account-level trial credit remaining (cents). Added by Job 2. */
+  trial_credit_cents?: number;
+};
+
+export type TokenUsageRow = {
+  model_id: string;
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  cents: number;
+  images?: number;
+  image_cents?: number;
+};
+
+export type TokenUsagePeriod = {
+  by_model: TokenUsageRow[];
+  total_input_tokens: number;
+  total_cached_input_tokens: number;
+  total_output_tokens: number;
+  total_cents: number;
+};
+
+export type UsageTokens = {
+  today: TokenUsagePeriod;
+  all_time: TokenUsagePeriod;
 };
 
 export type Product = {
@@ -156,6 +181,7 @@ export type BootstrapData = {
   user: UserProfile;
   subscriptions: Subscription[];
   usage: UsageInfo | null;
+  usageTokens: UsageTokens | null;
   products: Product[];
   pricing: ModelPricing[];
 };
@@ -192,6 +218,16 @@ async function fetchUsage(): Promise<UsageInfo | null> {
       return body.billing as UsageInfo;
     }
     return body as UsageInfo;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchUsageTokens(): Promise<UsageTokens | null> {
+  try {
+    const res = await serverFetch("/api/me/usage-tokens");
+    if (!res.ok) return null;
+    return (await res.json()) as UsageTokens;
   } catch {
     return null;
   }
@@ -250,9 +286,10 @@ async function fetchPricing(): Promise<ModelPricing[]> {
 // so the layout + any page that calls it both get the same Promise.
 // ---------------------------------------------------------------------------
 export const getBootstrapData = cache(async (): Promise<BootstrapData | null> => {
-  const [meResult, usage, products, pricing] = await Promise.all([
+  const [meResult, usage, usageTokens, products, pricing] = await Promise.all([
     fetchMe(),
     fetchUsage(),
+    fetchUsageTokens(),
     fetchProducts(),
     fetchPricing(),
   ]);
@@ -261,6 +298,7 @@ export const getBootstrapData = cache(async (): Promise<BootstrapData | null> =>
     user: meResult.user,
     subscriptions: meResult.subscriptions,
     usage,
+    usageTokens,
     products,
     pricing,
   };

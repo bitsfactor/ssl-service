@@ -1,7 +1,7 @@
 "use client";
 
 import { useT, useI18n } from "@/lib/i18n/i18n-provider";
-import type { UsageInfo, Product, ModelPricing } from "@/lib/api/server";
+import type { UsageInfo, Product, ModelPricing, UsageTokens, TokenUsagePeriod } from "@/lib/api/server";
 import { resolveLocaleString } from "@/lib/products";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -66,12 +66,72 @@ function UsageBar({ consumed, limit }: { consumed: number; limit: number }) {
   );
 }
 
+const fmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+
+function TokenUsageTable({ period }: { period: TokenUsagePeriod }) {
+  const t = useT();
+  if (period.by_model.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground py-2">{t("billing.tokenNoData")}</p>
+    );
+  }
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-border/60 text-muted-foreground text-xs uppercase tracking-wide">
+            <th className="pb-2 text-left font-medium">{t("billing.modelLabel")}</th>
+            <th className="pb-2 text-right font-medium">{t("billing.inputTokens")}</th>
+            <th className="pb-2 text-right font-medium">{t("billing.cachedTokens")}</th>
+            <th className="pb-2 text-right font-medium">{t("billing.outputTokens")}</th>
+            <th className="pb-2 text-right font-medium">¢</th>
+          </tr>
+        </thead>
+        <tbody>
+          {period.by_model.map((row) => (
+            <tr key={row.model_id} className="border-b border-border/40 last:border-0">
+              <td className="py-2 pr-4 font-mono text-xs">{row.model_id}</td>
+              <td className="py-2 text-right tabular-nums text-xs">
+                {row.images != null
+                  ? `${fmt.format(row.images)} img`
+                  : fmt.format(row.input_tokens)}
+              </td>
+              <td className="py-2 text-right tabular-nums text-xs">
+                {row.cached_input_tokens ? fmt.format(row.cached_input_tokens) : "—"}
+              </td>
+              <td className="py-2 text-right tabular-nums text-xs">
+                {row.images != null
+                  ? "—"
+                  : fmt.format(row.output_tokens)}
+              </td>
+              <td className="py-2 text-right tabular-nums text-xs">
+                {row.cents.toFixed(2)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+        <tfoot>
+          <tr className="border-t border-border/60 font-medium text-xs">
+            <td className="pt-2 text-muted-foreground">Total</td>
+            <td className="pt-2 text-right tabular-nums">{fmt.format(period.total_input_tokens)}</td>
+            <td className="pt-2 text-right tabular-nums">{fmt.format(period.total_cached_input_tokens)}</td>
+            <td className="pt-2 text-right tabular-nums">{fmt.format(period.total_output_tokens)}</td>
+            <td className="pt-2 text-right tabular-nums">{period.total_cents.toFixed(2)}</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  );
+}
+
 export function BillingClient({
   usage,
+  usageTokens,
   products,
   pricing,
 }: {
   usage: UsageInfo | null;
+  usageTokens: UsageTokens | null;
   products: Product[];
   pricing: ModelPricing[];
 }) {
@@ -96,6 +156,28 @@ export function BillingClient({
           {t("billing.subtitle")}
         </p>
       </div>
+
+      {/* Account credit card (trial credit — Job 2) */}
+      {usage && typeof usage.trial_credit_cents === "number" ? (
+        <Card className="mb-6">
+          <CardHeader className="pb-3">
+            <CardTitle>{t("billing.trialCredit")}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-muted-foreground">{t("billing.trialCreditRemaining")}</span>
+              <span className="font-semibold tabular-nums">
+                {formatCents(usage.trial_credit_cents)}
+              </span>
+            </div>
+            {usage.trial_credit_cents === 0 ? (
+              <p className="mt-2 text-xs text-muted-foreground">
+                {t("billing.trialCreditExhausted")}
+              </p>
+            ) : null}
+          </CardContent>
+        </Card>
+      ) : null}
 
       {/* Current plan + usage */}
       {usage ? (
@@ -149,11 +231,30 @@ export function BillingClient({
         </Card>
       ) : null}
 
-      {/* All plans table */}
+      {/* Token usage card (Job 1) */}
+      {usageTokens ? (
+        <Card className="mb-6">
+          <CardHeader>
+            <CardTitle>{t("billing.tokenUsage")}</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <div>
+              <h3 className="mb-2 text-sm font-medium">{t("billing.todayTokens")}</h3>
+              <TokenUsageTable period={usageTokens.today} />
+            </div>
+            <div>
+              <h3 className="mb-2 text-sm font-medium">{t("billing.allTimeTokens")}</h3>
+              <TokenUsageTable period={usageTokens.all_time} />
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {/* Chat channel plans table (was "All plans" — Job 4) */}
       {products.length > 0 ? (
         <Card className="mb-6">
           <CardHeader>
-            <CardTitle>{t("billing.allPlans")}</CardTitle>
+            <CardTitle>{t("billing.chatChannelPlans")}</CardTitle>
             <CardDescription>{t("billing.upgradeNote")}</CardDescription>
           </CardHeader>
           <CardContent>

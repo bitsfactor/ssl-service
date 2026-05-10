@@ -12,6 +12,7 @@ export default async function BillingPage() {
   return (
     <BillingClient
       usage={data.usage}
+      usageTokens={data.usageTokens}
       products={data.products}
       pricing={data.pricing}
     />

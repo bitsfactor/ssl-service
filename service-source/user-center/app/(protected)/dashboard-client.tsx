@@ -69,6 +69,12 @@ function productLabel(p: Product, locale: string): string {
   return p.code ?? "";
 }
 
+function serviceLabel(serviceCode: string | undefined, t: (key: string) => string): string {
+  if (serviceCode === "chat") return t("dashboard.serviceSectionChat");
+  if (serviceCode === "xout") return t("dashboard.serviceSectionXout");
+  return t("dashboard.serviceSectionPlatform");
+}
+
 export function DashboardClient({
   user,
   usage,
@@ -130,6 +136,20 @@ export function DashboardClient({
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">{user.email}</p>
       </div>
+
+      {/* Trial credit banner (Job 2) */}
+      {usage && typeof usage.trial_credit_cents === "number" && usage.trial_credit_cents > 0 ? (
+        <div className="mb-4 flex items-center justify-between rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3">
+          <div>
+            <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
+              {t("dashboard.trialCreditRemaining")}
+            </p>
+          </div>
+          <span className="font-semibold tabular-nums text-amber-700 dark:text-amber-400">
+            ${(usage.trial_credit_cents / 100).toFixed(2)}
+          </span>
+        </div>
+      ) : null}
 
       <div className="grid gap-4 sm:grid-cols-2">
         {/* Plan card */}
@@ -226,63 +246,81 @@ export function DashboardClient({
             <p className="text-sm text-muted-foreground">
               {t("dashboard.subscriptionsEmpty")}
             </p>
-          ) : (
-            <ul className="space-y-3">
-              {subscriptions.map((sub) => {
-                const link = productLink({ code: sub.product_code, service_code: sub.service_code });
-                const description = productDescriptionFor(sub);
-                return (
-                  <li
-                    key={sub.id}
-                    className="flex items-start gap-3 rounded-xl border border-border/60 p-3"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-sm font-medium">
-                          {subProductLabel(sub)}
-                        </span>
-                        <span
-                          className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${statusBadgeClass(sub.status)}`}
-                        >
-                          {t("dashboard.subscriptionStatus", {
-                            status: sub.status,
-                          })}
-                        </span>
-                      </div>
-                      {description ? (
-                        <p className="mt-0.5 text-xs text-muted-foreground">
-                          {description}
-                        </p>
-                      ) : null}
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        {periodLabel(sub)}
-                      </p>
-                    </div>
-                    <div className="shrink-0">
-                      {link.url ? (
-                        link.comingSoon ? (
-                          <span className="inline-flex items-center rounded-md border border-border/60 px-2.5 py-1 text-xs text-muted-foreground">
-                            {t("dashboard.subscriptionComingSoon")}
-                          </span>
-                        ) : (
-                          <Button size="sm" variant="outline" asChild>
-                            <a
-                              href={link.url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                            >
-                              {t("dashboard.subscriptionOpen")}
-                              <ExternalLinkIcon className="ml-1 size-3" />
-                            </a>
-                          </Button>
-                        )
-                      ) : null}
-                    </div>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
+          ) : (() => {
+            // Group by service_code so we can render section headers (Job 4).
+            const grouped = new Map<string, Subscription[]>();
+            for (const sub of subscriptions) {
+              const svc = sub.service_code ?? "platform";
+              if (!grouped.has(svc)) grouped.set(svc, []);
+              grouped.get(svc)!.push(sub);
+            }
+            return (
+              <div className="space-y-4">
+                {Array.from(grouped.entries()).map(([svc, subs]) => (
+                  <div key={svc}>
+                    <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      {serviceLabel(svc, t)}
+                    </p>
+                    <ul className="space-y-2">
+                      {subs.map((sub) => {
+                        const link = productLink({ code: sub.product_code, service_code: sub.service_code });
+                        const description = productDescriptionFor(sub);
+                        return (
+                          <li
+                            key={sub.id}
+                            className="flex items-start gap-3 rounded-xl border border-border/60 p-3"
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="text-sm font-medium">
+                                  {subProductLabel(sub)}
+                                </span>
+                                <span
+                                  className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${statusBadgeClass(sub.status)}`}
+                                >
+                                  {t("dashboard.subscriptionStatus", {
+                                    status: sub.status,
+                                  })}
+                                </span>
+                              </div>
+                              {description ? (
+                                <p className="mt-0.5 text-xs text-muted-foreground">
+                                  {description}
+                                </p>
+                              ) : null}
+                              <p className="mt-1 text-xs text-muted-foreground">
+                                {periodLabel(sub)}
+                              </p>
+                            </div>
+                            <div className="shrink-0">
+                              {link.url ? (
+                                link.comingSoon ? (
+                                  <span className="inline-flex items-center rounded-md border border-border/60 px-2.5 py-1 text-xs text-muted-foreground">
+                                    {t("dashboard.subscriptionComingSoon")}
+                                  </span>
+                                ) : (
+                                  <Button size="sm" variant="outline" asChild>
+                                    <a
+                                      href={link.url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                    >
+                                      {t("dashboard.subscriptionOpen")}
+                                      <ExternalLinkIcon className="ml-1 size-3" />
+                                    </a>
+                                  </Button>
+                                )
+                              ) : null}
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
         </CardContent>
       </Card>
 

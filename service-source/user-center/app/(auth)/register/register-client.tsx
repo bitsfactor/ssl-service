@@ -13,7 +13,9 @@ export function RegisterClient() {
   const t = useT();
   const router = useRouter();
   const searchParams = useSearchParams();
-  const returnTo = searchParams.get("return_to") ?? "/";
+  const _rawReturnTo = searchParams.get("return_to") ?? "/";
+  // Sanitize: only allow relative paths to prevent open-redirect attacks.
+  const returnTo = _rawReturnTo.startsWith("/") && !_rawReturnTo.startsWith("//") ? _rawReturnTo : "/";
 
   const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
