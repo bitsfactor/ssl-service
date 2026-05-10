@@ -11192,10 +11192,27 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
       }
     });
 
+    // Helpers exposed to the history modal so a "Re-run" row can put
+    // the historical args back into THIS card's form and trigger Run
+    // — avoids the operator hand-typing the same payload again.
+    function applyArgs(args) {
+      if (!args || typeof args !== "object") return;
+      for (const [name, info] of Object.entries(inputs)) {
+        if (!(name in args)) continue;
+        const v = args[name];
+        if (info.type === "checkbox") {
+          info.el.checked = !!v;
+        } else {
+          info.el.value = v == null ? "" : String(v);
+        }
+      }
+    }
+    function triggerRun() { runBtn.click(); }
+
     historyBtn.addEventListener("click", async () => {
       try {
         const r = await api("GET", `/api/commands/runs?command_id=${encodeURIComponent(cmd.id)}&limit=25`);
-        showHistoryModal(cmd, r.runs || []);
+        showHistoryModal(cmd, r.runs || [], { applyArgs, triggerRun });
       } catch (err) {
         toast("error", "Could not load history", err.message);
       }
@@ -11253,31 +11270,54 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
     panel.appendChild(tools);
   }
 
-  function showHistoryModal(cmd, runs) {
+  // ``controls`` (optional) = { applyArgs(args), triggerRun() } closures
+  // owned by the originating card. Passing them in keeps the history
+  // modal a pure renderer and gives one-click "re-run with same args"
+  // without smuggling DOM refs through globals.
+  function showHistoryModal(cmd, runs, controls) {
     const body = h("div", null);
     if (!runs.length) {
       body.appendChild(h("p", { class: "muted" }, "No runs yet."));
     } else {
       const tbl = h("table", { class: "data" });
-      tbl.appendChild(h("thead", null, h("tr", null,
+      const headerCells = [
         h("th", null, "When"),
         h("th", null, "Status"),
         h("th", null, "Exit"),
         h("th", null, "Args"),
-      )));
+      ];
+      if (controls && controls.applyArgs) headerCells.push(h("th", null, ""));
+      tbl.appendChild(h("thead", null, h("tr", null, ...headerCells)));
       const tb = h("tbody");
       for (const r of runs) {
         const when = r.started_at ? new Date(r.started_at).toLocaleString() : "—";
+        const argsObj = r.args_json && typeof r.args_json === "object" ? r.args_json : {};
         const argsStr = (() => {
-          try { return JSON.stringify(r.args_json || {}); } catch { return ""; }
+          try { return JSON.stringify(argsObj); } catch { return ""; }
         })();
-        tb.appendChild(h("tr", null,
+        const cells = [
           h("td", { style: "font-family: var(--mono); font-size: 12px;" }, when),
           h("td", null, r.status),
           h("td", null, r.exit_code != null ? String(r.exit_code) : "—"),
-          h("td", { style: "font-family: var(--mono); font-size: 11px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" },
-            argsStr),
-        ));
+          h("td", {
+            style: "font-family: var(--mono); font-size: 11px; max-width: 320px;"
+                 + " overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+            title: argsStr,
+          }, argsStr),
+        ];
+        if (controls && controls.applyArgs) {
+          const reRunBtn = h("button", { class: "btn btn-sm" }, "Re-run");
+          reRunBtn.addEventListener("click", () => {
+            controls.applyArgs(argsObj);
+            Modal.close();
+            // Defer the actual run so the modal-close transition can settle
+            // — without this, the inline output panel sometimes races with
+            // the modal teardown and renders briefly under the closing layer.
+            setTimeout(() => controls.triggerRun(), 50);
+          });
+          cells.push(h("td", { style: "white-space: nowrap;" }, reRunBtn));
+        }
+        tb.appendChild(h("tr", null, ...cells));
       }
       tbl.appendChild(tb);
       body.appendChild(tbl);
