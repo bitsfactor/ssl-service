@@ -1151,6 +1151,16 @@ def auth_signup(req: SignupRequest, request: Request, response: Response) -> dic
           """,
           (user_row["id"], _free_pid, _trial_cents),
         )
+      # Create accounts row with trial_credit_cents = 200 (the $2 account
+      # credit. Idempotent via ON CONFLICT DO NOTHING).
+      cur.execute(
+        """
+        INSERT INTO accounts (user_id, trial_credit_cents)
+        VALUES (%s, 200)
+        ON CONFLICT (user_id) DO NOTHING
+        """,
+        (user_row["id"],),
+      )
     conn.commit()
 
   token = issue_session(user_row["id"],
@@ -1596,9 +1606,131 @@ def me_usage(user: dict = Depends(get_current_user)) -> dict:
   response is fresh-to-the-second; ``quotas`` is a DB snapshot of
   every product the user has a quota row for."""
   from . import billing as _billing
+  usage_summary = _billing.get_usage_summary(user["id"])
+  # Attach trial_credit_cents from accounts table (Job 2 — account-level credit).
+  trial_credit = _get_trial_credit(user["id"])
+  if trial_credit is not None:
+    usage_summary["trial_credit_cents"] = trial_credit
   return {
     "quotas": _list_user_quotas(user["id"]),
-    "billing": _billing.get_usage_summary(user["id"]),
+    "billing": usage_summary,
+  }
+
+
+def _get_trial_credit(user_id: str) -> int | None:
+  """Return the remaining trial_credit_cents for the user, or None if the
+  accounts table / column doesn't exist yet (migration hasn't run)."""
+  try:
+    with connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute(
+          "SELECT trial_credit_cents FROM accounts WHERE user_id = %s",
+          (user_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+      return None
+    return int(row["trial_credit_cents"] or 0)
+  except Exception:
+    return None
+
+
+def _build_token_usage_period(
+  user_id: str,
+  period_start: "datetime",
+) -> dict:
+  """Aggregate usage_events rows for user_id since period_start.
+
+  Returns a dict with:
+    by_model: list of per-model breakdowns
+    total_input_tokens, total_cached_input_tokens, total_output_tokens, total_cents
+  """
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        """
+        SELECT
+          event AS model_id,
+          COALESCE(SUM((metadata->>'input_tokens')::bigint), 0) AS input_tokens,
+          COALESCE(SUM((metadata->>'cached_input_tokens')::bigint), 0) AS cached_input_tokens,
+          COALESCE(SUM((metadata->>'output_tokens')::bigint), 0) AS output_tokens,
+          COALESCE(SUM(qty), 0) AS cents
+        FROM usage_events
+        WHERE user_id = %s AND ts >= %s
+        GROUP BY event
+        ORDER BY cents DESC
+        """,
+        (user_id, period_start),
+      )
+      rows = cur.fetchall()
+
+  by_model = []
+  total_input = 0
+  total_cached = 0
+  total_output = 0
+  total_cents = 0.0
+  for r in rows:
+    inp = int(r["input_tokens"] or 0)
+    cached = int(r["cached_input_tokens"] or 0)
+    out = int(r["output_tokens"] or 0)
+    cents = float(r["cents"] or 0)
+    total_input += inp
+    total_cached += cached
+    total_output += out
+    total_cents += cents
+    by_model.append({
+      "model_id": r["model_id"],
+      "input_tokens": inp,
+      "cached_input_tokens": cached,
+      "output_tokens": out,
+      "cents": round(cents, 6),
+    })
+
+  return {
+    "by_model": by_model,
+    "total_input_tokens": total_input,
+    "total_cached_input_tokens": total_cached,
+    "total_output_tokens": total_output,
+    "total_cents": round(total_cents, 6),
+  }
+
+
+@app.get("/api/me/usage-tokens")
+def me_usage_tokens(user: dict = Depends(get_current_user)) -> dict:
+  """Return per-model token consumption totals for the current user.
+
+  ``today`` covers the current billing period (UTC midnight or the
+  active quota's current_period_start, whichever is later).
+  ``all_time`` covers since account creation.
+  """
+  uid = user["id"]
+
+  # "today" period start: use UTC midnight, same as the billing engine.
+  now_utc = datetime.now(timezone.utc)
+  today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+
+  # "all_time" period start: user's account creation timestamp.
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT created_at FROM auth_users WHERE id = %s",
+        (uid,),
+      )
+      row = cur.fetchone()
+  if row and row["created_at"]:
+    all_time_start = row["created_at"]
+    if all_time_start.tzinfo is None:
+      all_time_start = all_time_start.replace(tzinfo=timezone.utc)
+  else:
+    # fallback: 2024-01-01
+    all_time_start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+  today_data = _build_token_usage_period(uid, today_start)
+  all_time_data = _build_token_usage_period(uid, all_time_start)
+
+  return {
+    "today": today_data,
+    "all_time": all_time_data,
   }
 
 

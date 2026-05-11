@@ -101,6 +101,68 @@ _IDEMP_SEEN: set[tuple[str, str, str]] = set()
 _IDEMP_LOCK = threading.Lock()
 _MAX_IDEMP_KEYS = 5000
 
+# ---------------------------------------------------------------------------
+# Trial credit helpers (Job 2 — account-level $2 credit)
+# ---------------------------------------------------------------------------
+
+def _fetch_trial_credit(user_id: str) -> int:
+    """Return the current trial_credit_cents for the user (0 if no row)."""
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT trial_credit_cents FROM accounts WHERE user_id = %s",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+        return int(row["trial_credit_cents"] or 0) if row else 0
+    except Exception as e:
+        LOGGER.debug("trial credit fetch failed: %s", e)
+        return 0
+
+
+def _deduct_trial_credit(user_id: str, amount_cents: float) -> float:
+    """Deduct up to `amount_cents` from accounts.trial_credit_cents.
+
+    Returns the amount actually deducted (may be < amount_cents if trial
+    runs out mid-charge). Uses a CTE to compute the old balance atomically.
+    """
+    if amount_cents <= 0:
+        return 0.0
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                # Use a CTE so we can read the old value and the new value
+                # in a single atomic statement.
+                cur.execute(
+                    """
+                    WITH old AS (
+                      SELECT trial_credit_cents FROM accounts
+                      WHERE user_id = %s FOR UPDATE
+                    ),
+                    updated AS (
+                      UPDATE accounts
+                      SET trial_credit_cents = GREATEST(0, trial_credit_cents - %s)
+                      WHERE user_id = %s
+                      RETURNING trial_credit_cents
+                    )
+                    SELECT old.trial_credit_cents AS before_cents,
+                           updated.trial_credit_cents AS after_cents
+                    FROM old, updated
+                    """,
+                    (user_id, amount_cents, user_id),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        if row is None:
+            return 0.0
+        before = float(row["before_cents"] or 0)
+        after = float(row["after_cents"] or 0)
+        return max(0.0, before - after)
+    except Exception as e:
+        LOGGER.warning("trial credit deduct failed: %s", e)
+        return 0.0
+
 
 def _user_lock(user_id: str) -> threading.Lock:
     with _USER_LOCKS_LOCK:
@@ -377,6 +439,54 @@ def charge_usage(
             tier_rank=int((tier["metadata"] or {}).get("tier_rank") or -1),
         )
 
+    # --- Trial credit deduction (Job 2) ---
+    # Deduct from account-level trial_credit_cents first, before touching
+    # the daily quota. The trial deduction is synchronous (one DB write)
+    # because trial credit is a one-time finite pool that must be
+    # accurate, unlike daily quotas which tolerate a few seconds of lag.
+    trial_deducted = _deduct_trial_credit(user_id, charged_cents)
+    remaining_charge = charged_cents - trial_deducted
+
+    if remaining_charge <= 0:
+        # Entire charge covered by trial credit — no quota deduction needed.
+        # Still record the event so usage_events stays complete.
+        with _EVENT_BUFFER_LOCK:
+            _EVENT_BUFFER.append(_PendingEvent(
+                user_id=user_id,
+                product_id=int(tier["product_id"]),
+                event=model,
+                qty=trial_deducted,
+                metadata={
+                    "resource_id": resource_id,
+                    "model": model,
+                    "input_tokens": input_tokens,
+                    "cached_input_tokens": cached_input_tokens,
+                    "output_tokens": output_tokens,
+                    "duration_seconds": duration_seconds,
+                    "openai_cents": openai_cents,
+                    "discount": discount,
+                    "tier_code": tier["code"],
+                    "paid_from": "trial_credit",
+                    **(metadata or {}),
+                },
+            ))
+        if resource_id:
+            idemp_key = (user_id, model, resource_id)
+            with _IDEMP_LOCK:
+                _IDEMP_SEEN.add(idemp_key)
+                if len(_IDEMP_SEEN) > _MAX_IDEMP_KEYS:
+                    _IDEMP_SEEN.clear()
+        return ChargeResult(
+            ok=True,
+            charged_cents=charged_cents,
+            openai_cents=openai_cents,
+            remaining_cents=0,
+            limit_cents=0,
+            tier_code=tier["code"],
+            tier_rank=int((tier["metadata"] or {}).get("tier_rank") or -1),
+        )
+
+    # Some charge remains after trial — deduct from quota as before.
     pid = int(tier["product_id"])
     key = (user_id, pid)
 
@@ -409,7 +519,27 @@ def charge_usage(
         consumed_total = cached.db_consumed + cached.pending_delta
         remaining = cached.limit_qty - consumed_total
 
-        if charged_cents > remaining:
+        if remaining_charge > remaining:
+            # Quota exhausted — but if trial covered part of the charge,
+            # surface the partial coverage in the error (best-effort: in
+            # practice this usually means the trial ran out simultaneously
+            # with quota exhaustion).
+            if trial_deducted > 0:
+                # Refund the trial deduction we already made (best-effort).
+                try:
+                    with connect() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                UPDATE accounts
+                                SET trial_credit_cents = trial_credit_cents + %s
+                                WHERE user_id = %s
+                                """,
+                                (trial_deducted, user_id),
+                            )
+                        conn.commit()
+                except Exception:
+                    LOGGER.warning("trial credit refund failed for user %s", user_id)
             return ChargeResult(
                 ok=False, charged_cents=0, openai_cents=openai_cents,
                 remaining_cents=max(0.0, remaining),
@@ -419,16 +549,16 @@ def charge_usage(
                 error="quota_exhausted",
             )
 
-        # Commit in memory
-        cached.pending_delta += charged_cents
+        # Commit in memory (only the remaining portion after trial credit)
+        cached.pending_delta += remaining_charge
         with _PENDING_DELTAS_LOCK:
-            _PENDING_DELTAS[key] = _PENDING_DELTAS.get(key, 0.0) + charged_cents
+            _PENDING_DELTAS[key] = _PENDING_DELTAS.get(key, 0.0) + remaining_charge
         with _EVENT_BUFFER_LOCK:
             _EVENT_BUFFER.append(_PendingEvent(
                 user_id=user_id,
                 product_id=pid,
                 event=model,
-                qty=charged_cents,
+                qty=charged_cents,  # record full charge for accurate usage_events
                 metadata={
                     "resource_id": resource_id,
                     "model": model,
@@ -439,6 +569,8 @@ def charge_usage(
                     "openai_cents": openai_cents,
                     "discount": discount,
                     "tier_code": tier["code"],
+                    "trial_deducted": trial_deducted,
+                    "quota_deducted": remaining_charge,
                     **(metadata or {}),
                 },
             ))
@@ -454,7 +586,7 @@ def charge_usage(
         ok=True,
         charged_cents=charged_cents,
         openai_cents=openai_cents,
-        remaining_cents=remaining - charged_cents,
+        remaining_cents=remaining - remaining_charge,
         limit_cents=cached.limit_qty,
         tier_code=tier["code"],
         tier_rank=int((tier["metadata"] or {}).get("tier_rank") or -1),
