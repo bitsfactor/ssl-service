@@ -460,55 +460,101 @@ def _redact_dsn(dsn: str | None) -> str:
 
 
 class Database:
+  """Long-lived Postgres pool with an active heartbeat keeping each
+  idle connection warm.
+
+  Why this exists: Supabase's Supavisor reaps client TCP connections
+  that have been idle for ~30-60 s. The pool's own ``max_idle`` and
+  ``check`` settings were not enough — multiple connections could die
+  between background probes, and a single per-checkout retry could
+  still hand back a freshly-cut conn. The fix: a dedicated heartbeat
+  thread that, every 15 s (well below the reap window), runs
+  ``SELECT 1`` on a connection — keeping the *whole pool* warm
+  because the heartbeat naturally rotates through whichever conn is
+  free at the moment. Combined with the per-checkout retry on stale
+  symptoms, the pool effectively never has dead connections in it.
+
+  We keep the pool small (default min=3 max=5) — admin handles
+  occasional bursts of parallel queries (``list_nodes`` does ~14
+  concurrent SELECTs), so going to a single connection serializes
+  them and tanks UI latency. 3-5 is the sweet spot: enough for the
+  normal parallel pattern, not enough to dominate Supabase's 60-conn
+  cap when several admin instances are connected.
+  """
+
+  _HEARTBEAT_INTERVAL_S: float = 15.0
+
+  # Symptoms that indicate the conn we got from the pool is dead and
+  # we should retire it + retry. Covers two distinct failure modes
+  # observed on Supabase / Supavisor:
+  #   - TLS session rotation:  "SSL error", "bad record mac",
+  #     "consuming input failed"
+  #   - Pooler-side TCP reset on a long-idle connection: "server
+  #     closed the connection unexpectedly", "connection terminated
+  #     unexpectedly", "ECONNRESET", "Broken pipe", and the
+  #     low-level psycopg.InterfaceError that wraps OS-level read fails.
+  _STALE_CONN_MARKERS: tuple[str, ...] = (
+    "SSL error",
+    "bad record mac",
+    "consuming input failed",
+    "server closed the connection unexpectedly",
+    "connection terminated unexpectedly",
+    "ECONNRESET",
+    "Broken pipe",
+    "EOF detected",
+  )
+
   def __init__(
     self,
     dsn: str,
     *,
     pool_min_size: int = 3,
-    pool_max_size: int = 10,
+    pool_max_size: int = 5,
     pool_timeout: float = 30.0,
     use_pool: bool = True,
   ) -> None:
+    import threading as _th
+
     self._dsn = dsn
     # ``home_dsn`` is the DSN this admin booted with — the value of
     # SSL_SERVICE_PG_DSN from .env. Even after ``swap_to()`` flips
     # ``self._dsn`` to a different working schema, ``self._home_dsn``
-    # stays put. It's the canonical location for the database registry
-    # itself: regardless of which schema the operator is currently
-    # working in, the list of schemas they CAN switch to lives in the
-    # home schema's ``system_config['databases']``. See ``home_connect``.
+    # stays put. It's the canonical location for the database registry.
     self._home_dsn = dsn
-    self._pool = None
+    self._pool: ConnectionPool | None = None
+    self._closed = False
     if use_pool and ConnectionPool is not None:
-      # Recycle connections aggressively so a Supabase-side TLS
-      # session that's gone stale (the SSL handshake stays valid
-      # but the session keys rotate periodically) can't keep
-      # poisoning the pool. Without this the operator sees "SSL
-      # error: decryption failed or bad record mac" on the first
-      # long-running write after ~30 min idle, and every subsequent
-      # reuse of that conn fails until admin is restarted.
       _pool_kwargs: dict = {
         "min_size": pool_min_size,
         "max_size": pool_max_size,
         "timeout": pool_timeout,
         "open": True,
-        "kwargs": {"row_factory": dict_row},
-        "max_lifetime": 600.0,
-        "max_idle": 120.0,
+        "kwargs": {
+          "row_factory": dict_row,
+          # OS-level keepalive — belt-and-braces with our app heartbeat,
+          # in case Supavisor honours TCP keepalive.
+          "keepalives": 1,
+          "keepalives_idle": 10,
+          "keepalives_interval": 5,
+          "keepalives_count": 3,
+        },
+        # max_lifetime caps how long a single conn can live before we
+        # rotate it; max_idle caps how long it can sit unused before
+        # close. Both are belt-and-braces alongside our heartbeat,
+        # which is the primary mechanism for keeping conns warm.
+        "max_lifetime": 60 * 60.0,  # 1 hour
+        "max_idle": 60.0,  # close anything idle longer than this
       }
-      # ``check`` is psycopg-pool 3.2+. Probe before passing to
-      # support older versions that don't know the kwarg.
       _check_fn = getattr(ConnectionPool, "check_connection", None)
       if callable(_check_fn):
         _pool_kwargs["check"] = _check_fn
       try:
         self._pool = ConnectionPool(dsn, **_pool_kwargs)
-        # Block until at least one connection is ready so the first
-        # request after startup doesn't pay the full TLS/handshake tax.
         self._pool.wait(timeout=pool_timeout)
         LOGGER.info(
-          "psycopg connection pool ready (min=%d, max=%d)",
-          pool_min_size, pool_max_size,
+          "psycopg connection pool ready (min=%d, max=%d) "
+          "+ heartbeat every %.0fs",
+          pool_min_size, pool_max_size, self._HEARTBEAT_INTERVAL_S,
         )
       except Exception as exc:  # noqa: BLE001
         LOGGER.warning(
@@ -518,6 +564,45 @@ class Database:
         )
         self._pool = None
 
+    self._heartbeat_thread = _th.Thread(
+      target=self._heartbeat_loop, daemon=True, name="db-heartbeat",
+    )
+    self._heartbeat_thread.start()
+
+  # ----- internal helpers -----
+
+  def _heartbeat_loop(self) -> None:
+    """Run ``SELECT 1`` on a pooled connection every 15 s. The query
+    activity prevents Supavisor from declaring the connection idle
+    and reaping it. ``self._pool.connection()`` rotates through
+    whichever conn is free, so over a few cycles every conn in the
+    pool gets touched.
+
+    Failure mode: if the heartbeat itself errors (e.g. a stale conn
+    leaked through), we don't crash — pool.check() retires the dead
+    conn, next iteration re-tries. Don't spam logs."""
+    import time as _time
+    while not self._closed:
+      _time.sleep(self._HEARTBEAT_INTERVAL_S)
+      if self._closed or self._pool is None:
+        continue
+      try:
+        with self._pool.connection() as conn:
+          with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+      except Exception as exc:  # noqa: BLE001
+        LOGGER.debug(
+          "db heartbeat failed (%s); recycling pool",
+          str(exc).strip()[:160] or type(exc).__name__,
+        )
+        try:
+          self._pool.check()
+        except Exception:
+          pass
+
+  # ----- public surface -----
+
   @property
   def dsn(self) -> str:
     """The DSN currently in use. Updates after ``swap_to()``."""
@@ -525,6 +610,7 @@ class Database:
 
   def close(self) -> None:
     """Close the underlying pool. Safe to call multiple times."""
+    self._closed = True
     if self._pool is not None:
       try:
         self._pool.close()
@@ -534,26 +620,10 @@ class Database:
   def swap_to(
     self, new_dsn: str, *,
     pool_min_size: int = 3,
-    pool_max_size: int = 10,
+    pool_max_size: int = 5,
     pool_timeout: float = 30.0,
   ) -> None:
-    """Live-swap the connection pool to a new DSN.
-
-    Used by the "Activate database" admin endpoint so the operator
-    can flip which Postgres the running admin process talks to
-    without restarting it. Steps:
-
-      1. Open a new pool to the new DSN
-      2. Verify it works (SELECT 1)
-      3. Atomically swap ``self._pool`` to the new pool + update
-         ``self._dsn``
-      4. Schedule the OLD pool to close after a short grace period
-         so any in-flight requests get to finish on their existing
-         connection.
-
-    If step 1 or 2 fails, the old pool stays in place and the
-    exception is re-raised.
-    """
+    """Live-swap the connection pool to a new DSN."""
     if ConnectionPool is None:
       raise RuntimeError("connection pooling is not available")
     new_pool = ConnectionPool(
@@ -581,12 +651,11 @@ class Database:
     old_dsn = self._dsn
     self._pool = new_pool
     self._dsn = new_dsn
-    LOGGER.info("Database.swap_to: pool swapped from %s to %s",
-                _redact_dsn(old_dsn), _redact_dsn(new_dsn))
+    LOGGER.info(
+      "Database.swap_to: pool swapped from %s to %s",
+      _redact_dsn(old_dsn), _redact_dsn(new_dsn),
+    )
 
-    # Drain the old pool in a daemon thread so we don't block the
-    # current request handler. 5s is plenty for the typical
-    # < 500ms admin requests.
     if old_pool is not None:
       def _drain_old():
         try:
@@ -600,11 +669,15 @@ class Database:
 
   @contextmanager
   def connect(self) -> Iterator[psycopg.Connection]:
-    """Open a connection from the pool (or create a one-shot if no
-    pool is configured). Auto-retries once on OperationalError caused
-    by a Supabase TLS-session rotation -- the pool has aggressive
-    max_idle but stale connections still leak past `check` when
-    Supabase rekeys mid-handoff."""
+    """Check out a connection from the pool, run the caller's block,
+    return it to the pool on exit. Concurrent callers run in parallel
+    on separate connections (pool min=3 max=5).
+
+    Reliability: if the block fails with a stale-connection symptom
+    (Supavisor TCP reset / Supabase TLS rotation), we recycle the
+    pool's idle conns and retry once. The background heartbeat (see
+    ``_heartbeat_loop``) keeps idle conns warm so this retry path
+    rarely fires in steady state."""
     if self._pool is None:
       with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
         yield connection
@@ -615,20 +688,17 @@ class Database:
         with self._pool.connection() as connection:
           yield connection
           return
-      except psycopg.OperationalError as exc:
-        # Match the SSL-rotation symptoms only; non-SSL OperationalErrors
-        # (timeouts, auth, etc.) shouldn't hit the retry path.
+      except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
         msg = str(exc)
-        if "SSL error" not in msg and "bad record mac" not in msg \
-           and "consuming input failed" not in msg:
+        if isinstance(exc, psycopg.OperationalError) and not any(
+          marker in msg for marker in self._STALE_CONN_MARKERS
+        ):
           raise
         last_exc = exc
         LOGGER.warning(
-          "psycopg pool: stale connection (%s); discarding pool and retrying",
-          msg.strip()[:120],
+          "psycopg pool: stale connection (%s); recycling and retrying",
+          msg.strip()[:160] or type(exc).__name__,
         )
-        # Force-recycle every idle connection in the pool so the
-        # retry doesn't get the same poisoned conn handed back.
         try:
           self._pool.check()
         except Exception:  # noqa: BLE001
