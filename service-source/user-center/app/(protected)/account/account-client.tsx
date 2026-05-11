@@ -2,8 +2,7 @@
 
 import { useState } from "react";
 import { toast } from "sonner";
-import { useTheme } from "next-themes";
-import { useT, useI18n } from "@/lib/i18n/i18n-provider";
+import { useT } from "@/lib/i18n/i18n-provider";
 import { LOCALES } from "@/lib/i18n/config";
 import type { UserProfile } from "@/lib/api/server";
 import { Button } from "@/components/ui/button";
@@ -21,21 +20,11 @@ import {
   CardContent,
   CardHeader,
   CardTitle,
-  CardDescription,
 } from "@/components/ui/card";
-import { UserCircleIcon, SunIcon, MoonIcon, MonitorIcon, InfoIcon } from "lucide-react";
-import { cn } from "@/lib/utils";
-
-const THEMES = [
-  { id: "light", icon: SunIcon },
-  { id: "dark", icon: MoonIcon },
-  { id: "system", icon: MonitorIcon },
-] as const;
+import { UserCircleIcon } from "lucide-react";
 
 export function AccountClient({ user }: { user: UserProfile }) {
   const t = useT();
-  const { locale, setLocale } = useI18n();
-  const { theme, setTheme } = useTheme();
 
   // Profile form state
   const [displayName, setDisplayName] = useState(user.display_name ?? "");
@@ -160,93 +149,6 @@ export function AccountClient({ user }: { user: UserProfile }) {
         </div>
       </form>
 
-      {/* ── Preferences section ─────────────────────────────────── */}
-      <h2 className="mb-3 text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-        {t("account.preferencesSection")}
-      </h2>
-
-      {/* Appearance */}
-      <Card className="mb-4">
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm">{t("account.themeSection")}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="flex gap-2">
-            {THEMES.map(({ id, icon: Icon }) => {
-              const active = theme === id;
-              const label = t(
-                id === "light"
-                  ? "account.themeLight"
-                  : id === "dark"
-                    ? "account.themeDark"
-                    : "account.themeSystem"
-              );
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  onClick={() => {
-                    setTheme(id);
-                    toast.success(t("account.preferencesSaved"));
-                  }}
-                  aria-pressed={active}
-                  className={cn(
-                    "flex h-20 flex-1 flex-col items-center justify-center gap-1.5 rounded-xl border-2 text-xs transition-all",
-                    active
-                      ? "border-primary bg-muted/60 font-medium text-foreground"
-                      : "border-border/60 text-muted-foreground hover:border-border hover:bg-muted/40"
-                  )}
-                >
-                  <Icon className="size-5" />
-                  <span>{label}</span>
-                </button>
-              );
-            })}
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* UI Language (client-side, separate from profile locale) */}
-      <Card className="mb-4">
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm">{t("account.languageSection")}</CardTitle>
-          <CardDescription className="text-xs">{t("account.languageNote")}</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Select
-            value={locale}
-            onValueChange={(next) => {
-              setLocale(next as (typeof LOCALES)[number]["id"]);
-            }}
-          >
-            <SelectTrigger className="w-full">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {LOCALES.map((l) => (
-                <SelectItem key={l.id} value={l.id}>
-                  {l.nativeName}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </CardContent>
-      </Card>
-
-      {/* AI defaults — placeholder */}
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm">{t("account.defaultModelSection")}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="flex items-start gap-2 rounded-lg bg-muted/40 p-3">
-            <InfoIcon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-            <p className="text-xs text-muted-foreground">
-              {t("account.defaultModelNote")}
-            </p>
-          </div>
-        </CardContent>
-      </Card>
     </div>
   );
 }

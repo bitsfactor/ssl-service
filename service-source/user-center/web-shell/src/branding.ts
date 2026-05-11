@@ -15,5 +15,9 @@ export const DEFAULT_BRAND: BrandConfig = {
   company: "BitsFactor LLC",
   tagline: "Your team's AI workspace",
   logoUrl: "/logo.png",
-  homeUrl: "https://develop.cc",
+  // Every service's header brand mark deep-links to the chat app.
+  // Earlier this pointed at the marketing site (develop.cc); users
+  // expected clicking the logo from user-center / future surfaces to
+  // take them straight to chatting, so we route there directly.
+  homeUrl: "https://chat.develop.cc",
 };

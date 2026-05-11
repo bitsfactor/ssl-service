@@ -8,7 +8,6 @@ import {
   ShieldIcon,
   CreditCardIcon,
   ReceiptIcon,
-  PackageIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useT } from "@/lib/i18n/i18n-provider";
@@ -19,7 +18,6 @@ const navItems = [
   { href: "/security", icon: ShieldIcon, key: "nav.security" },
   { href: "/billing", icon: CreditCardIcon, key: "nav.billing" },
   { href: "/orders", icon: ReceiptIcon, key: "nav.orders" },
-  { href: "/products", icon: PackageIcon, key: "nav.products" },
 ] as const;
 
 export function AccountNav() {
