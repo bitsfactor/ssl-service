@@ -7,6 +7,7 @@ import {
   UserIcon,
   ShieldIcon,
   CreditCardIcon,
+  ReceiptIcon,
   PackageIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -17,6 +18,7 @@ const navItems = [
   { href: "/account", icon: UserIcon, key: "nav.account" },
   { href: "/security", icon: ShieldIcon, key: "nav.security" },
   { href: "/billing", icon: CreditCardIcon, key: "nav.billing" },
+  { href: "/orders", icon: ReceiptIcon, key: "nav.orders" },
   { href: "/products", icon: PackageIcon, key: "nav.products" },
 ] as const;
 

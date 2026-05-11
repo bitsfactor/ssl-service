@@ -408,6 +408,7 @@ export function BillingClient({
           </CardContent>
         </Card>
       )}
+
     </div>
   );
 }
