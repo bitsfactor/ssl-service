@@ -1210,9 +1210,14 @@ def auth_signup(req: SignupRequest, request: Request, response: Response) -> dic
   try:
     vt = _make_verification_token(user_row["id"], email, "verify_email", 24)
     base = (os.getenv("PUBLIC_URL") or "https://user.develop.cc").rstrip("/")
+    # The user-center SPA reads `?token=...` on /auth/verify-email and
+    # POSTs it back to this service's /api/auth/verify-email. The old
+    # `/?verify=<tok>` shape only worked on the legacy static index.html
+    # which user.develop.cc no longer serves.
     _send_email(email, "Verify your email",
                 f"Welcome! Click the link to verify your email:\n\n"
-                f"{base}/?verify={vt}\n\nThis link expires in 24 hours.")
+                f"{base}/auth/verify-email?token={vt}\n\n"
+                f"This link expires in 24 hours.")
   except Exception:  # noqa: BLE001
     LOGGER.exception("could not enqueue verification email at signup")
   return {"user": _user_row_to_public(user_row)}
@@ -1293,7 +1298,16 @@ def _send_email(to_email: str, subject: str, body: str) -> bool:
   password = cfg.get("password") or ""
   from_email = (cfg.get("from_email") or user or "no-reply@user.develop.cc").strip()
   from_name = (cfg.get("from_name") or "User Service").strip()
-  use_starttls = (str(cfg.get("starttls") or "true").lower() in ("1","true","yes"))
+  # `starttls: false` in the system_config JSON parses to Python `False`,
+  # which `or "true"` then silently *replaced* with True — making the code
+  # use STARTTLS even when the operator had said "no, this is implicit SSL".
+  # Treat missing/None as the default (True), but respect a real False.
+  starttls_raw = cfg.get("starttls")
+  use_starttls = (
+    True
+    if starttls_raw is None
+    else str(starttls_raw).lower() in ("1", "true", "yes")
+  )
   try:
     import smtplib
     from email.mime.text import MIMEText
@@ -1388,7 +1402,7 @@ def verify_email_send(user: dict = Depends(get_current_user)) -> dict:
     return {"ok": True, "already_verified": True}
   token = _make_verification_token(user["id"], email, "verify_email", 24)
   base = (os.getenv("PUBLIC_URL") or "https://user.develop.cc").rstrip("/")
-  link = f"{base}/?verify={token}"
+  link = f"{base}/auth/verify-email?token={token}"
   _send_email(email, "Verify your email",
               f"Click the link to verify your email:\n\n{link}\n\n"
               f"This link expires in 24 hours.")

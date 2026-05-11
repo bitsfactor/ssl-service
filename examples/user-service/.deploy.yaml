@@ -39,8 +39,11 @@ secrets:
   # The DSN is referenced via the database registry; ssl-service's
   # inline resolver expands ``database:<id>`` to the registry entry's
   # full DSN at deploy time.
+  # Migrated 2026-05-11 from cloud Supabase one-base (id f499f7431634) to
+  # xcenter's self-hosted Supabase, schema `one`. The old id is retained in
+  # the registry for rollback but is no longer primary.
   - env: USER_SERVICE_PG_DSN
-    from: database:f499f7431634
+    from: database:7a1703df432f
   # system_config keys themselves contain dots (e.g. user_service.admin_token);
   # the resolver walks the longest matching prefix and then descends through
   # the JSON value's leaf key.
