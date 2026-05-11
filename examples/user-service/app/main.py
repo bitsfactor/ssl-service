@@ -2,7 +2,9 @@
 
 Endpoints (v1, P1 scope):
 
-  POST /api/auth/signup            email + password
+  POST /api/auth/signup-start      email + password → emails OTP
+  POST /api/auth/signup-confirm    email + code     → creates account + cookie
+  POST /api/auth/signup-resend     email            → re-issues OTP
   POST /api/auth/login             email + password → cookie
   POST /api/auth/logout            clears cookie + revokes session row
   GET  /api/me                     current user + active subscriptions
@@ -1052,8 +1054,70 @@ _FIRST_USER_LOCK_KEY = 0x7553_4552_5F31_5354  # b"USER_1ST" mnemonic
 # ---------------------------------------------------------------------------
 
 
-@app.post("/api/auth/signup")
-def auth_signup(req: SignupRequest, request: Request, response: Response) -> dict:
+# ---------------------------------------------------------------------------
+# Signup is a two-step OTP flow:
+#   POST /api/auth/signup-start    → email + password staged in
+#                                    `pending_signups`, 6-digit OTP emailed.
+#                                    No `auth_users` row yet, no session.
+#   POST /api/auth/signup-confirm  → email + code → on match, the staged
+#                                    row is promoted into a real account
+#                                    (auth_users + auth_passwords + tier
+#                                    grants + accounts row), session cookie
+#                                    set, pending row deleted.
+#   POST /api/auth/signup-resend   → re-issue the OTP for an in-flight
+#                                    signup (rate-limited).
+#
+# Why two steps: blocks signups with bogus emails — the account isn't
+# created until the user proves they can read mail at that address. The
+# old single-shot /api/auth/signup is gone.
+#
+# OTP details:
+#   - 6 random digits, zero-padded
+#   - argon2-hashed at rest (same hasher we use for passwords)
+#   - 10-minute TTL from issuance
+#   - 5 wrong attempts on the same staged row → user must resend
+#   - resend is rate-limited to once per 60 seconds
+# ---------------------------------------------------------------------------
+
+_OTP_TTL_MINUTES = 10
+_OTP_MAX_ATTEMPTS = 5
+_OTP_RESEND_MIN_SECONDS = 60
+
+
+def _generate_otp() -> str:
+  import secrets as _secrets
+  return f"{_secrets.randbelow(1_000_000):06d}"
+
+
+def _verify_otp_hash(raw_code: str, stored_hash: str) -> bool:
+  try:
+    return verify_password(raw_code, stored_hash)
+  except Exception:  # noqa: BLE001
+    return False
+
+
+def _send_signup_otp_email(email: str, code: str) -> None:
+  _send_email(
+    email,
+    "Your verification code",
+    f"Your verification code is: {code}\n\n"
+    f"It expires in {_OTP_TTL_MINUTES} minutes. If you didn't try to "
+    f"sign up, you can ignore this email.",
+  )
+
+
+class SignupConfirmRequest(BaseModel):
+  email: EmailStr
+  code: str = Field(min_length=6, max_length=6)
+
+
+class SignupResendRequest(BaseModel):
+  email: EmailStr
+
+
+@app.post("/api/auth/signup-start")
+def auth_signup_start(req: SignupRequest, request: Request) -> dict:
+  """Stage a signup and send an OTP. No account is created here."""
   locale_hint = req.locale or request.headers.get("accept-language")
   locale = negotiate_locale(locale_hint)
   email = _normalize_email(req.email)
@@ -1063,28 +1127,161 @@ def auth_signup(req: SignupRequest, request: Request, response: Response) -> dic
     raise HTTPException(status_code=400,
                         detail=t(locale, "auth.signup.password_too_short"))
 
-  # First-user bootstrap: the very first signup becomes admin so the
-  # operator has a way in without running SQL by hand. Two concurrent
-  # signups racing here would both observe an empty table without the
-  # advisory lock — we'd end up with two admins or a unique-index
-  # collision. The lock is transaction-scoped: held until commit, then
-  # auto-released. Cheap (microseconds) and doesn't survive crashes.
-  # Derive username from the email's local part (matches both the
-  # admin-create flow and the migration backfill rule). Resolve any
-  # collision with a numeric suffix so signup never 500s on the
-  # auth_users.username NOT NULL constraint.
+  # Refuse re-signup for an address that's already a full account.
+  # (The pending_signups row will be overwritten below — re-entering the
+  # form for an unfinished signup is the supported "lost the code" path.)
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT 1 FROM auth_users WHERE LOWER(primary_email) = %s",
+        (email,),
+      )
+      if cur.fetchone() is not None:
+        raise HTTPException(status_code=409,
+                            detail=t(locale, "auth.signup.email_taken"))
+
+  code = _generate_otp()
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        """
+        INSERT INTO pending_signups
+          (email, password_hash, locale, display_name, otp_hash,
+           otp_created_at, attempts, resend_count, last_resend_at)
+        VALUES (%s, %s, %s, NULL, %s, NOW(), 0, 0, NOW())
+        ON CONFLICT (email) DO UPDATE SET
+          password_hash = EXCLUDED.password_hash,
+          locale = EXCLUDED.locale,
+          otp_hash = EXCLUDED.otp_hash,
+          otp_created_at = NOW(),
+          attempts = 0,
+          resend_count = 0,
+          last_resend_at = NOW()
+        """,
+        (email, hash_password(req.password), locale, hash_password(code)),
+      )
+    conn.commit()
+
+  try:
+    _send_signup_otp_email(email, code)
+  except Exception:  # noqa: BLE001
+    LOGGER.exception("could not send signup OTP email")
+
+  LOGGER.info("auth.signup-start email=%s", email)
+  return {"pending": True, "email": email}
+
+
+@app.post("/api/auth/signup-resend")
+def auth_signup_resend(req: SignupResendRequest, request: Request) -> dict:
+  """Re-issue the OTP for an in-flight signup. Throttled."""
+  locale = negotiate_locale(request.headers.get("accept-language"))
+  email = _normalize_email(req.email)
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        """
+        SELECT email, last_resend_at, resend_count
+        FROM pending_signups WHERE email = %s
+        """,
+        (email,),
+      )
+      row = cur.fetchone()
+      if row is None:
+        # Don't reveal whether the email is staged or not — same 200
+        # path either way to avoid email-enumeration.
+        return {"pending": True}
+      since = (datetime.now(timezone.utc) -
+               row["last_resend_at"]).total_seconds() if row["last_resend_at"] else 1e9
+      if since < _OTP_RESEND_MIN_SECONDS:
+        raise HTTPException(
+          status_code=429,
+          detail=t(locale, "auth.signup.resend_too_soon"),
+        )
+      code = _generate_otp()
+      cur.execute(
+        """
+        UPDATE pending_signups
+        SET otp_hash = %s, otp_created_at = NOW(), attempts = 0,
+            resend_count = resend_count + 1, last_resend_at = NOW()
+        WHERE email = %s
+        """,
+        (hash_password(code), email),
+      )
+    conn.commit()
+  try:
+    _send_signup_otp_email(email, code)
+  except Exception:  # noqa: BLE001
+    LOGGER.exception("could not resend signup OTP email")
+  return {"pending": True}
+
+
+@app.post("/api/auth/signup-confirm")
+def auth_signup_confirm(req: SignupConfirmRequest, request: Request,
+                       response: Response) -> dict:
+  """Verify the OTP and finalize the account."""
+  locale_hint = request.headers.get("accept-language")
+  locale = negotiate_locale(locale_hint)
+  email = _normalize_email(req.email)
+
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        """
+        SELECT email, password_hash, locale, otp_hash, otp_created_at,
+               attempts
+        FROM pending_signups WHERE email = %s
+        FOR UPDATE
+        """,
+        (email,),
+      )
+      pending = cur.fetchone()
+      if pending is None:
+        raise HTTPException(status_code=400,
+                            detail=t(locale, "auth.signup.no_pending"))
+      age = (datetime.now(timezone.utc) -
+             pending["otp_created_at"]).total_seconds() / 60
+      if age > _OTP_TTL_MINUTES:
+        cur.execute("DELETE FROM pending_signups WHERE email = %s", (email,))
+        conn.commit()
+        raise HTTPException(status_code=400,
+                            detail=t(locale, "auth.signup.code_expired"))
+      if pending["attempts"] >= _OTP_MAX_ATTEMPTS:
+        raise HTTPException(status_code=429,
+                            detail=t(locale, "auth.signup.too_many_attempts"))
+      if not _verify_otp_hash(req.code, pending["otp_hash"]):
+        cur.execute(
+          "UPDATE pending_signups SET attempts = attempts + 1 WHERE email = %s",
+          (email,),
+        )
+        conn.commit()
+        raise HTTPException(status_code=400,
+                            detail=t(locale, "auth.signup.code_wrong"))
+      # OTP matches — promote the staged row into a real account.
+      conn.commit()
+
+  user_locale = pending["locale"] or locale
+  password_hash = pending["password_hash"]
+
+  # Username derivation + first-user bootstrap, same as the old single-shot
+  # signup. Held under the same advisory lock so concurrent "first-ever
+  # signup confirmations" can't both win.
   local = re.sub(r"[^a-z0-9_.-]", "", email.split("@", 1)[0].lower())
   base_username = local or f"user_{int(datetime.now(timezone.utc).timestamp())}"
   with connect() as conn:
     with conn.cursor() as cur:
       cur.execute("SELECT pg_advisory_xact_lock(%s)", (_FIRST_USER_LOCK_KEY,))
       is_first = _no_users_yet(cur)
+      # Re-check email uniqueness inside the lock — a race between two
+      # confirms with the same address could otherwise produce two rows.
       cur.execute(
         "SELECT id::text FROM auth_users WHERE LOWER(primary_email) = %s",
         (email,),
       )
       if cur.fetchone() is not None:
-        raise HTTPException(status_code=409, detail=t(locale, "auth.signup.email_taken"))
+        cur.execute("DELETE FROM pending_signups WHERE email = %s", (email,))
+        conn.commit()
+        raise HTTPException(status_code=409,
+                            detail=t(user_locale, "auth.signup.email_taken"))
       candidate = base_username
       attempt = 0
       while True:
@@ -1098,26 +1295,24 @@ def auth_signup(req: SignupRequest, request: Request, response: Response) -> dic
         candidate = f"{base_username}_{attempt}"
         if attempt > 99:
           raise HTTPException(status_code=409,
-                              detail=t(locale, "auth.signup.email_taken"))
+                              detail=t(user_locale, "auth.signup.email_taken"))
       cur.execute(
         """
-        INSERT INTO auth_users (username, primary_email, locale, is_admin, status)
-        VALUES (%s, %s, %s, %s, 'active')
+        INSERT INTO auth_users (username, primary_email, locale, is_admin, status,
+                                email_verified_at)
+        VALUES (%s, %s, %s, %s, 'active', NOW())
         RETURNING id::text, username, primary_email, locale, is_admin, display_name, status
         """,
-        (candidate, email, locale, is_first),
+        (candidate, email, user_locale, is_first),
       )
       user_row = cur.fetchone()
       cur.execute(
         "INSERT INTO auth_passwords (user_id, argon2_hash) VALUES (%s, %s)",
-        (user_row["id"], hash_password(req.password)),
+        (user_row["id"], password_hash),
       )
-      # New signup grant: 7 days of Basic (chat tier) + the Free tier
-      # as a permanent fallback when Basic expires. Previously we gave a
-      # $2 lifetime "trial credit" via tier_free's usage_quota +
-      # accounts.trial_credit_cents — both are dropped for new accounts
-      # (existing accounts keep their balance, just re-labelled
-      # "account balance" in the UI).
+
+      # Grant tier_free (fallback, 0/day) + 7-day tier_basic + accounts
+      # row — identical to the pre-OTP flow.
       cur.execute(
         "SELECT id FROM products WHERE code = 'tier_free' AND active = TRUE LIMIT 1"
       )
@@ -1125,19 +1320,11 @@ def auth_signup(req: SignupRequest, request: Request, response: Response) -> dic
       if _free is not None:
         cur.execute(
           """
-          INSERT INTO subscriptions (user_id, product_id, status,
-                                       starts_at, source)
-          SELECT %s, %s, 'active', NOW(), 'grant'
-          WHERE NOT EXISTS (
-            SELECT 1 FROM subscriptions
-            WHERE user_id = %s AND product_id = %s AND status = 'active'
-          )
+          INSERT INTO subscriptions (user_id, product_id, status, starts_at, source)
+          VALUES (%s, %s, 'active', NOW(), 'grant')
           """,
-          (user_row["id"], _free["id"], user_row["id"], _free["id"]),
+          (user_row["id"], _free["id"]),
         )
-        # tier_free quota: 0/day. The user can still browse / load the
-        # app, but every chat charge will fail with quota_exhausted and
-        # prompt them to upgrade.
         cur.execute(
           """
           INSERT INTO usage_quotas (user_id, product_id, limit_qty,
@@ -1148,9 +1335,6 @@ def auth_signup(req: SignupRequest, request: Request, response: Response) -> dic
           """,
           (user_row["id"], _free["id"]),
         )
-
-      # 7-day Basic grant. Reads daily_allowance_cents from product
-      # metadata so the value stays in sync with the catalog.
       cur.execute(
         """
         SELECT id,
@@ -1163,16 +1347,12 @@ def auth_signup(req: SignupRequest, request: Request, response: Response) -> dic
       if _basic is not None:
         cur.execute(
           """
-          INSERT INTO subscriptions (user_id, product_id, status,
-                                       starts_at, expires_at, source, metadata)
-          SELECT %s, %s, 'active', NOW(), NOW() + INTERVAL '7 days',
-                 'grant', jsonb_build_object('reason', 'signup_7day_basic')
-          WHERE NOT EXISTS (
-            SELECT 1 FROM subscriptions
-            WHERE user_id = %s AND product_id = %s AND status = 'active'
-          )
+          INSERT INTO subscriptions (user_id, product_id, status, starts_at,
+                                       expires_at, source, metadata)
+          VALUES (%s, %s, 'active', NOW(), NOW() + INTERVAL '7 days',
+                  'grant', jsonb_build_object('reason', 'signup_7day_basic'))
           """,
-          (user_row["id"], _basic["id"], user_row["id"], _basic["id"]),
+          (user_row["id"], _basic["id"]),
         )
         cur.execute(
           """
@@ -1186,9 +1366,6 @@ def auth_signup(req: SignupRequest, request: Request, response: Response) -> dic
           """,
           (user_row["id"], _basic["id"], _basic["daily_allowance"]),
         )
-
-      # Idempotent accounts row — keeps existing trial credit for legacy
-      # users intact, brand-new accounts open at 0 (no signup bonus).
       cur.execute(
         """
         INSERT INTO accounts (user_id, trial_credit_cents)
@@ -1197,29 +1374,15 @@ def auth_signup(req: SignupRequest, request: Request, response: Response) -> dic
         """,
         (user_row["id"],),
       )
+      cur.execute("DELETE FROM pending_signups WHERE email = %s", (email,))
     conn.commit()
 
   token = issue_session(user_row["id"],
                         ip=request.client.host if request.client else None,
                         ua=request.headers.get("user-agent"))
   _set_session_cookie(response, token)
-  LOGGER.info("auth.signup id=%s admin=%s", user_row["id"], is_first)
-  # Best-effort verification email — log fallback if SMTP isn't set,
-  # so dev-mode operators can copy from `docker logs`. We don't fail
-  # signup if the email fails.
-  try:
-    vt = _make_verification_token(user_row["id"], email, "verify_email", 24)
-    base = (os.getenv("PUBLIC_URL") or "https://user.develop.cc").rstrip("/")
-    # The user-center SPA reads `?token=...` on /auth/verify-email and
-    # POSTs it back to this service's /api/auth/verify-email. The old
-    # `/?verify=<tok>` shape only worked on the legacy static index.html
-    # which user.develop.cc no longer serves.
-    _send_email(email, "Verify your email",
-                f"Welcome! Click the link to verify your email:\n\n"
-                f"{base}/auth/verify-email?token={vt}\n\n"
-                f"This link expires in 24 hours.")
-  except Exception:  # noqa: BLE001
-    LOGGER.exception("could not enqueue verification email at signup")
+  LOGGER.info("auth.signup-confirm id=%s admin=%s email=%s",
+              user_row["id"], is_first, email)
   return {"user": _user_row_to_public(user_row)}
 
 
