@@ -232,31 +232,92 @@ def _fetch_quota_from_db(user_id: str, product_id: int) -> _CachedQuota | None:
     )
 
 
-def _resolve_active_tier(user_id: str) -> dict | None:
+def _resolve_active_tier(
+    user_id: str,
+    service_code: str | None = None,
+) -> dict | None:
     """Return the user's highest-tier active subscription product row, or None.
 
     Picks among all rows with status='active' and (expires_at IS NULL OR
     expires_at > now()), ordering by ``products.metadata.tier_rank`` desc.
+
+    If ``service_code`` is given, only subscriptions to products of that
+    service are considered. This prevents cross-contamination — without
+    the scope, a user holding (e.g.) a high-rank xout subscription could
+    accidentally be matched as the "active tier" for a chat charge.
+    Callers that don't pass it (legacy paths) fall back to the global
+    pick; we log a warning so those call sites can be tightened over time.
+
+    Fallback: if no active subscription matches and ``service_code`` is
+    given, return the product row marked
+    ``metadata.is_default_tier = true`` for that service (typically
+    ``tier_free``). Users who only ever had a paid tier and let it lapse
+    therefore land on the free tier instead of getting a 0-quota dead
+    end. ``sub_id`` is None in this synthetic case so callers can tell
+    "real sub" apart from "default fallback" if they care.
     """
+    if service_code is None:
+        LOGGER.warning(
+            "_resolve_active_tier called without service_code "
+            "(global pick, deprecated)"
+        )
     with connect() as conn:
         with conn.cursor() as cur:
+            if service_code:
+                cur.execute(
+                    """
+                    SELECT p.id AS product_id, p.code, p.name, p.metadata,
+                           s.id AS sub_id, s.expires_at, s.status
+                    FROM subscriptions s
+                    JOIN products p ON p.id = s.product_id
+                    WHERE s.user_id = %s
+                      AND p.service_code = %s
+                      AND s.status = 'active'
+                      AND (s.expires_at IS NULL OR s.expires_at > NOW())
+                    ORDER BY COALESCE((p.metadata->>'tier_rank')::int, -1) DESC,
+                             s.created_at DESC
+                    LIMIT 1
+                    """,
+                    (user_id, service_code),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT p.id AS product_id, p.code, p.name, p.metadata,
+                           s.id AS sub_id, s.expires_at, s.status
+                    FROM subscriptions s
+                    JOIN products p ON p.id = s.product_id
+                    WHERE s.user_id = %s
+                      AND s.status = 'active'
+                      AND (s.expires_at IS NULL OR s.expires_at > NOW())
+                    ORDER BY COALESCE((p.metadata->>'tier_rank')::int, -1) DESC,
+                             s.created_at DESC
+                    LIMIT 1
+                    """,
+                    (user_id,),
+                )
+            row = cur.fetchone()
+            if row is not None:
+                return row
+            # Fallback: synthetic default tier (e.g. tier_free for chat).
+            if not service_code:
+                return None
             cur.execute(
                 """
-                SELECT p.id AS product_id, p.code, p.name, p.metadata, s.id AS sub_id,
-                       s.expires_at, s.status
-                FROM subscriptions s
-                JOIN products p ON p.id = s.product_id
-                WHERE s.user_id = %s
-                  AND s.status = 'active'
-                  AND (s.expires_at IS NULL OR s.expires_at > NOW())
-                ORDER BY COALESCE((p.metadata->>'tier_rank')::int, -1) DESC,
-                         s.created_at DESC
+                SELECT id AS product_id, code, name, metadata,
+                       NULL::bigint AS sub_id,
+                       NULL::timestamptz AS expires_at,
+                       'active' AS status
+                FROM products
+                WHERE service_code = %s
+                  AND active = TRUE
+                  AND (metadata->>'is_default_tier')::boolean = TRUE
+                ORDER BY COALESCE((metadata->>'tier_rank')::int, -1) ASC
                 LIMIT 1
                 """,
-                (user_id,),
+                (service_code,),
             )
-            row = cur.fetchone()
-    return row
+            return cur.fetchone()
 
 
 def _fetch_model_pricing(model_id: str) -> dict | None:
@@ -381,6 +442,7 @@ def charge_usage(
     duration_seconds: float = 0,
     resource_id: str | None = None,
     metadata: dict | None = None,
+    service_code: str | None = None,
 ) -> ChargeResult:
     """Apply a usage charge against the user's active tier quota.
 
@@ -410,7 +472,7 @@ def charge_usage(
             tier_code="?", tier_rank=-1, error=f"unknown_model:{model}",
         )
 
-    tier = _resolve_active_tier(user_id)
+    tier = _resolve_active_tier(user_id, service_code=service_code)
     if tier is None:
         return ChargeResult(
             ok=False, charged_cents=0, openai_cents=0,
@@ -598,12 +660,19 @@ def charge_usage(
 # ---------------------------------------------------------------------------
 
 
-def get_usage_summary(user_id: str) -> dict:
+def get_usage_summary(user_id: str, service_code: str | None = None) -> dict:
     """Return the user's tier + today's spend + remaining.
 
     Reads the cached quota when fresh, falls back to a DB hit. Cheap.
+
+    ``service_code`` (e.g. "chat") scopes which subscription to resolve
+    so a chat-tab summary doesn't accidentally pick up a xout tier.
+    Defaults to "chat" because that's what the chatbot sidebar uses;
+    other surfaces can pass their own.
     """
-    tier = _resolve_active_tier(user_id)
+    # Default to chat — most callers are chatbot. The internal
+    # endpoint passes service_code explicitly for non-chat surfaces.
+    tier = _resolve_active_tier(user_id, service_code=service_code or "chat")
     if tier is None:
         return {
             "tier_code": "anonymous",

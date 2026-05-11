@@ -21,9 +21,15 @@ defaults:
   # match as admin without needing a cookie session. MUST match
   # exactly — if missing, admin endpoints work via cookie only.
   ADMIN_SERVICE_TOKEN: change-me-in-system-config
-  # Cookie security — for prod, the deploy override sets this to
-  # the canonical user.develop.cc + secure flag.
-  SESSION_COOKIE_DOMAIN: ""
+  # Cookie security — for prod, scope the session cookie to the
+  # whole `.develop.cc` apex so chat.develop.cc and user.develop.cc
+  # share a session. Without this each subdomain runs its own auth
+  # silo and the user gets re-prompted for credentials when
+  # navigating between products. chatbot's login Server Action
+  # piggybacks a user-service login and forwards this cookie back to
+  # the browser; user-service then trusts the same value on its own
+  # subsequent requests.
+  SESSION_COOKIE_DOMAIN: ".develop.cc"
   SESSION_COOKIE_SECURE: "true"
   # Password reset / verify-email URL prefix the user clicks. The
   # actual link is built as <PUBLIC_URL>/auth/verify?token=...

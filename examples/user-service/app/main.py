@@ -1611,6 +1611,26 @@ def me_usage(user: dict = Depends(get_current_user)) -> dict:
   trial_credit = _get_trial_credit(user["id"])
   if trial_credit is not None:
     usage_summary["trial_credit_cents"] = trial_credit
+  # Per-model token breakdown for the current billing period — same
+  # numbers used by the chatbot sidebar footer. Period start matches
+  # the billing engine's quota period or UTC midnight as fallback.
+  period_start_iso = usage_summary.get("current_period_start")
+  if period_start_iso:
+    try:
+      period_start = datetime.fromisoformat(period_start_iso)
+      if period_start.tzinfo is None:
+        period_start = period_start.replace(tzinfo=timezone.utc)
+    except Exception:
+      period_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+      )
+  else:
+    period_start = datetime.now(timezone.utc).replace(
+      hour=0, minute=0, second=0, microsecond=0
+    )
+  usage_summary["tokens_today"] = _build_token_usage_period(
+    user["id"], period_start
+  )
   return {
     "quotas": _list_user_quotas(user["id"]),
     "billing": usage_summary,
@@ -1748,6 +1768,11 @@ class ChargeRequest(BaseModel):
   duration_seconds: float = 0
   resource_id: str | None = None
   metadata: dict | None = None
+  # Scope the tier lookup to this service (e.g. "chat", "xout"). Without
+  # it the resolver picks the user's globally-highest tier_rank, which
+  # cross-contaminates as soon as more than one service has rank-bearing
+  # products. Optional for now to keep older callers working.
+  service_code: str | None = None
 
 
 @app.post("/api/usage/charge", dependencies=[Depends(require_service_token)])
@@ -1769,6 +1794,7 @@ def usage_charge(req: ChargeRequest) -> dict:
     duration_seconds=req.duration_seconds,
     resource_id=req.resource_id,
     metadata=req.metadata,
+    service_code=req.service_code,
   )
   if not result.ok:
     if result.error == "quota_exhausted":
@@ -1809,17 +1835,45 @@ def _resolve_user_id(ident: str) -> str | None:
 
 @app.get("/api/internal/users/{ident}/usage-summary",
          dependencies=[Depends(require_service_token)])
-def internal_usage_summary(ident: str) -> dict:
+def internal_usage_summary(ident: str, service_code: str = "chat") -> dict:
   """Service-to-service: return billing summary for a user without
   needing a session cookie. ``ident`` may be either the
   ``auth_users.id`` UUID or the user's primary email — chatbot has
   its own user table with a different id space, so it passes the
-  email."""
+  email.
+
+  ``service_code`` scopes which subscription to resolve. Defaults to
+  ``chat`` since chatbot is the dominant caller; other services pass
+  their own (e.g. ``service_code=xout``) via query string.
+
+  Also includes a ``tokens_today`` block (per-model input / cached /
+  output breakdown) so the chatbot sidebar can show the user how many
+  tokens they've burned in the current billing period without making
+  a second round-trip."""
   from . import billing as _billing
   uid = _resolve_user_id(ident)
   if not uid:
     raise HTTPException(status_code=404, detail="user not found")
-  return _billing.get_usage_summary(uid)
+  summary = _billing.get_usage_summary(uid, service_code=service_code)
+  # Bolt token-breakdown onto the same response. Period start matches
+  # the billing engine's: prefer the active quota's current_period_start
+  # (so a mid-day quota reset is reflected here too), else UTC midnight.
+  period_start_iso = summary.get("current_period_start")
+  if period_start_iso:
+    try:
+      period_start = datetime.fromisoformat(period_start_iso)
+      if period_start.tzinfo is None:
+        period_start = period_start.replace(tzinfo=timezone.utc)
+    except Exception:
+      period_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+      )
+  else:
+    period_start = datetime.now(timezone.utc).replace(
+      hour=0, minute=0, second=0, microsecond=0
+    )
+  summary["tokens_today"] = _build_token_usage_period(uid, period_start)
+  return summary
 
 
 class InternalChargeRequest(BaseModel):
@@ -1831,6 +1885,7 @@ class InternalChargeRequest(BaseModel):
   duration_seconds: float = 0
   resource_id: str | None = None
   metadata: dict | None = None
+  service_code: str | None = None
 
 
 @app.post("/api/internal/usage/charge",
@@ -1852,6 +1907,7 @@ def internal_usage_charge(req: InternalChargeRequest) -> dict:
     duration_seconds=req.duration_seconds,
     resource_id=req.resource_id,
     metadata=req.metadata,
+    service_code=req.service_code,
   )
   if not result.ok:
     if result.error == "quota_exhausted":
@@ -3347,7 +3403,13 @@ def _get_system_config(key: str) -> dict:
 
 
 class CheckoutSessionRequest(BaseModel):
+  # New offer-based model: caller picks a (product_code, duration_months)
+  # pair from the catalog. Server resolves to the matching product_offers
+  # row + its stripe_price_id. Legacy `product_code`-only callers (which
+  # implicitly mean "the 1-month price") still work via the fallback at
+  # the bottom of the resolver.
   product_code: str
+  duration_months: int | None = None
   # Optional override URLs the SPA can pass; default to PUBLIC_URL paths.
   success_url: str | None = None
   cancel_url: str | None = None
@@ -3369,54 +3431,72 @@ def _stripe_client():
 def create_checkout_session(req: CheckoutSessionRequest,
                               user: dict = Depends(get_current_user),
                               request: Request = None) -> dict:
+  duration_months = req.duration_months or 1
   with connect() as conn:
     with conn.cursor() as cur:
       cur.execute(
         """
-        SELECT id, code, kind, price_cents, currency, period_days,
-               stripe_price_id, name
-        FROM products WHERE code = %s AND active = TRUE
+        SELECT p.id AS product_id, p.code, p.name, p.currency,
+               o.id AS offer_id, o.duration_months, o.price_cents,
+               o.discount_pct, o.stripe_price_id
+        FROM product_offers o
+        JOIN products p ON p.id = o.product_id
+        WHERE p.code = %s
+          AND p.active = TRUE
+          AND o.active = TRUE
+          AND o.duration_months = %s
         """,
-        (req.product_code,),
+        (req.product_code, duration_months),
       )
-      product = cur.fetchone()
-  if product is None:
-    raise HTTPException(status_code=404, detail=f"product not found: {req.product_code}")
-  if product["price_cents"] <= 0:
-    raise HTTPException(status_code=400, detail="this product is free; no checkout required")
-  if not product["stripe_price_id"]:
-    raise HTTPException(status_code=400,
-                        detail="product has no stripe_price_id — set it via Admin → Products")
-  # Reject if the user already has an active subscription to this
-  # product. Without this guard a user can re-pay the same product;
-  # the webhook ON CONFLICT would record the second payment but
-  # never grant a second subscription — money lost.
-  with connect() as conn:
-    with conn.cursor() as cur:
-      cur.execute(
-        "SELECT 1 FROM subscriptions WHERE user_id=%s AND product_id=%s AND status='active'",
-        (user["id"], product["id"]),
-      )
-      if cur.fetchone() is not None:
-        raise HTTPException(status_code=409,
-                            detail="already subscribed to this product")
+      offer = cur.fetchone()
+  if offer is None:
+    raise HTTPException(
+      status_code=404,
+      detail=f"offer not found: {req.product_code} × {duration_months}mo",
+    )
+  if not offer["stripe_price_id"]:
+    raise HTTPException(
+      status_code=400,
+      detail="offer has no stripe_price_id — re-run the Stripe catalog sync",
+    )
+  # No 409 on existing-active sub: under the one-time + duration model the
+  # user is *allowed* to top up; the webhook stacks duration_months onto
+  # the existing expires_at. This is the whole point of multi-month buys
+  # alongside an active sub (early renewal at the discounted bulk price).
   stripe = _stripe_client()
   base = (os.getenv("PUBLIC_URL") or "https://user.develop.cc").rstrip("/")
   success_url = req.success_url or f"{base}/?checkout=success"
   cancel_url = req.cancel_url or f"{base}/?checkout=cancel"
   try:
     session = stripe.checkout.Session.create(
-      mode="subscription" if product["kind"] in ("recurring",) else "payment",
-      line_items=[{"price": product["stripe_price_id"], "quantity": 1}],
+      # Always one-time payment now — we no longer use Stripe subscriptions
+      # at all. The "subscription" inside our system is just a row whose
+      # expires_at gets pushed forward on each successful payment.
+      mode="payment",
+      # Explicit method allowlist so Chinese users see the Alipay tile on
+      # the Stripe-hosted checkout — our products are USD-priced and the
+      # paid_tier dialog promises "USD payments also support Alipay".
+      # Card stays first so non-CN users default to it.
+      payment_method_types=["card", "alipay"],
+      line_items=[{"price": offer["stripe_price_id"], "quantity": 1}],
       success_url=success_url,
       cancel_url=cancel_url,
       client_reference_id=str(user["id"]),
       customer_email=user.get("primary_email") or None,
+      # Stripe copies session.metadata onto the payment_intent (and
+      # therefore the webhook). Carry everything the webhook needs to
+      # locate the right (user, product, offer) tuple without re-querying.
       metadata={
         "user_id": str(user["id"]),
-        "product_id": str(product["id"]),
-        "product_code": product["code"],
+        "product_id": str(offer["product_id"]),
+        "product_code": offer["code"],
+        "offer_id": str(offer["offer_id"]),
+        "duration_months": str(offer["duration_months"]),
+        "discount_pct": str(offer["discount_pct"]),
       },
+      # Allow promo codes the user enters on Stripe Checkout. We don't
+      # mint them — operators create coupons in the dashboard.
+      allow_promotion_codes=True,
     )
   except Exception as exc:  # noqa: BLE001
     LOGGER.exception("stripe.checkout.session create failed")
@@ -3538,6 +3618,9 @@ async def stripe_webhook(request: Request) -> dict:
   user_id = meta.get("user_id") or data_obj.get("client_reference_id")
   product_id = int(meta.get("product_id") or 0)
   product_code = meta.get("product_code")
+  # New under the one-time + duration model: how many months this purchase
+  # grants. Defaults to 1 so a legacy session without the field still works.
+  duration_months = int(meta.get("duration_months") or 1)
   amount = int(data_obj.get("amount_total") or data_obj.get("amount_paid") or 0)
   currency = (data_obj.get("currency") or "usd").upper()
   pi_id = data_obj.get("payment_intent") or data_obj.get("invoice") or ""
@@ -3557,7 +3640,9 @@ async def stripe_webhook(request: Request) -> dict:
       product = cur.fetchone()
       if product is None:
         return {"ok": True, "skipped": "product not found"}
-      # Insert payment idempotently.
+      # Insert payment idempotently. Stash product_code + duration_months
+      # + discount_pct on the row so the user's Orders page can render
+      # "Chat Pro · 3 months · 15% off" without re-joining product_offers.
       cur.execute(
         """
         INSERT INTO payments
@@ -3568,21 +3653,28 @@ async def stripe_webhook(request: Request) -> dict:
         RETURNING id
         """,
         (user_id, product_id, amount, currency, pi_id, event_id,
-         _to_jsonb({"event_type": event_type})),
+         _to_jsonb({
+           "event_type": event_type,
+           "product_code": product_code,
+           "duration_months": duration_months,
+           "discount_pct": int(meta.get("discount_pct") or 0),
+           "offer_id": int(meta.get("offer_id") or 0) or None,
+         })),
       )
       payment_row = cur.fetchone()
       if payment_row is None:
         # Already processed — idempotent retry.
         return {"ok": True, "duplicate": True}
-      # Auto-grant subscription if not already active. For renewals
-      # (invoice.payment_succeeded on a recurring sub the user already
-      # has), we *extend* expires_at instead of NO-OPing on conflict;
-      # otherwise recurring subs would never expire AND never count
-      # the renewal payment as anything that grants more access.
+      # Auto-grant subscription or extend the existing one. Under the
+      # one-time + duration model we shift expires_at forward by the
+      # purchased duration_months; the row stays active throughout.
       expires_at = None
-      period = product["period_days"] or 30  # fallback for kind=recurring without period_days
-      if product["kind"] in ("period", "recurring") and period:
-        expires_at = datetime.now(timezone.utc) + timedelta(days=period)
+      if product["kind"] in ("one_time", "period", "recurring"):
+        # `relativedelta` from dateutil would be tidier (handles leap
+        # months) but we already depend on stdlib timedelta everywhere;
+        # 30 d/month is the same rule the legacy `period_days` path used
+        # and matches Stripe's billing precedent for "monthly".
+        expires_at = datetime.now(timezone.utc) + timedelta(days=30 * duration_months)
       cur.execute(
         """
         SELECT id, expires_at FROM subscriptions
@@ -3627,7 +3719,7 @@ async def stripe_webhook(request: Request) -> dict:
           if existing_sub is not None and expires_at is not None:
             from_dt = max(datetime.now(timezone.utc),
                           (existing_sub["expires_at"] or datetime.now(timezone.utc)))
-            new_exp = from_dt + timedelta(days=period)
+            new_exp = from_dt + timedelta(days=30 * duration_months)
             cur.execute(
               """
               UPDATE subscriptions SET expires_at=%s, updated_at=NOW()
@@ -3664,6 +3756,30 @@ async def stripe_webhook(request: Request) -> dict:
       # No xout-side provisioning needed: xout containers read user
       # state from auth_users + subscriptions + xout_products on every
       # tick, and the user's VLESS UUID is on auth_users (not per node).
+      #
+      # Provision (or refresh) the usage_quotas row for chat-tier
+      # purchases. Without this the user sees their new tier but
+      # limit_cents=0 because get_usage_summary reads from
+      # usage_quotas — there's no on-the-fly derivation from
+      # product.metadata.daily_allowance_cents. ON CONFLICT DO NOTHING
+      # so renewals don't wipe the running consumption for the day.
+      cur.execute(
+        """
+        INSERT INTO usage_quotas
+          (user_id, product_id, limit_qty, reset_kind,
+           current_period_start, current_period_consumed, updated_at)
+        SELECT %s, p.id,
+               COALESCE((p.metadata->>'daily_allowance_cents')::int, 0),
+               'daily',
+               date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+               0, NOW()
+        FROM products p
+        WHERE p.id = %s
+          AND (p.metadata->>'daily_allowance_cents') IS NOT NULL
+        ON CONFLICT (user_id, product_id) DO NOTHING
+        """,
+        (user_id, product_id),
+      )
     conn.commit()
   LOGGER.info("stripe webhook handled event=%s user=%s product=%s",
                event_id, user_id, product_code)
@@ -3862,6 +3978,145 @@ async def oauth_callback(provider: str, code: str | None = None,
   resp.delete_cookie(_OAUTH_STATE_COOKIE, path="/")
   LOGGER.info("oauth login provider=%s user=%s", provider, user_id)
   return resp
+
+
+@app.get("/api/me/orders")
+def me_orders(user: dict = Depends(get_current_user)) -> dict:
+  """Return the user's purchase history — every successful Stripe
+  payment they've made, newest first. The data lives in the
+  ``payments`` table; we join ``products`` and ``product_offers`` so
+  the response carries tier name + duration + Stripe receipt URL
+  without the SPA having to do follow-up lookups."""
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        """
+        SELECT pay.id, pay.amount_cents, pay.currency, pay.status,
+               pay.stripe_payment_intent_id, pay.created_at, pay.metadata,
+               p.code AS product_code, p.name AS product_name
+        FROM payments pay
+        JOIN products p ON p.id = pay.product_id
+        WHERE pay.user_id = %s
+        ORDER BY pay.created_at DESC
+        LIMIT 100
+        """,
+        (user["id"],),
+      )
+      rows = cur.fetchall()
+  out = []
+  for r in rows:
+    m = r["metadata"] or {}
+    if isinstance(m, str):
+      try:
+        m = json.loads(m)
+      except Exception:
+        m = {}
+    out.append({
+      "id": r["id"],
+      "product_code": r["product_code"],
+      "product_name": r["product_name"],
+      "duration_months": int(m.get("duration_months") or 1),
+      "discount_pct": int(m.get("discount_pct") or 0),
+      "amount_cents": r["amount_cents"],
+      "currency": r["currency"],
+      "status": r["status"],
+      "stripe_payment_intent_id": r["stripe_payment_intent_id"],
+      "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+    })
+  return {"orders": out}
+
+
+@app.get("/api/internal/users/{ident}/orders",
+         dependencies=[Depends(require_service_token)])
+def internal_orders(ident: str) -> dict:
+  """Service-to-service mirror of /api/me/orders. chatbot calls this
+  to power the upgrade/orders dialog without re-auth."""
+  uid = _resolve_user_id(ident)
+  if not uid:
+    raise HTTPException(status_code=404, detail="user not found")
+  return me_orders({"id": uid})  # reuse the cookie-auth impl
+
+
+class InternalCheckoutSessionRequest(BaseModel):
+  user_ident: str  # email or auth_users.id
+  product_code: str
+  duration_months: int | None = None
+  success_url: str | None = None
+  cancel_url: str | None = None
+
+
+@app.post("/api/internal/checkout/create-session",
+          dependencies=[Depends(require_service_token)])
+def internal_create_checkout_session(req: InternalCheckoutSessionRequest) -> dict:
+  """Service-to-service mirror of /api/checkout/create-session for
+  callers (chatbot) that don't have a user-service cookie. Resolves
+  the user via email or uuid, then delegates to the same code path
+  as the cookie-authed endpoint."""
+  uid = _resolve_user_id(req.user_ident)
+  if not uid:
+    raise HTTPException(status_code=404, detail="user not found")
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT id, primary_email, display_name, username FROM auth_users WHERE id = %s",
+        (uid,),
+      )
+      user_row = cur.fetchone()
+  if user_row is None:
+    raise HTTPException(status_code=404, detail="user not found")
+  cookie_req = CheckoutSessionRequest(
+    product_code=req.product_code,
+    duration_months=req.duration_months,
+    success_url=req.success_url,
+    cancel_url=req.cancel_url,
+  )
+  return create_checkout_session(cookie_req, user=dict(user_row))
+
+
+@app.get("/api/billing/catalog")
+def billing_catalog(service_code: str = "chat") -> dict:
+  """Public chat-tier catalog: every (product, offer) the user can
+  buy for ``service_code``. Server-side computation so the SPA only
+  has to render. Free / non-user-facing products are filtered out."""
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        """
+        SELECT p.code, p.name, p.description, p.metadata,
+               p.price_cents AS base_cents,
+               o.id AS offer_id, o.duration_months,
+               o.price_cents, o.discount_pct, o.stripe_price_id
+        FROM products p
+        LEFT JOIN product_offers o ON o.product_id = p.id AND o.active = TRUE
+        WHERE p.service_code = %s
+          AND p.active = TRUE
+          AND p.kind = 'one_time'
+          AND (p.metadata->>'user_facing')::boolean = TRUE
+        ORDER BY (p.metadata->>'tier_rank')::int NULLS LAST, o.duration_months
+        """,
+        (service_code,),
+      )
+      rows = cur.fetchall()
+  by_product: dict[str, dict] = {}
+  for r in rows:
+    code = r["code"]
+    entry = by_product.setdefault(code, {
+      "code": code,
+      "name": r["name"],
+      "description": r["description"],
+      "metadata": r["metadata"] or {},
+      "base_cents_monthly": r["base_cents"],
+      "offers": [],
+    })
+    if r["offer_id"] is not None:
+      entry["offers"].append({
+        "offer_id": r["offer_id"],
+        "duration_months": r["duration_months"],
+        "price_cents": r["price_cents"],
+        "discount_pct": r["discount_pct"],
+        "stripe_price_id": r["stripe_price_id"],
+      })
+  return {"service_code": service_code, "products": list(by_product.values())}
 
 
 @app.get("/api/me/oauth-links")
