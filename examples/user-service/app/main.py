@@ -1112,23 +1112,17 @@ def auth_signup(req: SignupRequest, request: Request, response: Response) -> dic
         "INSERT INTO auth_passwords (user_id, argon2_hash) VALUES (%s, %s)",
         (user_row["id"], hash_password(req.password)),
       )
-      # Auto-grant the Free tier on signup: subscription row + a
-      # ``never``-reset usage_quota seeded with the lifetime trial
-      # amount (currently $2 = 200 cents). Whole flow is idempotent
-      # via the conditional INSERTs in case the user already has the
-      # rows from a backfill.
+      # New signup grant: 7 days of Basic (chat tier) + the Free tier
+      # as a permanent fallback when Basic expires. Previously we gave a
+      # $2 lifetime "trial credit" via tier_free's usage_quota +
+      # accounts.trial_credit_cents — both are dropped for new accounts
+      # (existing accounts keep their balance, just re-labelled
+      # "account balance" in the UI).
       cur.execute(
-        """
-        SELECT id, COALESCE((metadata->>'lifetime_trial_cents')::int, 200)
-            AS trial_cents
-        FROM products WHERE code = 'tier_free' AND active = TRUE
-        LIMIT 1
-        """
+        "SELECT id FROM products WHERE code = 'tier_free' AND active = TRUE LIMIT 1"
       )
       _free = cur.fetchone()
       if _free is not None:
-        _free_pid = _free["id"]
-        _trial_cents = _free["trial_cents"]
         cur.execute(
           """
           INSERT INTO subscriptions (user_id, product_id, status,
@@ -1139,24 +1133,66 @@ def auth_signup(req: SignupRequest, request: Request, response: Response) -> dic
             WHERE user_id = %s AND product_id = %s AND status = 'active'
           )
           """,
-          (user_row["id"], _free_pid, user_row["id"], _free_pid),
+          (user_row["id"], _free["id"], user_row["id"], _free["id"]),
+        )
+        # tier_free quota: 0/day. The user can still browse / load the
+        # app, but every chat charge will fail with quota_exhausted and
+        # prompt them to upgrade.
+        cur.execute(
+          """
+          INSERT INTO usage_quotas (user_id, product_id, limit_qty,
+                                     reset_kind, current_period_start,
+                                     current_period_consumed, updated_at)
+          VALUES (%s, %s, 0, 'never', NOW(), 0, NOW())
+          ON CONFLICT (user_id, product_id) DO NOTHING
+          """,
+          (user_row["id"], _free["id"]),
+        )
+
+      # 7-day Basic grant. Reads daily_allowance_cents from product
+      # metadata so the value stays in sync with the catalog.
+      cur.execute(
+        """
+        SELECT id,
+               COALESCE((metadata->>'daily_allowance_cents')::int, 200)
+                 AS daily_allowance
+        FROM products WHERE code = 'tier_basic' AND active = TRUE LIMIT 1
+        """
+      )
+      _basic = cur.fetchone()
+      if _basic is not None:
+        cur.execute(
+          """
+          INSERT INTO subscriptions (user_id, product_id, status,
+                                       starts_at, expires_at, source, metadata)
+          SELECT %s, %s, 'active', NOW(), NOW() + INTERVAL '7 days',
+                 'grant', jsonb_build_object('reason', 'signup_7day_basic')
+          WHERE NOT EXISTS (
+            SELECT 1 FROM subscriptions
+            WHERE user_id = %s AND product_id = %s AND status = 'active'
+          )
+          """,
+          (user_row["id"], _basic["id"], user_row["id"], _basic["id"]),
         )
         cur.execute(
           """
           INSERT INTO usage_quotas (user_id, product_id, limit_qty,
                                      reset_kind, current_period_start,
                                      current_period_consumed, updated_at)
-          VALUES (%s, %s, %s, 'never', NOW(), 0, NOW())
+          VALUES (%s, %s, %s, 'daily',
+                  date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+                  0, NOW())
           ON CONFLICT (user_id, product_id) DO NOTHING
           """,
-          (user_row["id"], _free_pid, _trial_cents),
+          (user_row["id"], _basic["id"], _basic["daily_allowance"]),
         )
-      # Create accounts row with trial_credit_cents = 200 (the $2 account
-      # credit. Idempotent via ON CONFLICT DO NOTHING).
+
+      # Idempotent accounts row — keeps existing trial credit for legacy
+      # users intact, brand-new accounts open at 0 (no signup bonus).
       cur.execute(
         """
         INSERT INTO accounts (user_id, trial_credit_cents)
-        VALUES (%s, 200)
+        VALUES (%s, 0)
         ON CONFLICT (user_id) DO NOTHING
         """,
         (user_row["id"],),
@@ -1873,6 +1909,13 @@ def internal_usage_summary(ident: str, service_code: str = "chat") -> dict:
       hour=0, minute=0, second=0, microsecond=0
     )
   summary["tokens_today"] = _build_token_usage_period(uid, period_start)
+  # account_balance_cents — the lifetime credit pool on accounts.
+  # Previously labelled "trial credit" / "体验金"; renamed to
+  # "account balance" / "账号余额" since it's a permanent balance the
+  # user accumulates (no longer a sign-up bonus on new accounts).
+  bal = _get_trial_credit(uid)
+  if bal is not None:
+    summary["account_balance_cents"] = bal
   return summary
 
 

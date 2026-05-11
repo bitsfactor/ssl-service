@@ -157,24 +157,22 @@ export function BillingClient({
         </p>
       </div>
 
-      {/* Account credit card (trial credit — Job 2) */}
-      {usage && typeof usage.trial_credit_cents === "number" ? (
+      {/* Account balance card — site-wide permanent credit pool.
+          Hidden when zero; older users hold the $2 sign-up grant
+          here, new accounts start at 0 with the 7-day Basic comp
+          instead. */}
+      {usage && typeof usage.trial_credit_cents === "number" && usage.trial_credit_cents > 0 ? (
         <Card className="mb-6">
           <CardHeader className="pb-3">
-            <CardTitle>{t("billing.trialCredit")}</CardTitle>
+            <CardTitle>{t("billing.accountBalance")}</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="flex items-center justify-between text-sm">
-              <span className="text-muted-foreground">{t("billing.trialCreditRemaining")}</span>
+              <span className="text-muted-foreground">{t("billing.accountBalanceRemaining")}</span>
               <span className="font-semibold tabular-nums">
                 {formatCents(usage.trial_credit_cents)}
               </span>
             </div>
-            {usage.trial_credit_cents === 0 ? (
-              <p className="mt-2 text-xs text-muted-foreground">
-                {t("billing.trialCreditExhausted")}
-              </p>
-            ) : null}
           </CardContent>
         </Card>
       ) : null}

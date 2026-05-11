@@ -137,15 +137,17 @@ export function DashboardClient({
         <p className="mt-1 text-sm text-muted-foreground">{user.email}</p>
       </div>
 
-      {/* Trial credit banner (Job 2) */}
+      {/* Account balance banner — site-wide permanent credit. Older
+          accounts still carry the $2 sign-up grant we used to label
+          "trial credit"; new accounts open at $0 here. */}
       {usage && typeof usage.trial_credit_cents === "number" && usage.trial_credit_cents > 0 ? (
-        <div className="mb-4 flex items-center justify-between rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3">
+        <div className="mb-4 flex items-center justify-between rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3">
           <div>
-            <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
-              {t("dashboard.trialCreditRemaining")}
+            <p className="text-sm font-medium text-emerald-700 dark:text-emerald-400">
+              {t("dashboard.accountBalance")}
             </p>
           </div>
-          <span className="font-semibold tabular-nums text-amber-700 dark:text-amber-400">
+          <span className="font-semibold tabular-nums text-emerald-700 dark:text-emerald-400">
             ${(usage.trial_credit_cents / 100).toFixed(2)}
           </span>
         </div>

@@ -703,6 +703,16 @@ def get_usage_summary(user_id: str, service_code: str | None = None) -> dict:
         }
     cached = _maybe_roll_period(cached)
     consumed_total = cached.db_consumed + cached.pending_delta
+    # expires_at: ISO of when the active subscription lapses (None for
+    # tier_free / lifetime grants). The sidebar uses it to render
+    # "Basic · expires Jun 10".
+    expires_at_iso = None
+    expires_at = tier.get("expires_at")
+    if expires_at is not None:
+        if isinstance(expires_at, str):
+            expires_at_iso = expires_at
+        else:
+            expires_at_iso = expires_at.isoformat()
     return {
         "tier_code": tier["code"],
         "tier_name": tier["name"],
@@ -712,6 +722,7 @@ def get_usage_summary(user_id: str, service_code: str | None = None) -> dict:
         "remaining_cents": max(0.0, cached.limit_qty - consumed_total),
         "reset_kind": cached.reset_kind,
         "current_period_start": cached.current_period_start.isoformat(),
+        "expires_at": expires_at_iso,
         "discount_factor": get_discount_factor(),
     }
 
