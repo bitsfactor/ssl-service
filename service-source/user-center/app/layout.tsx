@@ -3,6 +3,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import { Suspense } from "react";
 import { Toaster } from "sonner";
 import { ThemeProvider } from "@/components/theme-provider";
+import { ThemeSync } from "@web-shell/theme-sync";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { DEFAULT_LOCALE } from "@/lib/i18n/config";
 import { I18nProvider } from "@/lib/i18n/i18n-provider";
@@ -88,6 +89,7 @@ function ProvidersTree({
       disableTransitionOnChange
       enableSystem
     >
+      <ThemeSync />
       <I18nProvider locale={locale as never}>
         <TooltipProvider>
           {children}

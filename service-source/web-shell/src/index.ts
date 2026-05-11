@@ -11,6 +11,7 @@ export { LocaleSwitcher } from "./header/locale-switcher";
 export { ServicesMenu } from "./header/services-menu";
 export { SiteHeader } from "./header/site-header";
 export { ThemeToggle } from "./header/theme-toggle";
+export { ThemeSync } from "./theme-sync";
 export { UserMenu } from "./header/user-menu";
 export type {
   AuthState,
