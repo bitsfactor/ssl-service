@@ -1,397 +1,288 @@
-# Plan — Commands sidebar in admin SPA
+# Plan — Commands palette Phase 2 + UI rework
 
-**Status:** proposal, ready to implement
-**Owner of next session:** TBD
-**Date drafted:** 2026-05-09
-
----
-
-## Why this exists
-
-The agent's current operational workflow has a major bottleneck. Every time we
-need to do something "imperative" (commit + push, redeploy a service, wipe a
-remote dir, run a one-shot SQL on the DB, sync a submodule, restart admin) the
-loop is:
-
-1. Write a `.command` shell script under `scripts/dev/`.
-2. `chmod +x` it.
-3. Drive Finder (Cmd+Shift+G → type path → Return).
-4. Double-click the `.command` to launch Terminal.
-5. Wait, screenshot, parse output, decide next step.
-
-Each cycle costs 30–60 seconds of wall-clock time and a non-trivial chunk of
-context (computer-use coordinates, screenshot images, retries when the
-double-click misses, etc.). In a single overnight session the agent ran this
-loop **12+ times**. The cost compounds because the screenshots themselves
-saturate the model's context budget, which means fewer cycles before another
-hand-off becomes necessary.
-
-The fix: a **Commands** page inside the admin SPA where every imperative
-operation is a button. The operator (or the agent driving the page through
-the Chrome MCP) clicks the button, fills any required inputs, and the admin
-process executes the work and streams output back inline. No Finder. No
-double-click. No `.command` files cluttering `scripts/dev/`.
-
-**Expected payoff:** ~80% reduction in time-per-imperative-action; a much
-larger reduction in agent context burn (no more screenshot rounds for git
-pushes); commands become first-class, discoverable, repeatable artefacts
-that survive across sessions.
+**Status:** Phase 1 landed as `cea8f8d` on origin/main. Phase 2 in progress.
+**Owner of next session:** Claude Code (handoff from Cowork; Cowork session got
+flaky on Anthropic-side capacity, Claude Code unaffected today).
+**Date drafted:** 2026-05-09 evening (post-Phase-1).
 
 ---
 
-## Scope (MVP)
+## What's live right now
 
-A new top-level admin route at `#/commands` rendered as a service-plugin
-view (using the existing `uiPageHeader` / `uiCard` / `uiSection` /
-`uiToolbar` helpers in `static/index.html`).
+`cea8f8d feat(admin): Commands palette — operator-facing #/commands page`
 
-### Backend
+- `/api/local/run`, `/api/local/git/commit-push`, `/api/local/repo-sync` —
+  the three executors against the host where admin runs.
+- `/api/commands` (GET catalog), `/api/commands/{id}/run` (POST dispatch
+  by `exec.kind` over 8 kinds), `/api/commands/runs` (GET history).
+- Tables `commands_catalog` and `command_runs` (FK with ON DELETE SET NULL)
+  on the home schema.
+- 18 builtin command rows seeded (idempotent, ON CONFLICT DO NOTHING).
+- SPA route `#/commands` with category sections, form-driven cards,
+  inline output panel, copy buttons, history modal.
+- Phase 1 review-pass fixes already in `cea8f8d`: psycopg connect_timeout
+  + statement_timeout, template-expansion guard against operator-input
+  cmd, `git commit -- <paths>` (so plain `git commit` doesn't sweep
+  stale staged work — bit us twice during Phase 1 testing), exec_spec
+  parse-failure surfacing, FK constraint, frontend confirm() before
+  `git add -A`.
 
-Three new admin endpoints, all behind `with_auth` (admin token required):
+## Uncommitted in the working tree (Cowork left this for Claude Code)
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/api/local/run` | Run a shell command on the host where admin runs (the operator's Mac). Returns `{stdout, stderr, exit_code, elapsed_ms, cwd}`. Streams optional via SSE later — MVP can be synchronous. |
-| `POST` | `/api/local/git/commit-push` | Convenience wrapper for the most common workflow. Body: `{repo_path, message, paths?, allow_empty?, push_to?}`. If `paths` is empty, stages everything in `repo_path`. If `push_to` is omitted, pushes to `origin/<current-branch>`. Returns the same shape as `/api/local/run` plus the resulting SHA. |
-| `POST` | `/api/local/repo-sync` | Pull + reset + clean a working tree. Body: `{repo_path, remote?, branch?}`. Used to recover from "uncommitted changes block deploy" scenarios. |
+`src/ssl_proxy_controller/static/index.html` has Phase 2 task #9
+(history modal one-click re-run) **partially landed but not e2e-verified**.
+Specifically:
 
-The existing endpoints we'll lean on (already implemented, just need UI):
+- `buildCommandCard` exposes `applyArgs(args)` and `triggerRun()` closures.
+- `historyBtn.click` now passes `{applyArgs, triggerRun}` to
+  `showHistoryModal` as a 3rd arg.
+- `showHistoryModal` adds an "Action" column with a "Re-run" button that
+  copies the row's `args_json` back into the card form, closes the modal,
+  and triggers Run after a 50ms settle.
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/api/admin/restart` | os.execv the admin process. Already wired into the nav-footer button — the Commands page can re-expose it for completeness. |
-| `POST` | `/api/services/{name}/deploy` | Trigger a full service deploy with optional node list. |
-| `POST` | `/api/nodes/{name}/run` | Run a shell command on a remote node via the platform's SSH mux. |
-| `POST` | `/api/databases/{id}/apply-schema` | Apply `sql/schema.sql` to a registered database. |
+The change is small and looks correct; it just hasn't been clicked through
+in a real browser. **First task for Claude Code: reload `#/commands`,
+open History on any card, verify the Re-run column shows up and the
+button does what the docstring says, then commit + push.**
 
-**Security model:** every endpoint sits behind the same admin-token auth as
-`/api/nodes/{name}/run`. There is no incremental risk — the operator already
-has unrestricted shell access via that endpoint.
+(Other dirty files in the tree — `_p22_commit.command`, `_tmp_*`,
+`scripts/.DS_Store`, `scripts/dev/commit-chatbot-header-fix.command`,
+`examples/user-service/app/billing.py`, `examples/user-service/app/main.py`
+— are NOT Cowork's. Don't touch them. Stage only `src/ssl_proxy_controller/static/index.html`
+when committing the re-run change. `git commit -- <paths>` is critical;
+see memory `feedback_git_commit_paths_only.md`.)
 
-**Error envelope:** all three new endpoints return on any failure path with
-`HTTP 200` body `{ok: false, exit_code: <n>, stdout, stderr, error}` so the
-UI can show the failure inline without losing access to the partial output.
-Reserve non-200 codes for genuine HTTP-layer errors (auth, malformed body).
+---
 
-**Timeouts:** default 60 s, allow overrides up to 600 s in the body. Long
-deploys still go through `/api/services/{name}/deploy` which has its own
-timeout machinery — the local-run endpoint is for git / shell glue, not
-for shipping container builds.
+## Phase 2 — what's still to build
 
-**Audit log:** persist every successful local-run in a new
-`local_command_runs` table: `(id, operator_token_id, command, args_json,
-exit_code, started_at, finished_at, output_truncated)`. So if anything weird
-happens, there's a trail. Truncate stored output at 64 KiB; full output is
-in the immediate response only.
+Priority order. Each item ships independently; commit + push between
+items, don't accumulate.
 
-### Frontend
+### 1. UI rework (HIGH — user explicitly flagged the page as messy)
 
-Add `commands` to `NAV_REGISTRY` in `static/index.html`, between
-`databases` and `logs`. Render via `renderCommandsView(root)` following the
-same service-plugin pattern as the Billing page.
+Current state of `#/commands`:
 
-Layout (top to bottom):
+- 5 SECTION blocks stacked vertically (Quick / Git / Deploy / DB / Remote / Free-form).
+- 2-column grid of cards inside each section.
+- Cards have wildly different heights (empty form like restart-admin is
+  ~80px, deploy-service with 3 fields is ~280px).
+- Inline output panel pushes each card down when run; no consistent
+  position for the "where do I look for output" question.
+- No top-level "I just want to run the thing I always run" affordance —
+  operator scans the whole catalog every time.
+
+Target state:
+
+1. **Top: segmented tabs** for the categories (default to "Quick"). Show
+   one category at a time. Halves vertical scroll, makes the screen feel
+   like a tool palette instead of a directory listing.
+
+2. **Cards become uniform height in a category.** CSS grid with
+   `align-items: stretch` + `grid-auto-rows: 1fr`. Form area grows; Run
+   button anchored at the card's footer (right-aligned) so the click
+   target is always in the same spot.
+
+3. **Sticky output drawer** on the right side of the page (or bottom on
+   narrow viewports). The active card's output streams into it. Clicking
+   Run on a different card switches the drawer to that card. Drawer has
+   a header `<command title> · <timestamp> · <duration> · <exit>` and
+   the same Copy stdout / Copy stderr / Re-run buttons we have today
+   inline. Width ~420px desktop, collapsible to icon-strip when not in
+   use. The card itself loses its inline output panel.
+
+4. **"Recent" strip at the top** of the page (above the tabs). Pulls
+   the last 5 runs across all commands from `/api/commands/runs?limit=5`.
+   Each pill shows `<command title> · <relative time>` and clicking
+   re-runs with the same args (uses the closures we just built for the
+   history modal). This is the "I just hit the same thing again" path.
+
+5. **Empty-form cards** like restart-admin / xcenter-clear-orphan-chat
+   should render at half-width or two-up so they don't waste a column.
+
+Files to touch:
+- `src/ssl_proxy_controller/static/index.html`, `renderCommandsView` and
+  `buildCommandCard` (search for those names; they're the only two
+  functions that matter). The card builder needs to NOT append the
+  output panel to itself; instead expose a `renderInto(panelEl, result)`
+  method that the drawer can call. The drawer is a single element owned
+  by `renderCommandsView`.
+- `static/index.html` CSS (the `<style>` block at the top): add
+  `.commands-tabs`, `.commands-grid`, `.commands-drawer`,
+  `.commands-recent-strip` rules. Reuse existing `--surface`, `--border`
+  CSS vars; don't introduce new colors.
+
+Verification: open `#/commands`, switch tabs (no scroll), click Run on
+3 different cards in succession, confirm the drawer swaps cleanly and
+each card's output is captured in `command_runs`. Take a screenshot
+when done; the page should look like a real tool palette, not a form
+catalogue.
+
+### 2. Preset save (MEDIUM)
+
+After a successful run, the output drawer (or inline panel pre-rework)
+should show a "Save as preset" button. Clicking opens a small modal:
 
 ```
-[ Commands · run common imperative actions on your host or remote nodes ]
-
-╔══ Quick actions ════════════════════════════════════════════════════╗
-║  [Restart admin]   [Apply schema (DB picker)]   [Refresh node       ║
-║                                                  inventory]         ║
-╚═════════════════════════════════════════════════════════════════════╝
-
-╔══ Service deploys ═════════════════════════════════════════════════╗
-║  Service: [ chat ▾ ]   Node: [ xcenter ▾ ]                         ║
-║  [Deploy now]   [Wipe install dir + Deploy]                        ║
-║  [Force rebuild (compose down + up --build --force-recreate)]      ║
-║  Last 3 runs:                                                      ║
-║   • 12:41 ✓ deploy:user-center → xcenter (16s)                     ║
-║   • 12:38 ✓ deploy:chatbot     → xcenter (53s)                     ║
-║   • 12:30 ✗ deploy:user-center → xcenter (failed: prerender)       ║
-╚════════════════════════════════════════════════════════════════════╝
-
-╔══ Git workflows ═══════════════════════════════════════════════════╗
-║  Repo: [ ssl-service ▾ ]                                            ║
-║  Commit message: [ ___________________________________________ ]    ║
-║  Paths (optional, blank = all): [ ___________________________ ]     ║
-║  [Commit + push]                                                    ║
-║                                                                     ║
-║  Submodule: [ chatbot ▾ ]                                          ║
-║  [Sync to chat.git mirror]   [Bump submodule pointer in parent]     ║
-╚════════════════════════════════════════════════════════════════════╝
-
-╔══ Database ════════════════════════════════════════════════════════╗
-║  DB: [ one ▾ ]                                                      ║
-║  [Apply schema]   [Run SQL file…] (file input)                      ║
-║  Or paste SQL: [ multiline _______________________ ]   [Run]        ║
-╚════════════════════════════════════════════════════════════════════╝
-
-╔══ Free-form ═══════════════════════════════════════════════════════╗
-║  Target: [ local ▾ | xcenter | us01 | … ]                           ║
-║  Command: [ _______________________________________ ]               ║
-║  Working dir: [ /Users/leo-m-a/projects/ssl-service ___________ ]   ║
-║  [Run]                                                              ║
-╚════════════════════════════════════════════════════════════════════╝
-
-╔══ Output ══════════════════════════════════════════════════════════╗
-║  ⏱ 0.4 s · exit 0 · /Users/.../ssl-service                          ║
-║  $ git log -1 --oneline                                             ║
-║  6da32ad fix(user-center): proxy /sub /sub-qr /product/info to ...  ║
-║                                                                     ║
-║  [Copy stdout]   [Copy stderr]   [Run again]   [Save as preset]     ║
-╚════════════════════════════════════════════════════════════════════╝
+Title:        [____________________________]
+Description:  [____________________________]
+Category:     [ same as parent ▾ ]
+[Cancel]                          [Save]
 ```
 
-Each command card has:
+On save, POST `/api/commands` with a new row whose:
+- `id` = slug of title (operator-edit-able)
+- `is_builtin` = false
+- `category` = chosen
+- `schema` = the parent command's schema
+- `exec` = parent's `exec.kind` + `args` = the form values that just ran
 
-- A title + one-line description
-- Required form inputs (text, dropdown, checkbox)
-- `Run` button (disabled while in flight, shows spinner)
-- Inline output panel (last result, ~5 KiB inline; "show full" link
-  reveals the rest)
-- A small "history" link that opens a modal listing the last 25 runs
-  for that command, with one-click "re-run with same args"
+So a frequent "deploy chat with --force-rebuild" becomes a one-click
+button.
 
-### Initial command catalog (the high-frequency ones we hit tonight)
+Backend: add `POST /api/commands` and `DELETE /api/commands/{id}` (only
+for is_builtin=false rows; refuse to delete builtins). Both behind
+`with_auth` + `_require_readwrite`. Validate `id` matches
+`^[a-z0-9-_.]{1,63}$`.
 
-These are the buttons the operator should be able to click with no input
-beyond a confirm dialog, plus the parametrised ones used in this session:
+Schema: no migration — `commands_catalog` already has `is_builtin`.
 
-**Quick actions (no input):**
-- Restart admin
-- Reload Caddy config (if the route reconciler is stuck)
-- Refresh service catalog from local repo (re-read `service-source/*/.deploy.yaml`)
+Frontend: small modal in `static/index.html`, similar to existing
+`Modal.open` patterns.
 
-**Service deploys (service + node + flag inputs):**
-- chat / chatbot / user / user-center / vpsbox / xout
-- Flag: "force rebuild" (passes `--build --force-recreate` extra arg)
-- Flag: "wipe install dir before deploy" (rms `/opt/<svc>` first)
+### 3. SSE streaming output (MEDIUM, scope-limit)
 
-**Git workflows:**
-- ssl-service: commit + push (message input)
-- chatbot submodule: commit + push (message input) — pushes to chatbot.git
-- Bump chatbot submodule pointer in ssl-service parent
-- Sync chatbot HEAD to chat.git mirror (force-push opt-in checkbox)
-- Discard local changes + pull origin (recovery action)
+Long deploys (`service-deploy` to xcenter takes 30-60s) currently show
+nothing until done. Add `/api/commands/{id}/stream` returning
+`text/event-stream`. **Scope-limit: only stream `local-run`,
+`local-git-commit-push`, `local-repo-sync`.** Other kinds
+(`service-deploy` calls `deploy_service_to_nodes` synchronously,
+`node-run` uses paramiko which buffers, `db-*` is a single SQL trip)
+fall through to the existing synchronous endpoint.
 
-**Database:**
-- Apply schema (DB picker)
-- Run pasted SQL (DB picker + textarea)
-- Migrate `accounts` table (one-shot helper for the v4 trial migration)
+Backend: in `commands.py`, add `run_local_shell_streaming(args, on_line)`
+that uses `subprocess.Popen` + reads stdout line-by-line and calls
+`on_line(stream, text)` for each chunk. The HTTP handler iterates these
+into `data: {...}\n\n` SSE events.
 
-**Remote node ops:**
-- xcenter: stop + remove orphaned `chat` lobehub container
-- xcenter: docker compose pull + up -d --force-recreate (per service)
-- us01: clear stale Caddy retry locks
-- Any node: free-form `docker logs --tail 50 <container>`
+Frontend: `EventSource` doesn't support `Authorization` headers, so use
+`fetch(..., {headers}).then(res => res.body.getReader())` and parse the
+`data: ...` framing manually. The drawer renders chunks incrementally;
+final event has `{done: true, exit_code, ok}`.
 
-### Persistence model
+Audit: insert_run_start at handler entry, update_run_finish on
+final-event-emit, exactly like the synchronous path.
 
-Two new tables in the home schema:
+Verification: `git-discard-and-pull-ssl-service` (because git fetch
+streams progress) should show progress lines as they arrive, not all
+at once.
 
-```sql
-CREATE TABLE IF NOT EXISTS commands_catalog (
-  id            TEXT PRIMARY KEY,           -- e.g. 'deploy.user-center'
-  title         TEXT NOT NULL,
-  description   TEXT,
-  category      TEXT NOT NULL,              -- 'quick' | 'deploy' | 'git' | 'db' | 'remote' | 'free'
-  schema        JSONB NOT NULL,             -- input field spec
-  exec          JSONB NOT NULL,             -- {kind: 'local-run' | 'service-deploy' | …, args: {…}}
-  is_builtin    BOOLEAN NOT NULL DEFAULT false,
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+### 4. Output diff (LOW — skip if running tight)
 
-CREATE TABLE IF NOT EXISTS command_runs (
-  id            BIGSERIAL PRIMARY KEY,
-  command_id    TEXT NOT NULL REFERENCES commands_catalog(id) ON DELETE CASCADE,
-  args_json     JSONB NOT NULL,
-  status        TEXT NOT NULL,              -- 'running' | 'success' | 'failed'
-  exit_code     INTEGER,
-  stdout_head   TEXT,                       -- first 64 KiB
-  stderr_head   TEXT,
-  started_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  finished_at   TIMESTAMPTZ
-);
-CREATE INDEX command_runs_recent_idx ON command_runs (command_id, started_at DESC);
-```
-
-Built-in commands seed via `INSERT … ON CONFLICT DO NOTHING` from `sql/schema.sql`
-so they're always available even on a fresh install. Operator can add custom
-commands via a "+ New command" button (the form is just the same JSON shape
-as a builtin).
+In the history modal, allow ticking 2 rows + clicking "Diff". Renders
+a side-by-side or unified diff of the two runs' `stdout_head`. Frontend
+only — server already returns stdout_head in the runs list response.
+Use the existing `jsdiff` lib if it's already in the bundle, otherwise
+inline a tiny LCS-based diff function.
 
 ---
 
-## Phasing
+## Carry-over (still real, untouched by Phase 1)
 
-**Phase 1 — MVP (~1 day):**
-- Backend: `/api/local/run`, `/api/local/git/commit-push`, `/api/local/repo-sync`
-- Backend: `commands_catalog` + `command_runs` tables + seed
-- Frontend: `Commands` nav entry, hardcoded form for the 5 categories above
-- 5 builtin commands seeded: restart-admin, deploy-service, git-commit-push,
-  apply-schema, free-form-run
-- Inline output panel (synchronous, no streaming)
-- 30-round review pass on the new code
+These are the same items that lived at the bottom of the original plan;
+none have been addressed yet. Reproduced verbatim for reference. Most
+are not Phase 2 work — pick them up only when a related task is open.
 
-**Phase 2 — quality of life (~half day):**
-- SSE streaming output (so long deploys show progress live)
-- Preset save: form values + command id captured as a new builtin
-- Run history modal with one-click re-run
-- Output diff between consecutive runs (helpful for debugging "why did this
-  run differ from last time")
+1. **Transatlantic Caddy hop** — chat.develop.cc / user.develop.cc go
+   browser → Caddy on us01 (US east) → backend on xcenter (Hetzner FI).
+   3-5s user-visible latency vs. 10ms server-side. Routing-topology
+   change, not a code fix. Move Caddy edge to xcenter, OR add an EU
+   edge node + geo-DNS. Operator decision.
 
-**Phase 3 — operator extensibility (~half day):**
-- Custom command CRUD (operator-defined builtins)
-- Permission model: `commands.run` scope on admin tokens (split from the
-  existing all-or-nothing `admin` scope)
-- Notification on failure: webhook or email on commands flagged "alert on fail"
+2. **drizzle migrate vs. lobehub tables** (#64, pre-existing). Chatbot's
+   drizzle skips when it sees existing lobehub-named tables in the shared
+   `chat` DB. Real fix is namespacing chatbot tables under a dedicated
+   schema or splitting the DB. Tracked, not blocking.
 
----
+3. **`service-source/chat/` is stale lobehub source.** The `chat`
+   service in admin still points at port 3210 (lobehub container).
+   chat.develop.cc actually serves the chatbot service (port 3220).
+   Lobehub container should be torn down (we have a builtin command
+   for that — `xcenter-clear-orphan-chat`). The `chat` service entry
+   should be retired or repointed.
 
-## Testing
-
-Unit:
-- `/api/local/run` happy path, non-zero exit, timeout
-- `/api/local/git/commit-push` with no staged changes (should be a no-op,
-  not an error)
-- `/api/local/repo-sync` against a clean and a dirty tree
-
-Integration:
-- Click "Restart admin" → admin restarts → SPA reconnects within 5 s
-- Click "Deploy chatbot to xcenter" → mirrors what the existing
-  `chatbot/v4` deploy did this session, end-to-end
-
-Browser:
-- Drive the new page via Chrome MCP, run each builtin once, capture output
-
----
-
-## Migration / rollback
-
-- New tables only, no schema changes to existing ones — safe rollout
-- If anything goes wrong, `DROP TABLE commands_catalog, command_runs` and
-  remove the new endpoints. Nothing else depends on them.
-
----
-
-# Carry-over: items found but not fixed across the night
-
-Captured here so the next session has full visibility. Source:
-`service-source/user-center/REVIEW_LOG_v5.md` plus this session's chat log.
-
-## Architecture / perf (deferred — needs operator decision)
-
-1. **Transatlantic Caddy hop** — `chat.develop.cc` and `user.develop.cc`
-   both go browser → Caddy on us01 (US east) → backend on xcenter (Hetzner
-   Finland). Server-side response is ~10 ms locally on xcenter; the
-   user-visible latency is 3–5 s because of the hop. Two real fixes:
-   (a) move Caddy edge to xcenter, (b) add a EU edge node and let geo-DNS
-   route. Both are routing-topology changes — not a code patch.
-
-2. **`drizzle migrate` conflict with lobehub tables** (#64, pre-existing) —
-   chatbot's drizzle migrations skip when they detect existing lobehub-named
-   tables in the shared `chat` DB. Real fix is namespacing chatbot's tables
-   under a dedicated schema or splitting the DB. Tracked, not blocking.
-
-3. **`/Users/leo-m-a/projects/ssl-service/service-source/chat/`** is now a
-   stale lobehub source tree. The `chat` service in the admin still points
-   at it (port 3210 lobehub container). chat.develop.cc actually serves the
-   `chatbot` service (port 3220). The lobehub container should be torn down
-   and the `chat` service entry retired or repointed.
-
-## Code-review TODOs from REVIEW_LOG_v5
-
-Already reviewed but deferred (low priority):
-
-4. Usage badge tooltip text "Resets at UTC 0:00" / "Lifetime trial credit"
-   is English-only — needs `nav.usageBadgeResets` / `nav.usageBadgeTrial`
+4. Usage badge tooltip "Resets at UTC 0:00" / "Lifetime trial credit"
+   English-only — needs `nav.usageBadgeResets` / `nav.usageBadgeTrial`
    keys in 5 locales.
-5. Mobile sidebar swipe-to-close gesture — no-op currently, sidebar must
-   be tapped closed.
-6. Billing page skeleton loader — page shows blank briefly before the
-   server fetch completes.
-7. Five test scaffolding gaps:
-   - `chargeUsageBackground` quota_exhausted 402 path
-   - `checkRateLimit` GC (expired entry removal)
-   - `return_to` open-redirect sanitization (4 input cases)
-   - `inlineFileParts` file-not-found 404 → skip-part path
-   - `usage-badge` 401-stops-polling path
-8. Public-API JSDoc on `getBootstrapData`, `chargeUsageBackground`,
-   `checkRateLimit` — missing.
 
-## UX polish
+5. Mobile sidebar swipe-to-close — no-op, sidebar must be tapped closed.
 
-9. Stale `chat` (lobehub) container on xcenter: 3210 — listed in
-   `docker ps` but no traffic. Stop + remove + retire its admin entry.
-10. `chat` service registered in the admin still points at `chat.git`
-    after this session's PATCH attempt — verify the URL change persisted
-    and that no scheduled job re-clones the old SHA.
-11. Memory file `feedback_user_service_deploy_pending.md` is stale (the
-    private-repo deploy issue was worked around via `local_repo_dir`
-    mode for user-service) — should be either deleted or updated.
-12. The `commit-*.command` files under `scripts/dev/` self-delete on
-    success, but the failed runs leave `commit-chatbot-header-fix.command`
-    and `sync-chat-repo.command` behind. They should be cleaned up
-    (commit-v3 + restart-admin + commit-sub-fix + commit-user-center-v2 are
-    already gone — only the failed two persist).
+6. Billing page skeleton loader — page shows blank briefly before fetch.
 
-## Operational
+7. Five test scaffolding gaps (chargeUsageBackground 402 path,
+   checkRateLimit GC, return_to open-redirect, inlineFileParts 404,
+   usage-badge 401 polling stop).
+
+8. Public-API JSDoc on getBootstrapData, chargeUsageBackground,
+   checkRateLimit — missing.
+
+9. Stale `chat` (lobehub) container on xcenter:3210 — listed in
+   `docker ps` but no traffic. Stop + remove + retire admin entry.
+   **Now a one-click button: `xcenter-clear-orphan-chat`.**
+
+10. `chat` service registered in admin still points at chat.git after
+    a previous PATCH attempt — verify URL change persisted, no
+    scheduled job re-clones the old SHA.
+
+11. Memory file `feedback_user_service_deploy_pending.md` is stale
+    (workaround via `local_repo_dir` mode). Delete or update.
+
+12. Failed `.command` runs left `commit-chatbot-header-fix.command` and
+    (formerly) `sync-chat-repo.command` behind in scripts/dev/. Clean up.
 
 13. SSL-service `default_node_name` system_config still says `us01`
-    despite the 2026-05-09 directive that xcenter is now primary. Update.
-14. `services_create.create_service` defaults the new service's
-    `github_repo_url` to a placeholder when the operator hasn't set one;
-    after this session's relaxation (allow `local_repo_dir` only),
-    we should also update the New Service form UI to make the GitHub URL
-    optional with a clear "I'll deploy from a local tree" toggle.
+    despite the 2026-05-09 directive that xcenter is primary. Update.
 
-## Open security review items (not bugs, but to track)
+14. New Service form UI: GitHub URL should be optional with a clear
+    "I'll deploy from a local tree" toggle.
 
-15. The admin token is stored in `localStorage` — fine for an
-    operator-only console, but if we ever expose the admin SPA outside the
-    operator's network, this needs to move to httpOnly cookies. Note in
-    threat model.
-16. `/api/local/run` (proposed) widens the attack surface from "remote SSH
-    to managed nodes" to "shell on the operator's Mac". Same trust level
-    as today since the operator already has a terminal there, but worth
-    explicit acknowledgement before phase 1 ships.
+15. Admin token in `localStorage` — fine for operator-only console;
+    move to httpOnly cookies if SPA ever exposed beyond operator's
+    network.
+
+16. `/api/local/run` widens attack surface from "remote SSH" to "shell
+    on operator's Mac". Same trust level as today (operator already has
+    a terminal there) but worth the explicit acknowledgement.
 
 ---
 
-# What's already shipped tonight (for context)
+## How to work on this branch
 
-Pushed commits, in order, on the ssl-service main branch:
+1. **Always commit with explicit paths.** `git commit -- <paths>` is
+   load-bearing now (memory `feedback_git_commit_paths_only.md`).
+   Plain `git commit` will sweep up `_p22_commit.command`,
+   `_tmp_17_8f547be9c010381a00f6c7d57e2646ae`, `scripts/.DS_Store`,
+   `scripts/dev/commit-chatbot-header-fix.command`, and the `examples/`
+   pending edits — none of which are ours.
 
-- `70ac7d3` — user-service in-memory billing engine + token-based USD metering
-- `6793ce5` — admin Billing tab + user-service xcenter migration
-- `95e7753` — user-center Next.js account center scaffold
-- `6da32ad` — perf consolidation + /account merge + subscriptions card + chat header unification
-- `a1c207e` — products-by-service refactor + 30-round review + billing smoke
-- `8819b0c` — fix: proxy /sub /sub-qr /product/info to user-service (regression fix)
-- `97ff573` — chore: bump chatbot submodule to v4 (header unify + image retry)
-- `f0a326b` — review fixes (cents bug, open-redirect protection, locale polish)
+2. **Use the Commands page itself** for shell / commit / deploy /
+   restart. memory `feedback_use_commands_page.md` is the rule.
+   `POST /api/commands/free-form-run/run` body
+   `{"args":{"cmd":"<shell line>"}}` is the everyday hammer.
+   For Claude Code which can run shell directly, the bash tool is fine
+   too — but prefer the commands path when it's a documented action so
+   the run lands in `command_runs` audit history.
 
-Pushed on chatbot main branch:
+3. **E2E in a real browser, not just curl.** memory
+   `feedback_real_e2e_in_browser.md`. The drawer/tabs rework
+   especially needs visual verification.
 
-- `93456d1` — per-token USD metering + per-user 20/min rate limit
-- `6ec9198` — unified header + 300s timeout + retry once + no charge on failure
-- `7269391` — sidebar hover/cursor fix + i18n audit (P22)
+4. **Apply schema is idempotent.** Re-run after any schema.sql change.
+   Builtins re-seed via ON CONFLICT DO NOTHING — operator edits to a
+   builtin row stay put.
 
-Live state:
-
-- `https://user.develop.cc` — Next.js user-center, 6 protected pages
-  (Dashboard / Account / Security / Billing / Products / verify-email),
-  account-level $2 trial credit, token consumption tables, sub/{token}
-  passthrough, 5-locale i18n
-- `https://chat.develop.cc` — chatbot service (port 3220), unified
-  header, sidebar hover fixed, image-gen 300 s timeout + auto-retry
-- `https://user.develop.cc/sub/{token}?format=clash` — restored
-- Token billing math verified end-to-end (1000 input + 100 output gpt-5.4
-  → 0.4¢ list × 0.8 discount = 0.32¢, DB persisted)
-- Database has `accounts` table with 15 rows (trial credit migration)
-- Schema has `services_code` column on products (refactor migration)
-
----
+5. **Restart admin** after any Python edit (admin.py / commands.py).
+   The SPA-only edits don't need a restart, just a hard reload (Cmd+R
+   typically suffices; F5 in Chrome).
 
 End of plan.
