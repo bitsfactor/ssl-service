@@ -501,66 +501,21 @@ def charge_usage(
             tier_rank=int((tier["metadata"] or {}).get("tier_rank") or -1),
         )
 
-    # --- Trial credit deduction (Job 2) ---
-    # Deduct from account-level trial_credit_cents first, before touching
-    # the daily quota. The trial deduction is synchronous (one DB write)
-    # because trial credit is a one-time finite pool that must be
-    # accurate, unlike daily quotas which tolerate a few seconds of lag.
-    trial_deducted = _deduct_trial_credit(user_id, charged_cents)
-    remaining_charge = charged_cents - trial_deducted
-
-    if remaining_charge <= 0:
-        # Entire charge covered by trial credit — no quota deduction needed.
-        # Still record the event so usage_events stays complete.
-        with _EVENT_BUFFER_LOCK:
-            _EVENT_BUFFER.append(_PendingEvent(
-                user_id=user_id,
-                product_id=int(tier["product_id"]),
-                event=model,
-                qty=trial_deducted,
-                metadata={
-                    "resource_id": resource_id,
-                    "model": model,
-                    "input_tokens": input_tokens,
-                    "cached_input_tokens": cached_input_tokens,
-                    "output_tokens": output_tokens,
-                    "duration_seconds": duration_seconds,
-                    "openai_cents": openai_cents,
-                    "discount": discount,
-                    "tier_code": tier["code"],
-                    "paid_from": "trial_credit",
-                    **(metadata or {}),
-                },
-            ))
-        if resource_id:
-            idemp_key = (user_id, model, resource_id)
-            with _IDEMP_LOCK:
-                _IDEMP_SEEN.add(idemp_key)
-                if len(_IDEMP_SEEN) > _MAX_IDEMP_KEYS:
-                    _IDEMP_SEEN.clear()
-        return ChargeResult(
-            ok=True,
-            charged_cents=charged_cents,
-            openai_cents=openai_cents,
-            remaining_cents=0,
-            limit_cents=0,
-            tier_code=tier["code"],
-            tier_rank=int((tier["metadata"] or {}).get("tier_rank") or -1),
-        )
-
-    # Some charge remains after trial — deduct from quota as before.
+    # Charge order (post-rework): plan-quota first, account balance
+    # second. This is the opposite of the old "trial credit first"
+    # logic. Reason: users explicitly buy a daily quota when they
+    # upgrade — burning the account balance ahead of it surprised
+    # users who'd just upgraded and saw the daily-quota bar sitting
+    # at $0 while their permanent balance silently drained.
     pid = int(tier["product_id"])
     key = (user_id, pid)
 
     with _user_lock(user_id):
-        # Get-or-fetch cached quota
+        # Get-or-fetch cached quota.
         cached = _QUOTAS.get(key)
         if cached is None or _is_quota_stale(cached):
             fresh = _fetch_quota_from_db(user_id, pid)
             if fresh is None:
-                # No quota row → tier has no entitlement (shouldn't happen
-                # because Stripe webhook / signup creates one). Fail open
-                # would lose money; fail closed here.
                 return ChargeResult(
                     ok=False, charged_cents=0, openai_cents=0,
                     remaining_cents=0, limit_cents=0,
@@ -568,59 +523,67 @@ def charge_usage(
                     tier_rank=int((tier["metadata"] or {}).get("tier_rank") or -1),
                     error="no_quota",
                 )
-            # Preserve any pending_delta we'd accumulated since the
-            # previous fetch — DB just doesn't know about it yet.
             if cached is not None:
                 fresh.pending_delta = cached.pending_delta
             _QUOTAS[key] = fresh
             cached = fresh
 
-        # Roll period if needed (in-memory only; DB will catch up on flush)
         cached = _maybe_roll_period(cached)
-
         consumed_total = cached.db_consumed + cached.pending_delta
-        remaining = cached.limit_qty - consumed_total
+        quota_remaining = max(0.0, cached.limit_qty - consumed_total)
 
-        if remaining_charge > remaining:
-            # Quota exhausted — but if trial covered part of the charge,
-            # surface the partial coverage in the error (best-effort: in
-            # practice this usually means the trial ran out simultaneously
-            # with quota exhaustion).
-            if trial_deducted > 0:
-                # Refund the trial deduction we already made (best-effort).
-                try:
-                    with connect() as conn:
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                """
-                                UPDATE accounts
-                                SET trial_credit_cents = trial_credit_cents + %s
-                                WHERE user_id = %s
-                                """,
-                                (trial_deducted, user_id),
-                            )
-                        conn.commit()
-                except Exception:
-                    LOGGER.warning("trial credit refund failed for user %s", user_id)
-            return ChargeResult(
-                ok=False, charged_cents=0, openai_cents=openai_cents,
-                remaining_cents=max(0.0, remaining),
-                limit_cents=cached.limit_qty,
-                tier_code=tier["code"],
-                tier_rank=int((tier["metadata"] or {}).get("tier_rank") or -1),
-                error="quota_exhausted",
-            )
+        # Split the charge: as much as fits in the daily quota first,
+        # the overflow goes to the account balance.
+        quota_deducted = min(charged_cents, quota_remaining)
+        overflow = charged_cents - quota_deducted
 
-        # Commit in memory (only the remaining portion after trial credit)
-        cached.pending_delta += remaining_charge
-        with _PENDING_DELTAS_LOCK:
-            _PENDING_DELTAS[key] = _PENDING_DELTAS.get(key, 0.0) + remaining_charge
+        balance_deducted = 0.0
+        if overflow > 0:
+            balance_deducted = _deduct_trial_credit(user_id, overflow)
+            if balance_deducted < overflow:
+                # Couldn't cover the rest — refund what we took from the
+                # balance and fail. The user must upgrade / top up.
+                if balance_deducted > 0:
+                    try:
+                        with connect() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    UPDATE accounts
+                                    SET trial_credit_cents = trial_credit_cents + %s
+                                    WHERE user_id = %s
+                                    """,
+                                    (balance_deducted, user_id),
+                                )
+                            conn.commit()
+                    except Exception:
+                        LOGGER.warning(
+                            "account-balance refund failed for user %s",
+                            user_id,
+                        )
+                return ChargeResult(
+                    ok=False, charged_cents=0, openai_cents=openai_cents,
+                    remaining_cents=quota_remaining,
+                    limit_cents=cached.limit_qty,
+                    tier_code=tier["code"],
+                    tier_rank=int((tier["metadata"] or {}).get("tier_rank") or -1),
+                    error="quota_exhausted",
+                )
+
+        # Commit the quota portion in-memory; DB catches up on flush.
+        if quota_deducted > 0:
+            cached.pending_delta += quota_deducted
+            with _PENDING_DELTAS_LOCK:
+                _PENDING_DELTAS[key] = _PENDING_DELTAS.get(key, 0.0) + quota_deducted
+
+        # Always log the event — even for fully-quota or fully-balance
+        # paid charges — so usage_events is the complete audit trail.
         with _EVENT_BUFFER_LOCK:
             _EVENT_BUFFER.append(_PendingEvent(
                 user_id=user_id,
                 product_id=pid,
                 event=model,
-                qty=charged_cents,  # record full charge for accurate usage_events
+                qty=charged_cents,
                 metadata={
                     "resource_id": resource_id,
                     "model": model,
@@ -631,8 +594,8 @@ def charge_usage(
                     "openai_cents": openai_cents,
                     "discount": discount,
                     "tier_code": tier["code"],
-                    "trial_deducted": trial_deducted,
-                    "quota_deducted": remaining_charge,
+                    "quota_deducted": quota_deducted,
+                    "balance_deducted": balance_deducted,
                     **(metadata or {}),
                 },
             ))
@@ -640,15 +603,13 @@ def charge_usage(
             with _IDEMP_LOCK:
                 _IDEMP_SEEN.add(idemp_key)
                 if len(_IDEMP_SEEN) > _MAX_IDEMP_KEYS:
-                    # Naive eviction: clear half. We err toward losing
-                    # idempotency than memory-bloating.
                     _IDEMP_SEEN.clear()
 
     return ChargeResult(
         ok=True,
         charged_cents=charged_cents,
         openai_cents=openai_cents,
-        remaining_cents=remaining - remaining_charge,
+        remaining_cents=max(0.0, quota_remaining - quota_deducted),
         limit_cents=cached.limit_qty,
         tier_code=tier["code"],
         tier_rank=int((tier["metadata"] or {}).get("tier_rank") or -1),
