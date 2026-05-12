@@ -40,21 +40,17 @@ export function UserMenu({
   const t = HEADER_STRINGS[locale];
 
   if (!auth.signedIn) {
+    // Anonymous header: just a single Sign-in pill. Signup-affordance
+    // lives inside the login form itself (every login page has an
+    // inline "no account? sign up" link), so the header doesn't need
+    // a second entry-point for it.
     return (
-      <div className="flex items-center gap-1">
-        <a
-          className="flex h-8 items-center rounded-md px-3 text-muted-foreground text-sm transition-colors hover:bg-muted/70 hover:text-foreground"
-          href={signInUrl}
-        >
-          {t.signIn}
-        </a>
-        <a
-          className="flex h-8 items-center rounded-md bg-foreground px-3 text-background text-sm transition-opacity hover:opacity-90"
-          href={signUpUrl}
-        >
-          {t.signUp}
-        </a>
-      </div>
+      <a
+        className="flex h-8 items-center rounded-md bg-foreground px-4 text-background text-sm font-medium transition-opacity hover:opacity-90"
+        href={signInUrl}
+      >
+        {t.signIn}
+      </a>
     );
   }
 

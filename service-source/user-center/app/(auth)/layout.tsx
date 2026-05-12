@@ -1,7 +1,13 @@
 /**
- * Auth layout — minimal chrome for login / register / verify-email.
- * No sidebar, no persistent nav — just the brand at the top.
+ * Auth layout — login / register / verify-email pages.
+ *
+ * Renders the shared site header even though the user is anonymous,
+ * so language + theme toggles are reachable before sign-in. The
+ * UserMenu falls back to a single "Sign in" pill in the anonymous
+ * branch.
  */
+import { SiteHeaderBridge } from "@/components/site-header-bridge";
+
 export default function AuthLayout({
   children,
 }: {
@@ -9,19 +15,8 @@ export default function AuthLayout({
 }) {
   return (
     <div className="flex min-h-screen flex-col">
-      {/* Minimal top bar */}
-      <header className="flex h-14 items-center border-b border-border/40 bg-background/85 px-4 backdrop-blur-md">
-        <a
-          href="/"
-          className="flex items-center gap-2 rounded-md px-2 py-1.5 transition-colors hover:bg-muted/60"
-        >
-          {/* biome-ignore lint/performance/noImgElement: brand logo */}
-          <img alt="Develop" className="size-7 rounded-md" src="/logo.png" />
-          <span className="font-semibold text-sm tracking-tight">Develop</span>
-        </a>
-      </header>
+      <SiteHeaderBridge auth={{ signedIn: false }} />
 
-      {/* Centered form area */}
       <main className="flex flex-1 items-center justify-center p-4">
         {children}
       </main>
