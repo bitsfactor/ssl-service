@@ -35,6 +35,12 @@ export function LoginClient() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  // After a successful auth response we flip into "redirecting" mode
+  // and replace the entire form with a full-page spinner. Without
+  // this the form sits visible while the cross-domain navigation is
+  // in flight (~200-500ms) which felt janky — the user sees the
+  // login form, then a blank-ish flash, then the destination page.
+  const [redirecting, setRedirecting] = useState(false);
   const [errors, setErrors] = useState<{ email?: string; password?: string; form?: string }>({});
 
   function validate() {
@@ -60,13 +66,15 @@ export function LoginClient() {
         const body = await res.json().catch(() => ({}));
         const msg = (body as { detail?: string }).detail ?? t("auth.loginError");
         setErrors({ form: msg });
+        setLoading(false);
         return;
       }
-      // Login succeeded — navigate to return_to (or dashboard).
+      // Hide the form behind a "Redirecting…" overlay, then navigate.
       // Relative paths use Next's client router (no full reload);
       // cross-product returns (e.g. chat's SSO exchange URL) need
       // window.location.href so the browser actually leaves
       // user.develop.cc with the new .develop.cc cookie in hand.
+      setRedirecting(true);
       if (/^https?:\/\//.test(returnTo)) {
         window.location.href = returnTo;
       } else {
@@ -74,9 +82,20 @@ export function LoginClient() {
       }
     } catch {
       toast.error(t("common.networkError"));
-    } finally {
       setLoading(false);
     }
+  }
+
+  if (redirecting) {
+    return (
+      <div className="flex w-full max-w-sm flex-col items-center gap-3 fade-up py-10 text-center">
+        <div
+          aria-label={t("auth.redirecting")}
+          className="size-7 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-foreground"
+        />
+        <p className="text-sm text-muted-foreground">{t("auth.redirecting")}</p>
+      </div>
+    );
   }
 
   return (

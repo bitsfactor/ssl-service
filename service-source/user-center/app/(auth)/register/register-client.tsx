@@ -38,6 +38,11 @@ export function RegisterClient() {
   const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
   const [loading, setLoading] = useState(false);
+  // Once OTP-confirm succeeds we replace the form with a spinner and
+  // start the cross-domain navigation. Same UX motivation as the
+  // login page: hide the lingering OTP form during the ~200-500ms
+  // it takes to bounce through chat's SSO exchange.
+  const [redirecting, setRedirecting] = useState(false);
   const [resending, setResending] = useState(false);
   const [resendCooldown, setResendCooldown] = useState(0);
   const [errors, setErrors] = useState<{
@@ -103,8 +108,10 @@ export function RegisterClient() {
         const body = await res.json().catch(() => ({}));
         const msg = (body as { detail?: string }).detail ?? t("auth.registerError");
         setErrors({ code: msg });
+        setLoading(false);
         return;
       }
+      setRedirecting(true);
       if (/^https?:\/\//.test(returnTo)) {
         window.location.href = returnTo;
       } else {
@@ -112,7 +119,6 @@ export function RegisterClient() {
       }
     } catch {
       toast.error(t("common.networkError"));
-    } finally {
       setLoading(false);
     }
   }
@@ -151,6 +157,18 @@ export function RegisterClient() {
       });
     };
     setTimeout(tick, 1000);
+  }
+
+  if (redirecting) {
+    return (
+      <div className="flex w-full max-w-sm flex-col items-center gap-3 fade-up py-10 text-center">
+        <div
+          aria-label={t("auth.redirecting")}
+          className="size-7 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-foreground"
+        />
+        <p className="text-sm text-muted-foreground">{t("auth.redirecting")}</p>
+      </div>
+    );
   }
 
   return (

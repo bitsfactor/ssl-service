@@ -85,7 +85,7 @@ export const ko: Messages = {
     verifying: "이메일 주소를 확인하는 중…",
     verifySuccess: "이메일이 확인되었습니다!",
     verifyFailedTitle: "인증 실패",
-    redirecting: "대시보드로 이동합니다…",
+    redirecting: "이동 중…",
   },
   dashboard: {
     welcomeTitle: "어서 오세요, {name}",

@@ -85,7 +85,7 @@ export const ja: Messages = {
     verifying: "メールアドレスを確認中…",
     verifySuccess: "メールが確認されました！",
     verifyFailedTitle: "確認に失敗しました",
-    redirecting: "ダッシュボードにリダイレクトします…",
+    redirecting: "リダイレクト中…",
   },
   dashboard: {
     welcomeTitle: "おかえりなさい、{name}",

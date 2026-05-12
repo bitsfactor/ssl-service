@@ -85,7 +85,7 @@ export const de: Messages = {
     verifying: "E-Mail-Adresse wird bestätigt…",
     verifySuccess: "Deine E-Mail wurde bestätigt!",
     verifyFailedTitle: "Bestätigung fehlgeschlagen",
-    redirecting: "Du wirst zum Dashboard weitergeleitet…",
+    redirecting: "Weiterleitung…",
   },
   dashboard: {
     welcomeTitle: "Willkommen zurück, {name}",

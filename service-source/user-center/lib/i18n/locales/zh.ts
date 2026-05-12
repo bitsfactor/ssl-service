@@ -85,7 +85,7 @@ export const zh: Messages = {
     verifying: "正在验证您的邮箱地址…",
     verifySuccess: "邮箱已验证！",
     verifyFailedTitle: "验证失败",
-    redirecting: "正在跳转到控制台…",
+    redirecting: "正在跳转…",
   },
   dashboard: {
     welcomeTitle: "欢迎回来，{name}",

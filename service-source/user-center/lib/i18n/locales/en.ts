@@ -86,7 +86,7 @@ export const en = {
     verifying: "Verifying your email address…",
     verifySuccess: "Your email has been verified!",
     verifyFailedTitle: "Verification failed",
-    redirecting: "Redirecting you to the dashboard…",
+    redirecting: "Redirecting…",
   },
   dashboard: {
     welcomeTitle: "Welcome back, {name}",
