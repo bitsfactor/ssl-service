@@ -1047,6 +1047,31 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE INDEX IF NOT EXISTS idx_payments_user
   ON payments (user_id, created_at DESC);
 
+-- Stripe webhook failures ------------------------------------------------
+-- When the webhook handler raises after signature verification (a logic
+-- bug, a DB transient, etc.) Stripe sees a 500 and retries silently for
+-- ~3 days. We were learning about failures only by ssh-ing into the
+-- container to grep stderr — and stderr gets wiped on every redeploy.
+-- This table is a persistent audit log: every uncaught exception inside
+-- the handler writes one row + the raw exception text + the event id,
+-- so a future "user paid but subscription didn't update" report can be
+-- diagnosed by a single SQL query.
+CREATE TABLE IF NOT EXISTS stripe_webhook_failures (
+  id              BIGSERIAL PRIMARY KEY,
+  event_id        TEXT,                                  -- Stripe event id; may be NULL if parsing the body failed
+  event_type      TEXT,                                  -- e.g. checkout.session.completed
+  user_id         UUID REFERENCES auth_users(id) ON DELETE SET NULL,
+  product_id      BIGINT REFERENCES products(id) ON DELETE SET NULL,
+  error_message   TEXT NOT NULL,                         -- str(exc) — short
+  error_traceback TEXT,                                  -- full traceback for debugging
+  request_body    TEXT,                                  -- raw incoming body (capped to ~8 KB)
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_stripe_webhook_failures_created
+  ON stripe_webhook_failures (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_stripe_webhook_failures_event_id
+  ON stripe_webhook_failures (event_id);
+
 -- xout user-system migration tables ---------------------------------------
 -- New tables, additive — leave the legacy xout_tokens / xout_node_tokens
 -- alone for now. The cut-over (P2) drops them once xout is rebuilt to

@@ -3833,6 +3833,67 @@ async def stripe_webhook(request: Request) -> dict:
                         "invoice.payment_succeeded"):
     return {"ok": True, "ignored": event_type}
 
+  # Defaults so the failure-logger in the except: branch can reference
+  # these even when the exception fires before we've parsed metadata.
+  user_id: str | None = None
+  product_id: int | None = None
+  try:
+    return _handle_stripe_webhook_event(event_id, event_type, data_obj, body)
+  except HTTPException:
+    raise  # 400/503 etc. — already structured, no need to log as a failure
+  except Exception as exc:
+    import traceback as _tb
+    tb_text = _tb.format_exc()
+    # Try to pull what we can from the event body for the audit log;
+    # this is best-effort because the exception may have happened
+    # before any of these were extracted.
+    try:
+      _meta = data_obj.get("metadata") or {}
+      user_id = _meta.get("user_id") or data_obj.get("client_reference_id")
+      pid_raw = _meta.get("product_id")
+      product_id = int(pid_raw) if pid_raw else None
+    except Exception:
+      pass
+    try:
+      with connect() as fail_conn:
+        with fail_conn.cursor() as fc:
+          fc.execute(
+            """
+            INSERT INTO stripe_webhook_failures
+              (event_id, event_type, user_id, product_id,
+               error_message, error_traceback, request_body)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+              event_id or None,
+              event_type or None,
+              user_id,
+              product_id,
+              str(exc)[:1000],
+              tb_text[:32000],
+              (body or b"")[:8192].decode("utf-8", "replace"),
+            ),
+          )
+        fail_conn.commit()
+    except Exception:
+      LOGGER.exception("could not log stripe webhook failure to DB")
+    LOGGER.exception("stripe webhook handler raised, event=%s", event_id)
+    # Re-raise as 500 so Stripe retries — fixes that touch the bug
+    # will pick up the next delivery automatically.
+    raise
+
+
+def _handle_stripe_webhook_event(
+  event_id: str,
+  event_type: str,
+  data_obj: dict,
+  body: bytes,
+) -> dict:
+  """Inner handler for stripe_webhook. Pulled out so the outer
+  function's try/except can wrap a single statement; everything in
+  here is allowed to raise and the wrapper will (a) log the failure
+  to stripe_webhook_failures and (b) re-raise as a 500 so Stripe
+  retries delivery."""
   meta = data_obj.get("metadata") or {}
   user_id = meta.get("user_id") or data_obj.get("client_reference_id")
   product_id = int(meta.get("product_id") or 0)
@@ -3855,7 +3916,12 @@ async def stripe_webhook(request: Request) -> dict:
       if cur.fetchone() is None:
         LOGGER.warning("stripe webhook user not found: %s", user_id)
         return {"ok": True, "skipped": "user not found"}
-      cur.execute("SELECT id, kind, period_days FROM products WHERE id = %s", (product_id,))
+      cur.execute(
+        "SELECT id, kind, period_days, service_code, "
+        "COALESCE((metadata->>'tier_rank')::int, -1) AS tier_rank "
+        "FROM products WHERE id = %s",
+        (product_id,),
+      )
       product = cur.fetchone()
       if product is None:
         return {"ok": True, "skipped": "product not found"}
@@ -3894,6 +3960,26 @@ async def stripe_webhook(request: Request) -> dict:
         # 30 d/month is the same rule the legacy `period_days` path used
         # and matches Stripe's billing precedent for "monthly".
         expires_at = datetime.now(timezone.utc) + timedelta(days=30 * duration_months)
+      # Three cases drive the subscription state change:
+      #
+      #   1. Same-product renewal — user already has an active sub for
+      #      this exact product. Extend its expires_at by the purchased
+      #      duration. "Early renewal" preserves remaining time
+      #      (extend from max(now, current expiry)).
+      #
+      #   2. Cross-tier UPGRADE — user has no sub for THIS product, but
+      #      does have an active lower-rank sub in the same service
+      #      family (e.g. signup_7day_basic or paid tier_basic, while
+      #      buying tier_pro). Cancel the lower sub, convert its
+      #      remaining DAYS into bonus NEW-TIER days using the ratio of
+      #      their 1-month-offer daily prices, and INSERT the new sub
+      #      with expires_at = now + duration + bonus.
+      #
+      #   3. Fresh purchase — no related active sub. INSERT with
+      #      SAVEPOINT-protected race recovery (concurrent Stripe
+      #      retries can fight for the same unique-per-(user,product)
+      #      slot; the loser re-reads and extends).
+      now = datetime.now(timezone.utc)
       cur.execute(
         """
         SELECT id, expires_at FROM subscriptions
@@ -3902,10 +3988,105 @@ async def stripe_webhook(request: Request) -> dict:
         (user_id, product_id),
       )
       existing_sub = cur.fetchone()
-      if existing_sub is None:
-        # SAVEPOINT lets us catch a concurrent-webhook race (the partial
-        # unique index would block a duplicate active sub) without
-        # losing the payments row we just inserted in the same txn.
+      sub_row = None
+      base_period_days = 30 * duration_months
+      if existing_sub is not None and expires_at is not None:
+        # Case 1: same-tier renewal. (THIS is the path that had the
+        # NameError-on-`period` bug — fixed by using base_period_days.)
+        from_dt = max(now, existing_sub["expires_at"] or now)
+        new_exp = from_dt + timedelta(days=base_period_days)
+        cur.execute(
+          """
+          UPDATE subscriptions SET expires_at=%s, updated_at=NOW()
+          WHERE id=%s RETURNING id
+          """,
+          (new_exp, existing_sub["id"]),
+        )
+        sub_row = cur.fetchone()
+        LOGGER.info("stripe webhook extended sub user=%s product=%s to %s",
+                    user_id, product_code, new_exp)
+      else:
+        # Case 2 candidate: look for a lower-rank active sub in the
+        # same service family. We restrict by service_code so a chat
+        # purchase never displaces an xout sub or vice versa. The
+        # `expires_at IS NOT NULL` filter intentionally excludes the
+        # permanent free-tier grant — that row is the fallback floor
+        # the active-tier resolver lands on when no paid sub is
+        # present, so it should outlive any purchase. We only displace
+        # genuinely time-bound lower-tier subs (trials + paid).
+        cur.execute(
+          """
+          SELECT s.id, s.expires_at, s.product_id,
+                 COALESCE((p.metadata->>'tier_rank')::int, -1) AS tier_rank
+          FROM subscriptions s
+          JOIN products p ON p.id = s.product_id
+          WHERE s.user_id = %s
+            AND p.service_code = %s
+            AND s.status = 'active'
+            AND s.product_id != %s
+            AND s.expires_at IS NOT NULL
+            AND COALESCE((p.metadata->>'tier_rank')::int, -1) < %s
+          """,
+          (user_id, product["service_code"], product_id, product["tier_rank"]),
+        )
+        lower_subs = cur.fetchall()
+        bonus_days = 0.0
+        replaced_ids: list[int] = []
+        if expires_at is not None and lower_subs:
+          # Option A proration: convert remaining lower-tier DAYS into
+          # new-tier days using daily prices derived from each tier's
+          # 1-month offer (price_cents / 30). The 1-month base is used
+          # — not the duration the user actually bought — so that
+          # bulk-discounted long-term subs don't shrink the credit and
+          # users always see a transparent rate.
+          cur.execute(
+            "SELECT price_cents FROM product_offers "
+            "WHERE product_id=%s AND duration_months=1 AND active=TRUE",
+            (product_id,),
+          )
+          new_offer = cur.fetchone()
+          new_monthly_cents = int(new_offer["price_cents"]) if new_offer else 0
+          for low in lower_subs:
+            remaining_days = 0.0
+            if low["expires_at"] is not None:
+              remaining = (low["expires_at"] - now).total_seconds() / 86_400.0
+              remaining_days = max(0.0, remaining)
+            cur.execute(
+              "SELECT price_cents FROM product_offers "
+              "WHERE product_id=%s AND duration_months=1 AND active=TRUE",
+              (low["product_id"],),
+            )
+            low_offer = cur.fetchone()
+            low_monthly_cents = int(low_offer["price_cents"]) if low_offer else 0
+            if remaining_days > 0 and low_monthly_cents > 0 and new_monthly_cents > 0:
+              # remaining_days × (low_daily / new_daily)
+              #   = remaining_days × (low_monthly/30) / (new_monthly/30)
+              #   = remaining_days × low_monthly / new_monthly
+              bonus_days += remaining_days * low_monthly_cents / new_monthly_cents
+            replaced_ids.append(int(low["id"]))
+          if replaced_ids:
+            # Tag the cancelled rows with the event id; we'll fill in
+            # replaced_by_sub_id once the new sub row exists.
+            cur.execute(
+              """
+              UPDATE subscriptions
+              SET status='canceled',
+                  updated_at=NOW(),
+                  metadata = metadata || jsonb_build_object(
+                    'canceled_reason', 'upgraded',
+                    'canceled_by_event_id', %s::text
+                  )
+              WHERE id = ANY(%s)
+              """,
+              (event_id, replaced_ids),
+            )
+        # INSERT the new sub. Use SAVEPOINT to recover from concurrent
+        # Stripe-retry races (unique partial index on
+        # (user_id, product_id) where status IN ('pending','active',
+        # 'over_quota') would block a duplicate).
+        new_expires = (
+          expires_at + timedelta(days=bonus_days) if expires_at is not None else None
+        )
         cur.execute("SAVEPOINT before_sub_insert")
         try:
           cur.execute(
@@ -3915,19 +4096,47 @@ async def stripe_webhook(request: Request) -> dict:
             VALUES (%s, %s, 'active', NOW(), %s, 'stripe', %s::jsonb)
             RETURNING id
             """,
-            (user_id, product_id, expires_at,
-             _to_jsonb({"stripe_payment_id": payment_row["id"]})),
+            (
+              user_id, product_id, new_expires,
+              _to_jsonb({
+                "stripe_payment_id": payment_row["id"],
+                # If we cancelled lower subs, record the linkage both
+                # ways so an audit can trace upgrade chains.
+                **(
+                  {
+                    "replaced_sub_ids": replaced_ids,
+                    "bonus_days_from_upgrade": round(bonus_days, 3),
+                  }
+                  if replaced_ids
+                  else {}
+                ),
+              }),
+            ),
           )
           sub_row = cur.fetchone()
           cur.execute("RELEASE SAVEPOINT before_sub_insert")
+          if replaced_ids and sub_row:
+            cur.execute(
+              """
+              UPDATE subscriptions
+              SET metadata = metadata || jsonb_build_object(
+                'replaced_by_sub_id', %s::bigint
+              )
+              WHERE id = ANY(%s)
+              """,
+              (sub_row["id"], replaced_ids),
+            )
+            LOGGER.info(
+              "stripe webhook upgraded user=%s to product=%s (rank=%s); "
+              "canceled %d lower-tier sub(s) %s; bonus_days=%.2f; new expires=%s",
+              user_id, product_code, product["tier_rank"],
+              len(replaced_ids), replaced_ids, bonus_days, new_expires,
+            )
         except psycopg.errors.UniqueViolation:
-          # Concurrent webhook delivery beat us to the INSERT. Roll back
-          # to the savepoint (keeps the payments row), re-read the
-          # winner's sub row, then -- for period/recurring products --
-          # apply the same expiry-extension as the regular renewal path
-          # so the second payment doesn't silently get a free ride. If
-          # we just took the winner's sub as-is, this user paid twice
-          # but only got one period of service.
+          # Concurrent Stripe retry beat us to the INSERT. Roll back to
+          # the savepoint (preserves the payments row + the lower-sub
+          # cancellations from this txn), find the winner, and apply
+          # the same extension logic as Case 1.
           cur.execute("ROLLBACK TO SAVEPOINT before_sub_insert")
           cur.execute(
             "SELECT id, expires_at FROM subscriptions "
@@ -3936,9 +4145,8 @@ async def stripe_webhook(request: Request) -> dict:
           )
           existing_sub = cur.fetchone()
           if existing_sub is not None and expires_at is not None:
-            from_dt = max(datetime.now(timezone.utc),
-                          (existing_sub["expires_at"] or datetime.now(timezone.utc)))
-            new_exp = from_dt + timedelta(days=30 * duration_months)
+            from_dt = max(now, existing_sub["expires_at"] or now)
+            new_exp = from_dt + timedelta(days=base_period_days + bonus_days)
             cur.execute(
               """
               UPDATE subscriptions SET expires_at=%s, updated_at=NOW()
@@ -3954,24 +4162,6 @@ async def stripe_webhook(request: Request) -> dict:
             )
           else:
             sub_row = existing_sub
-      elif expires_at is not None:
-        # Renewal — extend expiry from the later of (now, current expiry)
-        # so users who renew early don't lose remaining time.
-        from_dt = max(datetime.now(timezone.utc),
-                       (existing_sub["expires_at"] or datetime.now(timezone.utc)))
-        new_exp = from_dt + timedelta(days=period)
-        cur.execute(
-          """
-          UPDATE subscriptions SET expires_at=%s, updated_at=NOW()
-          WHERE id=%s RETURNING id
-          """,
-          (new_exp, existing_sub["id"]),
-        )
-        sub_row = cur.fetchone()
-        LOGGER.info("stripe webhook extended sub user=%s product=%s to %s",
-                     user_id, product_code, new_exp)
-      else:
-        sub_row = None
       # No xout-side provisioning needed: xout containers read user
       # state from auth_users + subscriptions + xout_products on every
       # tick, and the user's VLESS UUID is on auth_users (not per node).
