@@ -27,7 +27,11 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, "/app")
 
 from app.db import connect            # noqa: E402
-from app.main import _handle_stripe_webhook_event  # noqa: E402
+from app.main import (                # noqa: E402
+    _build_checkout_preview,
+    _compute_upgrade_credit,
+    _handle_stripe_webhook_event,
+)
 
 
 def db_exec(sql: str, params: tuple = ()):
@@ -114,24 +118,38 @@ def fake_event(
     product_code: str,
     duration_months: int,
     amount_cents: int,
+    credit_applied_cents: int = 0,
+    credit_source_sub_ids: list[int] | None = None,
 ) -> tuple[str, str, dict, bytes]:
     """Mirror the shape of a real Stripe checkout.session.completed
-    payload — just the fields the handler reads."""
+    payload — just the fields the handler reads.
+
+    For the new-flow tests (credit applied at checkout), pass
+    ``credit_applied_cents`` + the IDs of the lower-tier subs that
+    backed the credit. The webhook should then skip bonus_days and
+    cancel exactly those subs.
+    """
     pid = product_id_for(product_code)
+    meta = {
+        "user_id": user_id,
+        "product_id": str(pid),
+        "product_code": product_code,
+        "duration_months": str(duration_months),
+        "discount_pct": "0",
+        "offer_id": "0",
+    }
+    if credit_applied_cents > 0:
+        meta["credit_applied_cents"] = str(credit_applied_cents)
+        meta["credit_source_sub_ids"] = ",".join(
+            str(i) for i in (credit_source_sub_ids or [])
+        )
     data_obj = {
         "object": "checkout.session",
         "id": f"cs_test_{event_id}",
         "payment_intent": f"pi_test_{event_id}",
         "amount_total": amount_cents,
         "currency": "usd",
-        "metadata": {
-            "user_id": user_id,
-            "product_id": str(pid),
-            "product_code": product_code,
-            "duration_months": str(duration_months),
-            "discount_pct": "0",
-            "offer_id": "0",
-        },
+        "metadata": meta,
     }
     return event_id, "checkout.session.completed", data_obj, b"{}"
 
@@ -348,6 +366,120 @@ def test_idempotency():
         cleanup(uid)
 
 
+def test_preview_no_lower_sub():
+    """User without trial / paid sub → preview returns credit 0."""
+    email = f"proration-test-{int(time.time())}-prev-fresh@bitsfactor.dev"
+    uid = make_user(email)
+    try:
+        db_commit(
+            "DELETE FROM subscriptions WHERE user_id=%s AND product_id=%s",
+            (uid, product_id_for("tier_basic")),
+        )
+        preview = _build_checkout_preview(uid, "tier_pro", 1)
+        assert preview["base_price_cents"] == 1000
+        assert preview["credit_cents"] == 0
+        assert preview["final_price_cents"] == 1000
+        assert preview["is_upgrade"] is False
+        print("  [preview/no-sub] credit=0 ✓")
+    finally:
+        cleanup(uid)
+
+
+def test_preview_trial_to_pro():
+    """signup_7day_basic (7d remaining) → upgrade to pro 1mo.
+
+    Credit = remaining_days × (basic_monthly_cents / 30)
+           ≈ 7 × (500/30) = ~117 cents.
+    """
+    email = f"proration-test-{int(time.time())}-prev-up@bitsfactor.dev"
+    uid = make_user(email)
+    try:
+        preview = _build_checkout_preview(uid, "tier_pro", 1)
+        assert preview["base_price_cents"] == 1000
+        # Allow ±3c for the few seconds of trial countdown during the test
+        assert 110 <= preview["credit_cents"] <= 120, preview
+        assert preview["final_price_cents"] == 1000 - preview["credit_cents"]
+        assert preview["is_upgrade"] is True
+        assert len(preview["credit_source"]) == 1
+        assert preview["credit_source"][0]["product_code"] == "tier_basic"
+        print(
+            f"  [preview/trial→pro] credit={preview['credit_cents']}c, "
+            f"final={preview['final_price_cents']}c ✓"
+        )
+    finally:
+        cleanup(uid)
+
+
+def test_preview_same_tier_returns_zero():
+    """User on tier_basic buys tier_basic again → credit 0 (renewal,
+    not upgrade)."""
+    email = f"proration-test-{int(time.time())}-prev-same@bitsfactor.dev"
+    uid = make_user(email)
+    try:
+        preview = _build_checkout_preview(uid, "tier_basic", 1)
+        assert preview["base_price_cents"] == 500
+        assert preview["credit_cents"] == 0
+        assert preview["is_upgrade"] is False
+        print("  [preview/same-tier] credit=0 ✓")
+    finally:
+        cleanup(uid)
+
+
+def test_webhook_with_credit_applied_no_bonus_days():
+    """Simulate the new flow: checkout already applied the credit and
+    set ``credit_applied_cents`` in session metadata. Webhook should
+    cancel exactly those subs but NOT add bonus_days — expires_at =
+    now + 30d exact.
+    """
+    email = f"proration-test-{int(time.time())}-new-flow@bitsfactor.dev"
+    uid = make_user(email)
+    try:
+        # Use preview to know which sub backs the credit
+        preview = _build_checkout_preview(uid, "tier_pro", 1)
+        source_sub_ids = [s["sub_id"] for s in preview["credit_source"]]
+        assert source_sub_ids, "expected at least one source sub"
+        # Stripe charged the user only final_price_cents
+        ev = fake_event(
+            event_id=f"evt_newflow_{int(time.time())}",
+            user_id=uid,
+            product_code="tier_pro",
+            duration_months=1,
+            amount_cents=preview["final_price_cents"],
+            credit_applied_cents=preview["credit_cents"],
+            credit_source_sub_ids=source_sub_ids,
+        )
+        out = _handle_stripe_webhook_event(*ev)
+        assert out.get("ok"), out
+        subs = fetch_subs(uid)
+        pro = [s for s in subs if s["code"] == "tier_pro"]
+        basic = [s for s in subs if s["code"] == "tier_basic"]
+        assert len(pro) == 1 and pro[0]["status"] == "active"
+        assert len(basic) == 1 and basic[0]["status"] == "canceled"
+        # Crucial: pro_expires = now + 30d EXACTLY (no bonus). Allow
+        # 12h tolerance for clock drift during the test.
+        delta = (
+            pro[0]["expires_at"] - datetime.now(timezone.utc)
+        ).total_seconds() / 86400.0
+        assert_close_days(timedelta(days=delta), 30.0, tol_hours=12.0)
+        # Metadata should reflect the new flow
+        pro_meta = pro[0]["metadata"] or {}
+        assert pro_meta.get("credit_applied_cents") == preview["credit_cents"], (
+            f"credit_applied_cents missing/wrong: {pro_meta}"
+        )
+        assert "bonus_days_from_upgrade" not in pro_meta, (
+            "new-flow row should NOT have bonus_days metadata"
+        )
+        # Source sub gets the replaced_by linkage
+        basic_meta = basic[0]["metadata"] or {}
+        assert basic_meta.get("replaced_by_sub_id") == pro[0]["id"]
+        print(
+            f"  [new-flow] credit=${preview['credit_cents']/100:.2f}, "
+            f"pro={delta:.2f}d (no bonus), basic canceled ✓"
+        )
+    finally:
+        cleanup(uid)
+
+
 def main():
     print("=" * 60)
     print("Stripe webhook proration — end-to-end test")
@@ -357,6 +489,11 @@ def main():
     test_upgrade_preserves_free_tier()
     test_fresh_purchase()
     test_idempotency()
+    print("-- preview API + new flow --")
+    test_preview_no_lower_sub()
+    test_preview_trial_to_pro()
+    test_preview_same_tier_returns_zero()
+    test_webhook_with_credit_applied_no_bonus_days()
     print("\nAll tests passed.")
 
 

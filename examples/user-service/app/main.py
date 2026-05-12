@@ -3651,11 +3651,17 @@ def create_checkout_session(req: CheckoutSessionRequest,
                               user: dict = Depends(get_current_user),
                               request: Request = None) -> dict:
   duration_months = req.duration_months or 1
+  # Compute the upgrade credit using the SAME helper as the preview
+  # endpoint. If the user opens the upgrade dialog (which calls
+  # /api/me/checkout-preview) and then clicks buy a few seconds later,
+  # the credit they see is the credit they pay — there's no
+  # round-trip race.
   with connect() as conn:
     with conn.cursor() as cur:
       cur.execute(
         """
-        SELECT p.id AS product_id, p.code, p.name, p.currency,
+        SELECT p.id AS product_id, p.code, p.name, p.service_code, p.currency,
+               COALESCE((p.metadata->>'tier_rank')::int, -1) AS tier_rank,
                o.id AS offer_id, o.duration_months, o.price_cents,
                o.discount_pct, o.stripe_price_id
         FROM product_offers o
@@ -3668,16 +3674,21 @@ def create_checkout_session(req: CheckoutSessionRequest,
         (req.product_code, duration_months),
       )
       offer = cur.fetchone()
-  if offer is None:
-    raise HTTPException(
-      status_code=404,
-      detail=f"offer not found: {req.product_code} × {duration_months}mo",
-    )
-  if not offer["stripe_price_id"]:
-    raise HTTPException(
-      status_code=400,
-      detail="offer has no stripe_price_id — re-run the Stripe catalog sync",
-    )
+      if offer is None:
+        raise HTTPException(
+          status_code=404,
+          detail=f"offer not found: {req.product_code} × {duration_months}mo",
+        )
+      credit_info = _compute_upgrade_credit(
+        cur,
+        user_id=str(user["id"]),
+        target_product_id=int(offer["product_id"]),
+        target_service_code=offer["service_code"],
+        target_tier_rank=int(offer["tier_rank"]),
+      )
+  base_price_cents = int(offer["price_cents"])
+  credit_cents = min(int(credit_info["credit_cents"]), base_price_cents)
+  final_price_cents = base_price_cents - credit_cents
   # No 409 on existing-active sub: under the one-time + duration model the
   # user is *allowed* to top up; the webhook stacks duration_months onto
   # the existing expires_at. This is the whole point of multi-month buys
@@ -3686,6 +3697,58 @@ def create_checkout_session(req: CheckoutSessionRequest,
   base = (os.getenv("PUBLIC_URL") or "https://user.develop.cc").rstrip("/")
   success_url = req.success_url or f"{base}/?checkout=success"
   cancel_url = req.cancel_url or f"{base}/?checkout=cancel"
+  # Two paths for line_items:
+  #   - No credit: use the existing stripe_price_id (cheaper UX for
+  #     Stripe's reporting/coupons, and matches what we've always done).
+  #   - With credit: dynamic price_data so the user is charged the
+  #     prorated final_price_cents. Stripe doesn't permit "discounts"
+  #     on top of a custom price_data line item, so the credit is folded
+  #     directly into unit_amount; the UI presents the breakdown.
+  base_metadata = {
+    "user_id": str(user["id"]),
+    "product_id": str(offer["product_id"]),
+    "product_code": offer["code"],
+    "offer_id": str(offer["offer_id"]),
+    "duration_months": str(offer["duration_months"]),
+    "discount_pct": str(offer["discount_pct"]),
+  }
+  if credit_cents > 0:
+    if not offer["stripe_price_id"]:
+      # We still want a sensible product_data.name for the Stripe-
+      # hosted checkout page when no canonical product mapping exists.
+      product_name_for_stripe = offer["code"]
+    else:
+      # Pull the original Stripe Product name so the checkout page
+      # shows e.g. "Develop · Chat Pro" — same string the fixed-price
+      # path would show. Best-effort; on failure we fall back to code.
+      product_name_for_stripe = offer["code"]
+      try:
+        stripe_price = stripe.Price.retrieve(offer["stripe_price_id"], expand=["product"])
+        if stripe_price and getattr(stripe_price, "product", None):
+          product_name_for_stripe = stripe_price.product.name or offer["code"]
+      except Exception:
+        # Don't block checkout if the lookup fails; just use the code.
+        pass
+    line_items = [{
+      "price_data": {
+        "currency": (offer.get("currency") or "USD").lower(),
+        "unit_amount": final_price_cents,
+        "product_data": {"name": product_name_for_stripe},
+      },
+      "quantity": 1,
+    }]
+    base_metadata["credit_applied_cents"] = str(credit_cents)
+    base_metadata["credit_source_sub_ids"] = ",".join(
+      str(s["sub_id"]) for s in credit_info["source_subs"]
+    )
+    base_metadata["base_price_cents"] = str(base_price_cents)
+  else:
+    if not offer["stripe_price_id"]:
+      raise HTTPException(
+        status_code=400,
+        detail="offer has no stripe_price_id — re-run the Stripe catalog sync",
+      )
+    line_items = [{"price": offer["stripe_price_id"], "quantity": 1}]
   try:
     session = stripe.checkout.Session.create(
       # Always one-time payment now — we no longer use Stripe subscriptions
@@ -3697,7 +3760,7 @@ def create_checkout_session(req: CheckoutSessionRequest,
       # paid_tier dialog promises "USD payments also support Alipay".
       # Card stays first so non-CN users default to it.
       payment_method_types=["card", "alipay"],
-      line_items=[{"price": offer["stripe_price_id"], "quantity": 1}],
+      line_items=line_items,
       success_url=success_url,
       cancel_url=cancel_url,
       client_reference_id=str(user["id"]),
@@ -3705,22 +3768,127 @@ def create_checkout_session(req: CheckoutSessionRequest,
       # Stripe copies session.metadata onto the payment_intent (and
       # therefore the webhook). Carry everything the webhook needs to
       # locate the right (user, product, offer) tuple without re-querying.
-      metadata={
-        "user_id": str(user["id"]),
-        "product_id": str(offer["product_id"]),
-        "product_code": offer["code"],
-        "offer_id": str(offer["offer_id"]),
-        "duration_months": str(offer["duration_months"]),
-        "discount_pct": str(offer["discount_pct"]),
-      },
+      metadata=base_metadata,
       # Allow promo codes the user enters on Stripe Checkout. We don't
       # mint them — operators create coupons in the dashboard.
-      allow_promotion_codes=True,
+      # Disable promo codes when we've already applied an upgrade
+      # credit — Stripe rejects coupons on top of dynamic price_data.
+      allow_promotion_codes=(credit_cents == 0),
     )
   except Exception as exc:  # noqa: BLE001
     LOGGER.exception("stripe.checkout.session create failed")
     raise HTTPException(status_code=502, detail=f"stripe error: {exc}")
-  return {"url": session.url, "session_id": session.id}
+  return {
+    "url": session.url,
+    "session_id": session.id,
+    "base_price_cents": base_price_cents,
+    "credit_cents": credit_cents,
+    "final_price_cents": final_price_cents,
+  }
+
+
+def _build_checkout_preview(
+  user_id: str,
+  product_code: str,
+  duration_months: int,
+) -> dict:
+  """Shared implementation for /api/me/checkout-preview and the
+  service-to-service variant. Pure read — no rows modified.
+
+  Returns the same shape on both endpoints so the chatbot can forward
+  verbatim.
+  """
+  if duration_months <= 0:
+    raise HTTPException(status_code=400, detail="duration_months must be > 0")
+  with connect() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        """
+        SELECT p.id AS product_id, p.code, p.service_code, p.currency,
+               COALESCE((p.metadata->>'tier_rank')::int, -1) AS tier_rank,
+               o.id AS offer_id, o.duration_months, o.price_cents,
+               o.discount_pct
+        FROM product_offers o
+        JOIN products p ON p.id = o.product_id
+        WHERE p.code = %s
+          AND p.active = TRUE
+          AND o.active = TRUE
+          AND o.duration_months = %s
+        """,
+        (product_code, duration_months),
+      )
+      offer = cur.fetchone()
+      if offer is None:
+        raise HTTPException(
+          status_code=404,
+          detail=f"offer not found: {product_code} × {duration_months}mo",
+        )
+      base_price_cents = int(offer["price_cents"])
+      # Credit only applies on a true UPGRADE (target rank strictly
+      # greater than every existing chat sub's rank). For same-tier
+      # renewal / downgrade, helper returns credit=0 naturally because
+      # the SQL filter excludes equal- and higher-rank rows.
+      credit_info = _compute_upgrade_credit(
+        cur,
+        user_id=user_id,
+        target_product_id=int(offer["product_id"]),
+        target_service_code=offer["service_code"],
+        target_tier_rank=int(offer["tier_rank"]),
+      )
+  credit_cents = int(credit_info["credit_cents"])
+  # Never let credit exceed price (a 100% discount turns the row free,
+  # which is fine for Stripe `price_data.unit_amount=0`, but it's
+  # cleaner if we clamp here).
+  credit_cents = min(credit_cents, base_price_cents)
+  final_price_cents = base_price_cents - credit_cents
+  return {
+    "product_code": offer["code"],
+    "duration_months": int(offer["duration_months"]),
+    "offer_id": int(offer["offer_id"]),
+    "currency": (offer.get("currency") or "USD").upper(),
+    "base_price_cents": base_price_cents,
+    "credit_cents": credit_cents,
+    "final_price_cents": final_price_cents,
+    "credit_source": credit_info["source_subs"],
+    "is_upgrade": credit_cents > 0,
+  }
+
+
+@app.get("/api/me/checkout-preview")
+def me_checkout_preview(
+  product_code: str,
+  duration_months: int = 1,
+  user: dict = Depends(get_current_user),
+) -> dict:
+  """Quote the price a logged-in user would actually pay for
+  (product_code, duration_months), including any upgrade credit
+  from their existing active subs.
+
+  Idempotent — call as many times as you want from the upgrade UI.
+  Same formula as the webhook so the displayed number matches what
+  Stripe charges.
+  """
+  return _build_checkout_preview(str(user["id"]), product_code, duration_months)
+
+
+@app.get("/api/internal/checkout-preview",
+         dependencies=[Depends(require_service_token)])
+def internal_checkout_preview(
+  product_code: str,
+  duration_months: int = 1,
+  user_ident: str | None = None,
+) -> dict:
+  """Service-to-service variant of /api/me/checkout-preview. Same
+  contract; auth is via X-Service-Token.
+
+  ``user_ident`` is email or uuid (mirrors /api/internal/usage/charge).
+  """
+  if not user_ident:
+    raise HTTPException(status_code=400, detail="user_ident is required")
+  user_id = _resolve_user_id(user_ident)
+  if not user_id:
+    raise HTTPException(status_code=404, detail=f"user not found: {user_ident}")
+  return _build_checkout_preview(user_id, product_code, duration_months)
 
 
 @app.post("/api/me/billing/portal")
@@ -3883,6 +4051,110 @@ async def stripe_webhook(request: Request) -> dict:
     raise
 
 
+def _compute_upgrade_credit(
+  cur,
+  user_id: str,
+  target_product_id: int,
+  target_service_code: str,
+  target_tier_rank: int,
+  now: datetime | None = None,
+) -> dict:
+  """Compute the upgrade credit a user has accumulated from active
+  lower-tier subscriptions in the same service family.
+
+  Pure read — does NOT cancel or modify any row. Shared by
+  ``/api/me/checkout-preview`` (read-only quote for the UI) and the
+  webhook upgrade branch (which commits the cancellation + payment
+  separately). Single source of truth so a user never sees a
+  different number than what they're actually charged.
+
+  Returns:
+    {
+      "credit_cents": int,                  # rounded down to nearest cent
+      "source_subs": [                      # for transparency / DB linkage
+         {"sub_id": int, "product_id": int, "product_code": str,
+          "remaining_days": float, "rate_cents_per_day": float,
+          "credit_cents": float}            # this sub's share, pre-round
+      ],
+      "new_offer_monthly_cents": int | None # 0/None if target has no 1mo offer
+    }
+
+  Algorithm (matches the bonus_days formula the webhook used to apply
+  — same math, expressed as money):
+
+  - Find every active sub in the same ``service_code`` family whose
+    ``tier_rank`` is strictly less than the target's, whose
+    ``expires_at IS NOT NULL`` (excludes the permanent tier_free
+    grant), and whose product is NOT the target product (would be
+    same-tier renewal, no credit).
+  - For each, look up the 1-month offer's ``price_cents``. The
+    *1-month rate* is intentionally chosen so bulk-discounted purchases
+    don't shrink the credit and the math is transparent at any
+    duration the user buys.
+  - This sub's credit = remaining_days × (low_offer_monthly / 30).
+  - Sum across sources, floor to int cents.
+  """
+  now = now or datetime.now(timezone.utc)
+  cur.execute(
+    """
+    SELECT s.id AS sub_id, s.expires_at, s.product_id,
+           p.code AS product_code,
+           COALESCE((p.metadata->>'tier_rank')::int, -1) AS tier_rank
+    FROM subscriptions s
+    JOIN products p ON p.id = s.product_id
+    WHERE s.user_id = %s
+      AND p.service_code = %s
+      AND s.status = 'active'
+      AND s.product_id != %s
+      AND s.expires_at IS NOT NULL
+      AND COALESCE((p.metadata->>'tier_rank')::int, -1) < %s
+    """,
+    (user_id, target_service_code, target_product_id, target_tier_rank),
+  )
+  lower_subs = cur.fetchall()
+  if not lower_subs:
+    return {"credit_cents": 0, "source_subs": [], "new_offer_monthly_cents": 0}
+  # Target's 1-month rate (denominator in the bonus-days formula).
+  cur.execute(
+    "SELECT price_cents FROM product_offers "
+    "WHERE product_id=%s AND duration_months=1 AND active=TRUE",
+    (target_product_id,),
+  )
+  new_offer = cur.fetchone()
+  new_monthly_cents = int(new_offer["price_cents"]) if new_offer else 0
+  total_credit_cents = 0.0
+  sources: list[dict] = []
+  for low in lower_subs:
+    remaining_days = 0.0
+    if low["expires_at"] is not None:
+      remaining = (low["expires_at"] - now).total_seconds() / 86_400.0
+      remaining_days = max(0.0, remaining)
+    cur.execute(
+      "SELECT price_cents FROM product_offers "
+      "WHERE product_id=%s AND duration_months=1 AND active=TRUE",
+      (low["product_id"],),
+    )
+    low_offer = cur.fetchone()
+    low_monthly_cents = int(low_offer["price_cents"]) if low_offer else 0
+    rate_per_day = low_monthly_cents / 30.0 if low_monthly_cents > 0 else 0.0
+    this_credit = remaining_days * rate_per_day
+    if this_credit > 0:
+      total_credit_cents += this_credit
+    sources.append({
+      "sub_id": int(low["sub_id"]),
+      "product_id": int(low["product_id"]),
+      "product_code": low["product_code"],
+      "remaining_days": round(remaining_days, 4),
+      "rate_cents_per_day": round(rate_per_day, 4),
+      "credit_cents": round(this_credit, 4),
+    })
+  return {
+    "credit_cents": int(total_credit_cents),  # floor to whole cents
+    "source_subs": sources,
+    "new_offer_monthly_cents": new_monthly_cents,
+  }
+
+
 def _handle_stripe_webhook_event(
   event_id: str,
   event_type: str,
@@ -4006,81 +4278,67 @@ def _handle_stripe_webhook_event(
         LOGGER.info("stripe webhook extended sub user=%s product=%s to %s",
                     user_id, product_code, new_exp)
       else:
-        # Case 2 candidate: look for a lower-rank active sub in the
-        # same service family. We restrict by service_code so a chat
-        # purchase never displaces an xout sub or vice versa. The
-        # `expires_at IS NOT NULL` filter intentionally excludes the
-        # permanent free-tier grant — that row is the fallback floor
-        # the active-tier resolver lands on when no paid sub is
-        # present, so it should outlive any purchase. We only displace
-        # genuinely time-bound lower-tier subs (trials + paid).
-        cur.execute(
-          """
-          SELECT s.id, s.expires_at, s.product_id,
-                 COALESCE((p.metadata->>'tier_rank')::int, -1) AS tier_rank
-          FROM subscriptions s
-          JOIN products p ON p.id = s.product_id
-          WHERE s.user_id = %s
-            AND p.service_code = %s
-            AND s.status = 'active'
-            AND s.product_id != %s
-            AND s.expires_at IS NOT NULL
-            AND COALESCE((p.metadata->>'tier_rank')::int, -1) < %s
-          """,
-          (user_id, product["service_code"], product_id, product["tier_rank"]),
-        )
-        lower_subs = cur.fetchall()
-        bonus_days = 0.0
+        # Case 2 / Case 3. The new contract: when the checkout flow
+        # already applied the upgrade credit at price-time (Session
+        # metadata.credit_applied_cents > 0), we just need to cancel
+        # the lower-tier subs and let the new one start at exactly
+        # `base_period_days` from now. The user already saw — and
+        # paid — the prorated price.
+        #
+        # The bonus_days branch survives strictly as a backwards-
+        # compatible path for Stripe events that were created BEFORE
+        # this deploy (and may still be retrying). Those sessions
+        # were charged full price; the only way the user gets their
+        # money's worth is the day-credit applied here. Delete this
+        # legacy branch ~30 days post-deploy.
+        credit_applied_cents = int(meta.get("credit_applied_cents") or 0)
+        credit_source_sub_ids: list[int] = []
+        if meta.get("credit_source_sub_ids"):
+          credit_source_sub_ids = [
+            int(s) for s in str(meta["credit_source_sub_ids"]).split(",") if s.strip()
+          ]
         replaced_ids: list[int] = []
-        if expires_at is not None and lower_subs:
-          # Option A proration: convert remaining lower-tier DAYS into
-          # new-tier days using daily prices derived from each tier's
-          # 1-month offer (price_cents / 30). The 1-month base is used
-          # — not the duration the user actually bought — so that
-          # bulk-discounted long-term subs don't shrink the credit and
-          # users always see a transparent rate.
-          cur.execute(
-            "SELECT price_cents FROM product_offers "
-            "WHERE product_id=%s AND duration_months=1 AND active=TRUE",
-            (product_id,),
+        bonus_days = 0.0
+        if credit_applied_cents > 0:
+          # New flow — credit was already applied at checkout. Cancel
+          # exactly the subs that backed that credit (use the IDs from
+          # session metadata so we don't accidentally cancel a sub the
+          # user added between preview and webhook). No bonus_days.
+          replaced_ids = credit_source_sub_ids
+        elif expires_at is not None:
+          # Legacy flow — no credit_applied_cents on the session. Use
+          # the shared helper to compute bonus_days, same formula as
+          # before. Reads the same lower-rank-active-sub set; pays
+          # off remaining time as extra days on the new sub.
+          info = _compute_upgrade_credit(
+            cur,
+            user_id=user_id,
+            target_product_id=product_id,
+            target_service_code=product["service_code"],
+            target_tier_rank=product["tier_rank"],
+            now=now,
           )
-          new_offer = cur.fetchone()
-          new_monthly_cents = int(new_offer["price_cents"]) if new_offer else 0
-          for low in lower_subs:
-            remaining_days = 0.0
-            if low["expires_at"] is not None:
-              remaining = (low["expires_at"] - now).total_seconds() / 86_400.0
-              remaining_days = max(0.0, remaining)
-            cur.execute(
-              "SELECT price_cents FROM product_offers "
-              "WHERE product_id=%s AND duration_months=1 AND active=TRUE",
-              (low["product_id"],),
-            )
-            low_offer = cur.fetchone()
-            low_monthly_cents = int(low_offer["price_cents"]) if low_offer else 0
-            if remaining_days > 0 and low_monthly_cents > 0 and new_monthly_cents > 0:
-              # remaining_days × (low_daily / new_daily)
-              #   = remaining_days × (low_monthly/30) / (new_monthly/30)
-              #   = remaining_days × low_monthly / new_monthly
-              bonus_days += remaining_days * low_monthly_cents / new_monthly_cents
-            replaced_ids.append(int(low["id"]))
-          if replaced_ids:
-            # Tag the cancelled rows with the event id; we'll fill in
-            # replaced_by_sub_id once the new sub row exists.
-            cur.execute(
-              """
-              UPDATE subscriptions
-              SET status='canceled',
-                  updated_at=NOW(),
-                  metadata = metadata || jsonb_build_object(
-                    'canceled_reason', 'upgraded',
-                    'canceled_by_event_id', %s::text
-                  )
-              WHERE id = ANY(%s)
-              """,
-              (event_id, replaced_ids),
-            )
-        # INSERT the new sub. Use SAVEPOINT to recover from concurrent
+          new_monthly = info["new_offer_monthly_cents"]
+          if new_monthly and info["credit_cents"] > 0:
+            # credit_cents is the dollar value; convert back to days
+            # at the new tier's daily rate: credit / (new_monthly/30).
+            bonus_days = info["credit_cents"] / (new_monthly / 30.0)
+          replaced_ids = [s["sub_id"] for s in info["source_subs"]]
+        if replaced_ids:
+          cur.execute(
+            """
+            UPDATE subscriptions
+            SET status='canceled',
+                updated_at=NOW(),
+                metadata = metadata || jsonb_build_object(
+                  'canceled_reason', 'upgraded',
+                  'canceled_by_event_id', %s::text
+                )
+            WHERE id = ANY(%s) AND status='active'
+            """,
+            (event_id, replaced_ids),
+          )
+        # INSERT the new sub. SAVEPOINT recovers from concurrent
         # Stripe-retry races (unique partial index on
         # (user_id, product_id) where status IN ('pending','active',
         # 'over_quota') would block a duplicate).
@@ -4100,12 +4358,13 @@ def _handle_stripe_webhook_event(
               user_id, product_id, new_expires,
               _to_jsonb({
                 "stripe_payment_id": payment_row["id"],
-                # If we cancelled lower subs, record the linkage both
-                # ways so an audit can trace upgrade chains.
                 **(
                   {
                     "replaced_sub_ids": replaced_ids,
-                    "bonus_days_from_upgrade": round(bonus_days, 3),
+                    **({"credit_applied_cents": credit_applied_cents}
+                       if credit_applied_cents > 0 else {}),
+                    **({"bonus_days_from_upgrade": round(bonus_days, 3)}
+                       if bonus_days > 0 else {}),
                   }
                   if replaced_ids
                   else {}
@@ -4128,9 +4387,11 @@ def _handle_stripe_webhook_event(
             )
             LOGGER.info(
               "stripe webhook upgraded user=%s to product=%s (rank=%s); "
-              "canceled %d lower-tier sub(s) %s; bonus_days=%.2f; new expires=%s",
+              "canceled %d lower-tier sub(s) %s; "
+              "credit_applied=%dc; bonus_days=%.2f; new expires=%s",
               user_id, product_code, product["tier_rank"],
-              len(replaced_ids), replaced_ids, bonus_days, new_expires,
+              len(replaced_ids), replaced_ids,
+              credit_applied_cents, bonus_days, new_expires,
             )
         except psycopg.errors.UniqueViolation:
           # Concurrent Stripe retry beat us to the INSERT. Roll back to
