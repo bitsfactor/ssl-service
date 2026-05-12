@@ -9,6 +9,19 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
+function sanitizeReturnTo(raw: string): string {
+  if (raw.startsWith("/") && !raw.startsWith("//")) return raw;
+  try {
+    const u = new URL(raw);
+    if (u.protocol === "https:" && u.hostname.endsWith(".develop.cc")) {
+      return raw;
+    }
+  } catch {
+    /* fall through */
+  }
+  return "/";
+}
+
 type Step = "form" | "code";
 
 export function RegisterClient() {
@@ -16,11 +29,9 @@ export function RegisterClient() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const _rawReturnTo = searchParams.get("return_to") ?? "/";
-  // Sanitize: only allow relative paths to prevent open-redirect attacks.
-  const returnTo =
-    _rawReturnTo.startsWith("/") && !_rawReturnTo.startsWith("//")
-      ? _rawReturnTo
-      : "/";
+  // Allow relative paths OR full https URLs on a *.develop.cc subdomain
+  // (chat sends users here with return_to=chat's SSO exchange URL).
+  const returnTo = sanitizeReturnTo(_rawReturnTo);
 
   const [step, setStep] = useState<Step>("form");
   const [email, setEmail] = useState("");
@@ -94,7 +105,11 @@ export function RegisterClient() {
         setErrors({ code: msg });
         return;
       }
-      router.replace(returnTo);
+      if (/^https?:\/\//.test(returnTo)) {
+        window.location.href = returnTo;
+      } else {
+        router.replace(returnTo);
+      }
     } catch {
       toast.error(t("common.networkError"));
     } finally {

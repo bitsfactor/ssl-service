@@ -9,13 +9,28 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
+function sanitizeReturnTo(raw: string): string {
+  if (raw.startsWith("/") && !raw.startsWith("//")) return raw;
+  try {
+    const u = new URL(raw);
+    if (u.protocol === "https:" && u.hostname.endsWith(".develop.cc")) {
+      return raw;
+    }
+  } catch {
+    /* fall through */
+  }
+  return "/";
+}
+
 export function LoginClient() {
   const t = useT();
   const router = useRouter();
   const searchParams = useSearchParams();
   const _rawReturnTo = searchParams.get("return_to") ?? "/";
-  // Sanitize: only allow relative paths to prevent open-redirect attacks.
-  const returnTo = _rawReturnTo.startsWith("/") && !_rawReturnTo.startsWith("//") ? _rawReturnTo : "/";
+  // Allow either a relative path OR a full https URL on a *.develop.cc
+  // subdomain (cross-product SSO bounces back here with one of those).
+  // Anything else falls back to "/" to block open-redirect attacks.
+  const returnTo = sanitizeReturnTo(_rawReturnTo);
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -48,8 +63,15 @@ export function LoginClient() {
         return;
       }
       // Login succeeded — navigate to return_to (or dashboard).
-      // We use replace so the login page isn't in the history stack.
-      router.replace(returnTo);
+      // Relative paths use Next's client router (no full reload);
+      // cross-product returns (e.g. chat's SSO exchange URL) need
+      // window.location.href so the browser actually leaves
+      // user.develop.cc with the new .develop.cc cookie in hand.
+      if (/^https?:\/\//.test(returnTo)) {
+        window.location.href = returnTo;
+      } else {
+        router.replace(returnTo);
+      }
     } catch {
       toast.error(t("common.networkError"));
     } finally {

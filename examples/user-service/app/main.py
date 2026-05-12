@@ -1096,13 +1096,12 @@ def _verify_otp_hash(raw_code: str, stored_hash: str) -> bool:
     return False
 
 
-def _send_signup_otp_email(email: str, code: str) -> None:
+def _send_signup_otp_email(email: str, code: str, locale: str) -> None:
   _send_email(
     email,
-    "Your verification code",
-    f"Your verification code is: {code}\n\n"
-    f"It expires in {_OTP_TTL_MINUTES} minutes. If you didn't try to "
-    f"sign up, you can ignore this email.",
+    t(locale, "auth.signup.otp_email_subject"),
+    t(locale, "auth.signup.otp_email_body",
+      code=code, ttl=_OTP_TTL_MINUTES),
   )
 
 
@@ -1163,7 +1162,7 @@ def auth_signup_start(req: SignupRequest, request: Request) -> dict:
     conn.commit()
 
   try:
-    _send_signup_otp_email(email, code)
+    _send_signup_otp_email(email, code, locale)
   except Exception:  # noqa: BLE001
     LOGGER.exception("could not send signup OTP email")
 
@@ -1209,7 +1208,7 @@ def auth_signup_resend(req: SignupResendRequest, request: Request) -> dict:
       )
     conn.commit()
   try:
-    _send_signup_otp_email(email, code)
+    _send_signup_otp_email(email, code, locale)
   except Exception:  # noqa: BLE001
     LOGGER.exception("could not resend signup OTP email")
   return {"pending": True}
