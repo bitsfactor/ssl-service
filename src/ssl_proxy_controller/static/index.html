@@ -10305,11 +10305,25 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
           contentPre.textContent = cache[fmt].body;
           return;
         }
-        const u = activeFmt === "base64" ? baseSubUrl : `${baseSubUrl}?format=${fmt}`;
-        contentMeta.textContent = `Fetching ${u} …`;
+        // Display the upstream URL (operator-visible), but fetch through
+        // the admin's /api/user-service/sub-content/<token> proxy —
+        // user.develop.cc/sub doesn't return CORS headers so a browser
+        // fetch direct to it fails with "Failed to fetch".
+        const displayUrl = fmt === "base64" ? baseSubUrl : `${baseSubUrl}?format=${fmt}`;
+        const tokenMatch = baseSubUrl.match(/\/sub\/([^/?#]+)/);
+        const proxyUrl = tokenMatch
+          ? `/api/user-service/sub-content/${encodeURIComponent(tokenMatch[1])}`
+            + (fmt === "base64" ? "" : `?format=${encodeURIComponent(fmt)}`)
+          : displayUrl;
+        contentMeta.textContent = `Fetching ${displayUrl} …`;
         contentPre.textContent = "";
         try {
-          const r = await fetch(u, { cache: "no-store" });
+          // Include the admin auth header — proxy is behind with_auth.
+          const adminToken = Store.getToken() || "";
+          const r = await fetch(proxyUrl, {
+            cache: "no-store",
+            headers: adminToken ? { Authorization: "Bearer " + adminToken } : {},
+          });
           const text = await r.text();
           const ui = r.headers.get("Subscription-Userinfo") || "";
           const meta =
@@ -10340,6 +10354,14 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
                + "border-bottom: 2px solid transparent; "
                + "border-radius: 0; padding: 8px 14px; font-weight: 500",
           onclick: () => {
+            // Restore normal-content visibility (in case we just left
+            // the speed-test tab, which hides these).
+            contentMeta.style.display = "";
+            contentPre.style.display = "";
+            copyContentBtn.style.display = "";
+            refreshBtn.style.display = "";
+            speedTbl.style.display = "none";
+            probeAllBtn.style.display = "none";
             activeFmt = fmt;
             urlEl.value = buildUrl() || urlEl.value;
             for (const t of tabBar.children) {
@@ -10473,19 +10495,8 @@ Upload: ${upMbps == null ? "—" : upMbps + " Mbps"}`;
         },
       }, "speed test");
       tabBar.appendChild(speedTabBtn);
-      // Wrap base64/yaml tab clicks to restore default visibility.
-      for (const tab of [tabBar.children[0], tabBar.children[1]]) {
-        const orig = tab.onclick;
-        tab.onclick = (e) => {
-          contentMeta.style.display = "";
-          contentPre.style.display = "";
-          copyContentBtn.style.display = "";
-          refreshBtn.style.display = "";
-          speedTbl.style.display = "none";
-          probeAllBtn.style.display = "none";
-          orig(e);
-        };
-      }
+      // base64/yaml tabs already restore visibility from their own
+      // onclick (see tabBtn above) — no post-hoc wrapping needed.
       // Activate the first tab — also kicks off the initial fetch.
       tabBar.children[0].click();
 

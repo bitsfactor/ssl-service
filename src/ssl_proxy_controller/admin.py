@@ -7627,6 +7627,54 @@ def _build_router(ctx: AdminContext) -> _Router:
   for method, route_path, sub_template in USER_SERVICE_PROXY_ROUTES:
     router.add(method, route_path, with_auth(_make_proxy_handler(sub_template)))
 
+  # Public subscription-content proxy. The Users page's "Subs" modal
+  # wants to preview the bytes user-service returns for /sub/<token>;
+  # fetching that directly from the browser hits CORS because
+  # user.develop.cc doesn't allow cross-origin reads. Forward through
+  # the admin server instead. Unlike the admin-API proxy above this
+  # route hits a PUBLIC user-service endpoint (auth is in the URL token)
+  # so we don't attach X-Admin-Service-Token, and we pass the response
+  # body through untouched — /sub returns base64 / clash-yaml, not JSON.
+  def sub_content_handler(request: _Request) -> _Response:
+    base = (ctx.database.get_system_config("user_service.base_url") or {}).get("url", "").strip()
+    if not base:
+      raise HttpError(HTTPStatus.SERVICE_UNAVAILABLE,
+                      "user_service.base_url is not configured (Settings → User Service)",
+                      code="user_service_not_configured")
+    token = request.path_params.get("token", "").strip()
+    if not token:
+      raise HttpError(HTTPStatus.BAD_REQUEST, "missing token", code="missing_token")
+    import urllib.parse, urllib.request, urllib.error
+    flat: list[tuple[str, str]] = []
+    for k, vs in (request.query or {}).items():
+      for v in vs:
+        flat.append((k, v))
+    qs = ("?" + urllib.parse.urlencode(flat)) if flat else ""
+    upstream_url = f"{base.rstrip('/')}/sub/{urllib.parse.quote(token, safe='')}{qs}"
+    req = urllib.request.Request(upstream_url, method="GET")
+    try:
+      with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+        # Preserve the subscription-userinfo header — the SPA shows it
+        # next to the body so the operator can see traffic counters.
+        out_headers = {
+          "Content-Type": resp.headers.get("Content-Type", "application/octet-stream"),
+        }
+        ui = resp.headers.get("Subscription-Userinfo")
+        if ui:
+          out_headers["Subscription-Userinfo"] = ui
+        return _Response(resp.status, raw, out_headers)
+    except urllib.error.HTTPError as e:
+      raw = e.read()
+      return _Response(e.code, raw,
+                       {"Content-Type": e.headers.get("Content-Type", "text/plain")})
+    except urllib.error.URLError as e:
+      raise HttpError(HTTPStatus.BAD_GATEWAY,
+                      f"user-service unreachable: {e.reason}",
+                      code="user_service_unreachable")
+  router.add("GET", "/api/user-service/sub-content/{token}",
+             with_auth(sub_content_handler))
+
   # SSH key endpoints ------------------------------------------------
   def ssh_keys_list_handler(_request: _Request) -> _Response:
     return _json_response(HTTPStatus.OK, {"ssh_keys": list_ssh_keys(ctx)})
